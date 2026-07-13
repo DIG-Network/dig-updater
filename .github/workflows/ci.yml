@@ -1,13 +1,13 @@
 # PR quality gates for the dig-updater (DIG auto-update beacon) Rust workspace:
-# formatting, linting, tests, coverage (CI-GATED at >=80% lines), and a release build.
-# Runs on every PR to main and on pushes to main so the default branch stays green.
-# Job `name:`s are stable — they are the required-check contexts wired on the protected
-# branch. See the ecosystem release-gate contract (§2.4a).
+# formatting, linting, tests (on all three OSes), coverage (CI-GATED at >=80% lines), and a
+# release build. Runs on every PR to main and on pushes to main so the default branch stays green.
+# Job `name:`s are stable — they are the required-check contexts wired on the protected branch.
+# See the ecosystem release-gate contract (§2.4a).
 #
-# Tests run on ubuntu-latest. NOTE: on Windows, a test/binary whose filename contains
-# "updater" trips UAC installer-detection (error 740) when run unelevated; that is a
-# local-dev nuisance only — CI runs on Linux, and the shipped Windows binary carries an
-# `asInvoker` manifest (a scheduler/OS-integration follow-up). See SPEC.md.
+# The beacon binaries are named "*updater*", which trips Windows UAC installer-detection
+# (error 740) unless they embed an `asInvoker` manifest. `.cargo/config.toml` embeds that manifest
+# on Windows builds (incl. the `cargo test` harness), so the e2e runs unelevated on the Windows
+# runner. Coverage runs on Linux (llvm-cov), where the manifest is irrelevant.
 name: CI
 
 on:
@@ -42,8 +42,14 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
+    # Lint on Linux AND Windows: the privilege-drop sandbox is `#[cfg]`-split per OS, so a
+    # single-OS lint would leave the Windows restricted-token path unchecked.
     name: Clippy
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (clippy)
@@ -54,7 +60,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
-    name: Test + coverage (>=80%)
+    # The full suite — including the local-HTTP-server DRY-verify e2e and the adversarial-vector
+    # tests — on all three OSes the beacon ships to.
+    name: Test (3 OS)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  coverage:
+    name: Coverage (>=80%)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,9 +89,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      # Runs the whole workspace test suite through an instrumented build and FAILS the job
-      # if line coverage drops below 80% (§2.3). One combined invocation — running tests and
-      # coverage separately would collect no coverage.
+      # One combined invocation — running tests and coverage separately would collect no
+      # coverage. FAILS the job if line coverage drops below 80% (§2.3).
       - name: cargo llvm-cov (test + coverage gate)
         run: cargo llvm-cov --workspace --locked --fail-under-lines 80 --summary-only | tee coverage-summary.txt
       - name: Coverage summary to job summary
@@ -84,7 +105,11 @@ jobs:
 
   build:
     name: Build (release)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust

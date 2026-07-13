@@ -1,19 +1,15 @@
 //! End-to-end trust-chain test: sign a delegation + manifest exactly as the CI signer
-//! will, then walk the verify chain a beacon pass runs — establishing the baseline on a
-//! fresh install, accepting a newer manifest, and rejecting a rollback replay. This doubles
-//! as executable documentation of how a caller composes the trust core.
+//! will, serialize them to their JSON envelopes, parse them back as a verifier would (over the
+//! RECEIVED bytes), then walk the verify chain a beacon pass runs — establishing the baseline
+//! on a fresh install, accepting a newer manifest, and rejecting a rollback replay. This
+//! doubles as executable documentation of how a caller composes the trust core.
 
-use base64::Engine as _;
 use dig_updater_trust::{
     verify_artifact_digest, verify_update_chain, Artifact, Component, Delegation, Manifest,
     SignedDelegation, SignedManifest, TrustError, TrustState,
 };
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
-
-fn b64(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
 
 fn keypair(seed: u8) -> (SigningKey, VerifyingKey) {
     let sk = SigningKey::from_bytes(&[seed; 32]);
@@ -21,20 +17,21 @@ fn keypair(seed: u8) -> (SigningKey, VerifyingKey) {
     (sk, vk)
 }
 
-fn sign_delegation(sk: &SigningKey, d: Delegation) -> SignedDelegation {
-    let signature = b64(&sk.sign(&d.signing_bytes()).to_bytes());
-    SignedDelegation {
-        delegation: d,
-        signature,
-    }
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-fn sign_manifest(sk: &SigningKey, m: Manifest) -> SignedManifest {
-    let signature = b64(&sk.sign(&m.signing_bytes()).to_bytes());
-    SignedManifest {
-        manifest: m,
-        signature,
-    }
+/// Sign a delegation and round-trip it through its JSON envelope, exactly as the wire path does
+/// (signer emits JSON; verifier parses it and captures the received bytes).
+fn wire_delegation(sk: &SigningKey, d: Delegation) -> SignedDelegation {
+    let json = SignedDelegation::sign(d, sk).to_json();
+    SignedDelegation::from_json(&json).expect("valid delegation envelope")
+}
+
+fn wire_manifest(sk: &SigningKey, m: Manifest) -> SignedManifest {
+    let json = SignedManifest::sign(m, sk).to_json();
+    SignedManifest::from_json(&json).expect("valid manifest envelope")
 }
 
 fn manifest(sequence: u64, generated: u64, artifact_bytes: &[u8]) -> Manifest {
@@ -65,7 +62,7 @@ fn baseline_accept_then_advance_then_reject_rollback() {
     let (root_sk, root_vk) = keypair(1);
     let (targets_sk, targets_vk) = keypair(2);
 
-    let delegation = sign_delegation(
+    let delegation = wire_delegation(
         &root_sk,
         Delegation {
             root_version: 1,
@@ -78,7 +75,7 @@ fn baseline_accept_then_advance_then_reject_rollback() {
 
     // --- Pass 1: first validly-signed manifest establishes the baseline. ---
     let bytes_v1 = b"dig-node-artifact-v1";
-    let m1 = sign_manifest(&targets_sk, manifest(100, 500_000, bytes_v1));
+    let m1 = wire_manifest(&targets_sk, manifest(100, 500_000, bytes_v1));
     assert_eq!(
         verify_update_chain(&root_vk, &state, &delegation, &m1, 500_100),
         Ok(())
@@ -96,7 +93,7 @@ fn baseline_accept_then_advance_then_reject_rollback() {
     state.advance(&m1.manifest);
 
     // --- Pass 2: a newer manifest (higher sequence + generated) is accepted. ---
-    let m2 = sign_manifest(&targets_sk, manifest(101, 540_000, b"dig-node-artifact-v2"));
+    let m2 = wire_manifest(&targets_sk, manifest(101, 540_000, b"dig-node-artifact-v2"));
     assert_eq!(
         verify_update_chain(&root_vk, &state, &delegation, &m2, 540_100),
         Ok(())
@@ -123,7 +120,7 @@ fn manifest_from_forged_root_is_rejected() {
     let (evil_root_sk, _evil_root_vk) = keypair(9);
     let (_evil_targets_sk, evil_targets_vk) = keypair(8);
 
-    let evil_delegation = sign_delegation(
+    let evil_delegation = wire_delegation(
         &evil_root_sk,
         Delegation {
             root_version: 1,
@@ -131,7 +128,7 @@ fn manifest_from_forged_root_is_rejected() {
             expires: 1_000_000_000,
         },
     );
-    let m = sign_manifest(&evil_root_sk, manifest(100, 500_000, b"evil"));
+    let m = wire_manifest(&evil_root_sk, manifest(100, 500_000, b"evil"));
     assert_eq!(
         verify_update_chain(
             &real_root_vk,

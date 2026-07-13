@@ -1,6 +1,6 @@
 [package]
 name = "dig-updater-broker"
-description = "DIG auto-update beacon PRIVILEGED broker (scaffold stub): orchestrates one update pass — spawn the unprivileged worker, apply verified installs, health-gate, roll back. Install/rollback/scheduler are follow-up tickets."
+description = "DIG auto-update beacon PRIVILEGED broker: spawns the UNPRIVILEGED fetch/verify worker in a sandbox (Unix setuid-drop / Windows restricted token), persists the Admin/SYSTEM-only monotonic trust state (atomic, forward-compatible), and (in follow-ups) applies verified installs behind a health gate + rollback."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,4 +9,24 @@ authors.workspace = true
 
 [dependencies]
 dig-updater-trust = { path = "../dig-updater-trust" }
+dig-updater-worker = { path = "../dig-updater-worker" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+# OS privilege primitives — the ONLY `unsafe` in the whole workspace lives in `src/sandbox.rs`,
+# gated behind these per-OS deps.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tiny_http = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
