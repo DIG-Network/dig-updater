@@ -1,0 +1,12 @@
+[package]
+name = "dig-updater-worker"
+description = "DIG auto-update beacon UNPRIVILEGED, sandboxed fetch/verify worker (scaffold stub): downloads the signed feed + artifacts and verifies them against the trust core, holding NO install privilege. Fetch pipeline is a follow-up ticket."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+dig-updater-trust = { path = "../dig-updater-trust" }
+thiserror = { workspace = true }

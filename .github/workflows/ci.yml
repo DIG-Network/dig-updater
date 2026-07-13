@@ -1,0 +1,93 @@
+# PR quality gates for the dig-updater (DIG auto-update beacon) Rust workspace:
+# formatting, linting, tests, coverage (CI-GATED at >=80% lines), and a release build.
+# Runs on every PR to main and on pushes to main so the default branch stays green.
+# Job `name:`s are stable — they are the required-check contexts wired on the protected
+# branch. See the ecosystem release-gate contract (§2.4a).
+#
+# Tests run on ubuntu-latest. NOTE: on Windows, a test/binary whose filename contains
+# "updater" trips UAC installer-detection (error 740) when run unelevated; that is a
+# local-dev nuisance only — CI runs on Linux, and the shipped Windows binary carries an
+# `asInvoker` manifest (a scheduler/OS-integration follow-up). See SPEC.md.
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: Test + coverage (>=80%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # Runs the whole workspace test suite through an instrumented build and FAILS the job
+      # if line coverage drops below 80% (§2.3). One combined invocation — running tests and
+      # coverage separately would collect no coverage.
+      - name: cargo llvm-cov (test + coverage gate)
+        run: cargo llvm-cov --workspace --locked --fail-under-lines 80 --summary-only | tee coverage-summary.txt
+      - name: Coverage summary to job summary
+        if: always()
+        run: |
+          {
+            echo '### dig-updater coverage (gated >=80% lines)'
+            echo '```'
+            cat coverage-summary.txt 2>/dev/null || echo 'no coverage output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release --locked
