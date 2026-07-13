@@ -83,17 +83,30 @@ mod imp {
     use crate::install::trusted_absolute;
     use crate::secure::harden_state_dir;
 
+    /// The absolute, trusted path to `net.exe` — never a bare name resolved through `PATH`.
+    fn net() -> Result<PathBuf, BrokerError> {
+        let system_root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("windir"))
+            .ok_or_else(|| BrokerError::Io("neither %SystemRoot% nor %windir% is set".into()))?;
+        trusted_absolute(PathBuf::from(system_root).join("System32").join("net.exe"))
+            .map_err(BrokerError::Io)
+    }
+
     /// Is this process elevated (Administrator)? `net session` succeeds only when elevated — the
     /// same probe dig-relay's own service registration uses, so both repos fail the same way for
-    /// the same reason.
+    /// the same reason. The `net.exe` is resolved by its absolute, trusted path (`%SystemRoot%\System32\net.exe`)
+    /// rather than a bare name, preventing PATH-search hijacking attacks.
     fn is_elevated() -> bool {
-        Command::new("net")
-            .arg("session")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        match net() {
+            Ok(net_exe) => Command::new(net_exe)
+                .arg("session")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
     /// The absolute, trusted path to `schtasks.exe` — never a bare name resolved through `PATH`.

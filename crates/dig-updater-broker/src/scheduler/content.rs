@@ -6,6 +6,23 @@
 use std::path::Path;
 use std::time::Duration;
 
+/// Escape a string for use in XML element text or attribute values.
+/// Replaces `&`, `<`, `>`, `"`, and `'` with their XML entity equivalents.
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Quote a string for use in a systemd `ExecStart` value, handling spaces and special chars.
+/// Wraps the string in double quotes and escapes internal backslashes and quotes.
+fn escape_systemd_exec(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
+}
+
 /// The Windows Task Scheduler path (folder + name) the daily pass registers under.
 pub const WINDOWS_TASK_PATH: &str = r"\DIG\dig-updater";
 
@@ -31,8 +48,11 @@ pub const JITTER_WINDOW: Duration = Duration::from_secs(2 * 60 * 60); // 2 hours
 /// The `StartBoundary` date is a fixed anchor in the past — Task Scheduler only uses it to derive
 /// the daily time-of-day for a recurring trigger; the trigger fires going forward from `now`
 /// regardless of how far in the past the anchor date is.
+///
+/// The `exe` path is XML-escaped so paths with special characters (`&`, `<`, `>`, `"`, `'`)
+/// do not break the XML structure.
 pub fn windows_task_xml(exe: &Path, random_delay: Duration) -> String {
-    let exe = exe.display();
+    let exe = escape_xml(&exe.display().to_string());
     let random_delay = duration_to_iso8601(random_delay);
     format!(
         // Declared UTF-16 to match how the CALLER (`scheduler::imp::install`, Windows) writes
@@ -82,7 +102,11 @@ pub fn windows_task_xml(exe: &Path, random_delay: Duration) -> String {
 }
 
 /// The systemd `dig-updater.service` unit: a `oneshot` run of `<exe> run`.
+///
+/// The `exe` path is quoted/escaped for systemd's `ExecStart` syntax to handle paths with
+/// spaces or special characters correctly.
 pub fn systemd_service_unit(exe: &Path) -> String {
+    let exe = escape_systemd_exec(&exe.display().to_string());
     format!(
         "[Unit]\n\
          Description=DIG auto-update beacon (one pass)\n\
@@ -90,7 +114,7 @@ pub fn systemd_service_unit(exe: &Path) -> String {
          [Service]\n\
          Type=oneshot\n\
          ExecStart={} run\n",
-        exe.display(),
+        exe,
     )
 }
 
@@ -117,7 +141,11 @@ pub fn systemd_timer_unit(random_delay: Duration) -> String {
 /// minute)` via `StartCalendarInterval`, plus `RunAtLoad` so a missed run (the machine was off)
 /// catches up the next time launchd loads daemons at boot (SPEC boot-recovery). Runs as root (no
 /// `UserName` key — a system LaunchDaemon defaults to root, matching dig-dns's plist convention).
+///
+/// The `exe` path is XML-escaped so paths with special characters (`&`, `<`, `>`, `"`, `'`)
+/// do not break the plist XML structure.
 pub fn launchd_plist(exe: &Path, hour: u32, minute: u32) -> String {
+    let exe = escape_xml(&exe.display().to_string());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -141,7 +169,7 @@ pub fn launchd_plist(exe: &Path, hour: u32, minute: u32) -> String {
          \t<true/>\n\
          </dict>\n\
          </plist>\n",
-        exe = exe.display(),
+        exe = exe,
     )
 }
 
@@ -191,7 +219,8 @@ mod tests {
     fn systemd_service_unit_is_a_oneshot_run() {
         let unit = systemd_service_unit(Path::new("/usr/local/bin/dig-updater"));
         assert!(unit.contains("Type=oneshot"));
-        assert!(unit.contains("ExecStart=/usr/local/bin/dig-updater run"));
+        // Path is quoted for proper shell-like semantics in ExecStart
+        assert!(unit.contains("ExecStart=\"/usr/local/bin/dig-updater\" run"));
     }
 
     #[test]
@@ -244,5 +273,72 @@ mod tests {
     fn duration_to_iso8601_formats_whole_seconds() {
         assert_eq!(duration_to_iso8601(Duration::from_secs(90)), "PT90S");
         assert_eq!(duration_to_iso8601(Duration::ZERO), "PT0S");
+    }
+
+    #[test]
+    fn escape_xml_handles_ampersand_and_angle_brackets() {
+        assert_eq!(escape_xml("a&b"), "a&amp;b");
+        assert_eq!(escape_xml("a<b"), "a&lt;b");
+        assert_eq!(escape_xml("a>b"), "a&gt;b");
+        assert_eq!(escape_xml("a\"b"), "a&quot;b");
+        assert_eq!(escape_xml("a'b"), "a&apos;b");
+    }
+
+    #[test]
+    fn escape_xml_leaves_safe_strings_unchanged() {
+        assert_eq!(escape_xml("hello"), "hello");
+        assert_eq!(
+            escape_xml("/usr/local/bin/dig-updater"),
+            "/usr/local/bin/dig-updater"
+        );
+    }
+
+    #[test]
+    fn escape_systemd_exec_quotes_paths_with_spaces() {
+        assert_eq!(
+            escape_systemd_exec("/path/with spaces/exe"),
+            "\"/path/with spaces/exe\""
+        );
+    }
+
+    #[test]
+    fn escape_systemd_exec_escapes_quotes_and_backslashes() {
+        assert_eq!(
+            escape_systemd_exec("C:\\Program Files\\dig\\exe.exe"),
+            "\"C:\\\\Program Files\\\\dig\\\\exe.exe\""
+        );
+        assert_eq!(escape_systemd_exec("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn windows_task_xml_escapes_exe_with_ampersand() {
+        let exe_with_amp = Path::new("C:\\Program Files & More\\dig-updater.exe");
+        let xml = windows_task_xml(exe_with_amp, Duration::from_secs(100));
+        assert!(xml.contains("&amp;"), "XML should escape & in exe path");
+        assert!(
+            !xml.contains("Program Files & More"),
+            "Raw & should not appear"
+        );
+    }
+
+    #[test]
+    fn systemd_service_unit_quotes_exe_with_spaces() {
+        let exe_with_spaces = Path::new("/usr/local/bin/my updater/dig-updater");
+        let unit = systemd_service_unit(exe_with_spaces);
+        assert!(
+            unit.contains("\"/usr/local/bin/my updater/dig-updater\" run"),
+            "systemd should quote exe with spaces"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_escapes_exe_with_ampersand() {
+        let exe_with_amp = Path::new("/opt/a&b/dig-updater");
+        let plist = launchd_plist(exe_with_amp, 3, 0);
+        assert!(plist.contains("&amp;"), "plist should escape & in exe path");
+        assert!(
+            !plist.contains("a&b"),
+            "Raw & should not appear in XML context"
+        );
     }
 }
