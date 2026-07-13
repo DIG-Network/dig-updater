@@ -7,12 +7,19 @@
 //! candidate manifest against it; [`TrustState::advance`] folds an accepted manifest's
 //! high-water-marks back in. The marks only ever move forward.
 
+use serde::{Deserialize, Serialize};
+
 use crate::manifest::Manifest;
 
 /// The freshest values the beacon has ever accepted. Compared against each candidate
 /// manifest to enforce anti-rollback (`sequence`), anti-freeze (`generated`), delegation
 /// monotonicity (`root_version`), and the anti-downgrade floor (`rollback_floor_build`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `Serialize`/`Deserialize` cover the broker↔worker request wire (the four monotonic marks the
+/// unprivileged worker needs for its freshness checks). On-disk persistence — which additionally
+/// PRESERVES unknown fields for forward-compatibility — is the privileged broker's concern
+/// (`dig_updater_broker::state`), not this pure type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TrustState {
     /// Highest delegation `root_version` ever accepted.
     pub root_version: u32,

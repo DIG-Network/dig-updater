@@ -1,18 +1,33 @@
 //! The signed feed wire types: the root→targets [`Delegation`] and the update
 //! [`Manifest`], each wrapped with a detached Ed25519 signature.
 //!
-//! ## Canonical signing bytes
+//! ## Verification is over the RECEIVED bytes, not a re-serialization (forward-compat)
 //!
-//! A signature is computed over the **canonical JSON** of the *payload* struct
-//! ([`Delegation`] / [`Manifest`]) — its UTF-8 `serde_json` serialization. serde emits
-//! struct fields in declaration order and these payloads contain no maps, so the encoding
-//! is deterministic: the same payload always produces the same bytes on the signer and the
-//! verifier. The detached signature and any envelope metadata are NOT part of the signed
-//! bytes (a signature cannot cover itself). Signers MUST serialize the payload exactly as
-//! defined here; verifiers reconstruct the same bytes via [`Delegation::signing_bytes`] /
-//! [`Manifest::signing_bytes`].
+//! A signature covers the exact UTF-8 JSON bytes of the *payload* object as they appear on the
+//! wire. A verifier MUST check the signature over **those received bytes** — captured verbatim
+//! via [`serde_json::value::RawValue`] in [`SignedDelegation::from_json`] /
+//! [`SignedManifest::from_json`] — and MUST NOT re-serialize the parsed struct and verify over
+//! that. Re-serializing would silently drop any field the reader's struct does not know, so a
+//! future feed that adds an (additive, backward-compatible) field would fail to verify under an
+//! older beacon — breaking the SPEC §5.2 forward-compatibility guarantee. Capturing the raw
+//! slice keeps every unknown byte inside the signed message, so the signature still verifies and
+//! the reader simply ignores fields it does not understand.
+//!
+//! [`Delegation::signing_bytes`] / [`Manifest::signing_bytes`] therefore exist ONLY for the
+//! **signer** (the CI feed-signer and tests): they define the canonical serialization a signer
+//! emits. Verifiers never call them.
 
+use base64::Engine as _;
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+
+use crate::verify::TrustError;
+
+/// Standard-alphabet base64 (RFC 4648 §4), the encoding for keys and signatures on the wire.
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
 
 /// A root→targets delegation, signed by the pinned **root** key.
 ///
@@ -33,21 +48,106 @@ pub struct Delegation {
 }
 
 impl Delegation {
-    /// The canonical bytes over which the root signature is computed (UTF-8 JSON of `self`).
+    /// The canonical bytes a **signer** produces for this payload (UTF-8 JSON of `self`).
+    ///
+    /// This is the SIGNER's canonicalization only. Verifiers do NOT use it — they verify over
+    /// the exact received bytes captured by [`SignedDelegation::from_json`] (see the module
+    /// docs). serde emits struct fields in declaration order and this payload contains no maps,
+    /// so the encoding is deterministic.
     #[must_use]
     pub fn signing_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Delegation is always JSON-serializable")
     }
 }
 
-/// A [`Delegation`] plus its detached root signature.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A [`Delegation`] plus its detached root signature and the exact payload bytes that signature
+/// covers.
+///
+/// Construct it as a **verifier** with [`from_json`](Self::from_json) (captures the received
+/// bytes) or as a **signer**/test with [`sign`](Self::sign). Verification runs over
+/// [`signed_payload`](Self::signed_payload), never over a re-serialization of `delegation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedDelegation {
-    /// The signed delegation payload.
+    /// The parsed delegation payload. Convenient typed access; NOT the source of truth for the
+    /// verified bytes (that is [`signed_payload`](Self::signed_payload)).
     pub delegation: Delegation,
-    /// Base64 (standard alphabet) of the 64-byte Ed25519 signature over
-    /// [`Delegation::signing_bytes`], produced by the pinned **root** key.
+    /// Base64 (standard alphabet) of the 64-byte Ed25519 signature over the payload bytes,
+    /// produced by the pinned **root** key.
     pub signature: String,
+    /// The exact payload byte slice the signature is verified over — the bytes as received on
+    /// the wire (which preserves fields this reader may not understand).
+    signed_payload: Vec<u8>,
+}
+
+/// The `delegation` envelope as it appears on the wire, borrowing the payload as raw bytes.
+#[derive(Deserialize)]
+struct DelegationEnvelope<'a> {
+    #[serde(borrow)]
+    delegation: &'a RawValue,
+    signature: String,
+}
+
+/// The `delegation` envelope for output, embedding the exact signed payload verbatim.
+#[derive(Serialize)]
+struct DelegationEnvelopeOut<'a> {
+    delegation: &'a RawValue,
+    signature: &'a str,
+}
+
+impl SignedDelegation {
+    /// Sign a delegation with the **root** signing key (the SIGNER path — CI feed-signer and
+    /// tests). Captures the canonical payload bytes as the signed bytes so a subsequent
+    /// [`to_json`](Self::to_json)/[`from_json`](Self::from_json) round-trip is stable.
+    #[must_use]
+    pub fn sign(delegation: Delegation, root: &SigningKey) -> Self {
+        let signed_payload = delegation.signing_bytes();
+        let signature = b64(&root.sign(&signed_payload).to_bytes());
+        Self {
+            delegation,
+            signature,
+            signed_payload,
+        }
+    }
+
+    /// Parse a signed delegation from its JSON envelope, capturing the payload's EXACT received
+    /// byte slice so the signature is later verified over precisely those bytes (§5.4).
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::MalformedJson`] if the envelope or its payload is not well-formed JSON.
+    pub fn from_json(json: &str) -> Result<Self, TrustError> {
+        let env: DelegationEnvelope =
+            serde_json::from_str(json).map_err(|e| TrustError::MalformedJson(e.to_string()))?;
+        let signed_payload = env.delegation.get().as_bytes().to_vec();
+        let delegation: Delegation = serde_json::from_str(env.delegation.get())
+            .map_err(|e| TrustError::MalformedJson(e.to_string()))?;
+        Ok(Self {
+            delegation,
+            signature: env.signature,
+            signed_payload,
+        })
+    }
+
+    /// The exact payload bytes the root signature is verified over.
+    #[must_use]
+    pub fn signed_payload(&self) -> &[u8] {
+        &self.signed_payload
+    }
+
+    /// Serialize back to the JSON envelope, embedding the exact signed payload bytes verbatim
+    /// (a stable round-trip with [`from_json`](Self::from_json)).
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let payload = RawValue::from_string(
+            String::from_utf8(self.signed_payload.clone()).expect("signed payload is UTF-8 JSON"),
+        )
+        .expect("signed payload is valid JSON");
+        serde_json::to_string(&DelegationEnvelopeOut {
+            delegation: &payload,
+            signature: &self.signature,
+        })
+        .expect("envelope is always serializable")
+    }
 }
 
 /// The update manifest: the authoritative statement of the latest build of every DIG
@@ -80,7 +180,10 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// The canonical bytes over which the targets signature is computed (UTF-8 JSON of `self`).
+    /// The canonical bytes a **signer** produces for this payload (UTF-8 JSON of `self`).
+    ///
+    /// SIGNER canonicalization only — verifiers verify over the received bytes captured by
+    /// [`SignedManifest::from_json`] (see the module docs).
     #[must_use]
     pub fn signing_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Manifest is always JSON-serializable")
@@ -93,15 +196,89 @@ impl Manifest {
     }
 }
 
-/// A [`Manifest`] plus its detached targets signature.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A [`Manifest`] plus its detached targets signature and the exact payload bytes that
+/// signature covers.
+///
+/// As with [`SignedDelegation`], verification runs over [`signed_payload`](Self::signed_payload)
+/// — the received bytes — so an additive future manifest field verifies under an older reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedManifest {
-    /// The signed manifest payload.
+    /// The parsed manifest payload (typed access; NOT the verified-bytes source of truth).
     pub manifest: Manifest,
-    /// Base64 (standard alphabet) of the 64-byte Ed25519 signature over
-    /// [`Manifest::signing_bytes`], produced by the **targets** key that the in-force
-    /// [`Delegation`] authorizes.
+    /// Base64 (standard alphabet) of the 64-byte Ed25519 signature over the payload bytes,
+    /// produced by the **targets** key the in-force [`Delegation`] authorizes.
     pub signature: String,
+    /// The exact payload byte slice the signature is verified over.
+    signed_payload: Vec<u8>,
+}
+
+/// The `manifest` envelope as it appears on the wire, borrowing the payload as raw bytes.
+#[derive(Deserialize)]
+struct ManifestEnvelope<'a> {
+    #[serde(borrow)]
+    manifest: &'a RawValue,
+    signature: String,
+}
+
+/// The `manifest` envelope for output, embedding the exact signed payload verbatim.
+#[derive(Serialize)]
+struct ManifestEnvelopeOut<'a> {
+    manifest: &'a RawValue,
+    signature: &'a str,
+}
+
+impl SignedManifest {
+    /// Sign a manifest with the **targets** signing key (SIGNER path — CI feed-signer and
+    /// tests), capturing the canonical payload bytes as the signed bytes.
+    #[must_use]
+    pub fn sign(manifest: Manifest, targets: &SigningKey) -> Self {
+        let signed_payload = manifest.signing_bytes();
+        let signature = b64(&targets.sign(&signed_payload).to_bytes());
+        Self {
+            manifest,
+            signature,
+            signed_payload,
+        }
+    }
+
+    /// Parse a signed manifest from its JSON envelope, capturing the payload's EXACT received
+    /// byte slice so verification runs over precisely those bytes (§5.4, forward-compatible).
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::MalformedJson`] if the envelope or its payload is not well-formed JSON.
+    pub fn from_json(json: &str) -> Result<Self, TrustError> {
+        let env: ManifestEnvelope =
+            serde_json::from_str(json).map_err(|e| TrustError::MalformedJson(e.to_string()))?;
+        let signed_payload = env.manifest.get().as_bytes().to_vec();
+        let manifest: Manifest = serde_json::from_str(env.manifest.get())
+            .map_err(|e| TrustError::MalformedJson(e.to_string()))?;
+        Ok(Self {
+            manifest,
+            signature: env.signature,
+            signed_payload,
+        })
+    }
+
+    /// The exact payload bytes the targets signature is verified over.
+    #[must_use]
+    pub fn signed_payload(&self) -> &[u8] {
+        &self.signed_payload
+    }
+
+    /// Serialize back to the JSON envelope, embedding the exact signed payload bytes verbatim.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let payload = RawValue::from_string(
+            String::from_utf8(self.signed_payload.clone()).expect("signed payload is UTF-8 JSON"),
+        )
+        .expect("signed payload is valid JSON");
+        serde_json::to_string(&ManifestEnvelopeOut {
+            manifest: &payload,
+            signature: &self.signature,
+        })
+        .expect("envelope is always serializable")
+    }
 }
 
 /// One updatable component (e.g. `dig-node`, `dig-installer`, `dig-relay`).
@@ -144,6 +321,114 @@ pub struct Artifact {
     pub url: String,
     /// Lowercase hex (64 chars) of the SHA-256 of the artifact bytes.
     pub sha256: String,
-    /// Expected size in bytes (advisory; the digest is the authority).
+    /// Expected size in bytes (advisory; the digest is the authority). Also bounds the
+    /// download: the worker refuses to stream more than `min(4 × size, 2 GiB)` (disk-fill DoS
+    /// guard).
     pub size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+
+    fn targets_key() -> SigningKey {
+        SigningKey::from_bytes(&[9u8; 32])
+    }
+
+    fn sample_manifest() -> Manifest {
+        Manifest {
+            schema: 1,
+            root_version: 1,
+            sequence: 10,
+            generated: 1000,
+            expires: 2000,
+            rollback_floor_build: 5,
+            components: vec![Component {
+                name: "dig-node".to_string(),
+                version: "0.26.0".to_string(),
+                build: 26,
+                artifacts: vec![Artifact {
+                    os: "linux".to_string(),
+                    arch: "x64".to_string(),
+                    url: "https://updates.dig.net/dig-node/0.26.0/linux-x64".to_string(),
+                    sha256: hex::encode(Sha256::digest(b"artifact")),
+                    size: 8,
+                }],
+            }],
+        }
+    }
+
+    /// `from_json` after `to_json` preserves the parsed payload and the exact signed bytes.
+    #[test]
+    fn manifest_json_round_trip_preserves_signed_bytes() {
+        let signed = SignedManifest::sign(sample_manifest(), &targets_key());
+        let json = signed.to_json();
+        let parsed = SignedManifest::from_json(&json).expect("valid envelope");
+        assert_eq!(parsed.manifest, signed.manifest);
+        assert_eq!(parsed.signed_payload(), signed.signed_payload());
+        assert_eq!(parsed.signature, signed.signature);
+    }
+
+    /// The delegation envelope round-trips identically.
+    #[test]
+    fn delegation_json_round_trip() {
+        let root = SigningKey::from_bytes(&[7u8; 32]);
+        let signed = SignedDelegation::sign(
+            Delegation {
+                root_version: 3,
+                targets_pubkey: b64(&targets_key().verifying_key().to_bytes()),
+                expires: 5000,
+            },
+            &root,
+        );
+        let parsed = SignedDelegation::from_json(&signed.to_json()).expect("valid envelope");
+        assert_eq!(parsed.delegation, signed.delegation);
+        assert_eq!(parsed.signed_payload(), signed.signed_payload());
+    }
+
+    /// The signed bytes captured from the wire equal the raw payload substring — NOT a
+    /// re-serialization. This is the property the forward-compat fix depends on.
+    #[test]
+    fn from_json_captures_raw_payload_verbatim() {
+        // A manifest payload carrying an unknown, additive field a future feed might emit.
+        let payload = r#"{"schema":2,"root_version":1,"sequence":11,"generated":1000,"expires":2000,"rollback_floor_build":5,"components":[],"future_flag":true}"#;
+        let sig = "AA"; // signature content is irrelevant to byte capture
+        let envelope = format!(r#"{{"manifest":{payload},"signature":"{sig}"}}"#);
+        let parsed = SignedManifest::from_json(&envelope).expect("well-formed JSON");
+        // The captured bytes include the unknown field verbatim...
+        assert_eq!(parsed.signed_payload(), payload.as_bytes());
+        // ...even though the parsed struct silently ignores it.
+        assert_eq!(parsed.manifest.schema, 2);
+        assert!(parsed.manifest.components.is_empty());
+    }
+
+    /// Malformed envelopes fail closed as `MalformedJson`, never a panic.
+    #[test]
+    fn malformed_envelope_is_rejected() {
+        assert!(matches!(
+            SignedManifest::from_json("not json"),
+            Err(TrustError::MalformedJson(_))
+        ));
+        assert!(matches!(
+            SignedManifest::from_json(r#"{"manifest":123,"signature":"x"}"#),
+            Err(TrustError::MalformedJson(_))
+        ));
+        assert!(matches!(
+            SignedDelegation::from_json(r#"{"signature":"x"}"#),
+            Err(TrustError::MalformedJson(_))
+        ));
+    }
+
+    /// Component/artifact lookups resolve as expected.
+    #[test]
+    fn lookups_resolve() {
+        let m = sample_manifest();
+        assert!(m.component("dig-node").is_some());
+        assert!(m.component("nope").is_none());
+        let c = m.component("dig-node").unwrap();
+        assert!(c.artifact("linux", "x64").is_some());
+        assert!(c.artifact("windows", "x64").is_none());
+    }
 }

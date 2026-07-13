@@ -1,91 +1,210 @@
 #![forbid(unsafe_code)]
 
-//! The `dig-updater` beacon CLI (scaffold stub).
+//! The `dig-updater` beacon CLI.
 //!
-//! Manual invocation surface for the beacon. In the scaffold the commands are wired but
-//! return a machine-readable "not yet implemented" result — the verify/install pipeline
-//! (#504-D…F) fills them in. Both a human line and a `--json` object are offered so the
-//! CLI is agent-consumable from day one (§6.2).
+//! Manual entry point to the beacon. In this (-D) milestone the wired command is
+//! `check --dry-run`: it runs one privileged pass that loads the trust state, spawns the
+//! unprivileged worker to fetch + verify + stage, and prints the verification report — WITHOUT
+//! installing anything and WITHOUT advancing the trust state (the install path is #504-E). Both a
+//! human line and a `--json` object are offered so the CLI is agent-consumable from day one
+//! (§6.2).
+//!
+//! The feed location can be overridden for a custom/test feed via `--feed-base <url>` or
+//! `$DIG_UPDATER_FEED_BASE` (transport is untrusted — the signature is the gate — so this is
+//! safe). The trusted root KEY has no such override.
 
 use std::process::ExitCode;
+
+use dig_updater_broker::{Broker, BrokerError, TrustStateStore};
+use dig_updater_trust::TrustState;
+use dig_updater_worker::{production_feed_ladder, FeedSource, WorkerReport};
 
 const USAGE: &str = "\
 dig-updater — DIG auto-update beacon
 
 USAGE:
-    dig-updater <COMMAND> [--json]
+    dig-updater <COMMAND> [OPTIONS]
 
 COMMANDS:
-    check      Run one update pass now (fetch + verify + install). Use --now to force.
-    status     Report the beacon's current trust state and last pass.
+    check      Fetch + verify the latest feed. In this build `check` is a DRY verify pass
+               (no install, no state change); the install path lands in #504-E.
+    status     Report the beacon's persisted trust state.
     help       Show this help.
 
 OPTIONS:
-    --json     Emit machine-readable JSON instead of a human line.
-    --version  Print the beacon version.
+    --dry-run           Verify only; never install or advance trust state (the default today).
+    --now               Run the pass immediately (the manual default).
+    --feed-base <url>   Override the feed base URL (for a custom/test feed). Untrusted transport.
+    --json              Emit machine-readable JSON instead of a human line.
+    --version, -V       Print the beacon version.";
 
-NOTE: this is the alpha scaffold — check/status are wired but the verify/install/scheduler
-pipeline is not yet implemented (tracked as #504-D through #504-F).";
+/// The parsed command line.
+#[derive(Debug, PartialEq, Eq)]
+enum Cmd {
+    Check {
+        feed_base: Option<String>,
+        json: bool,
+    },
+    Status {
+        json: bool,
+    },
+    Help,
+    Version,
+    Unknown(String),
+}
 
-/// Parse the argument list (excluding argv[0]) and produce the output to print.
-///
-/// Returns `Ok(stdout)` for a recognized command and `Err(stderr)` for an unknown one.
-fn dispatch(args: &[String]) -> Result<String, String> {
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse(&args) {
+        Cmd::Version => {
+            println!("dig-updater {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Cmd::Help => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Cmd::Unknown(cmd) => {
+            eprintln!("unknown command: {cmd}\n\n{USAGE}");
+            ExitCode::from(2)
+        }
+        Cmd::Status { json } => run_status(json),
+        Cmd::Check { feed_base, json } => run_check(feed_base, json),
+    }
+}
+
+/// Parse argv (excluding argv[0]) into a [`Cmd`]. Pure and total — every input maps to a variant.
+fn parse(args: &[String]) -> Cmd {
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        return Cmd::Version;
+    }
     let json = args.iter().any(|a| a == "--json");
+    let feed_base = flag_value(args, "--feed-base");
     match args
         .iter()
         .find(|a| !a.starts_with('-'))
         .map(String::as_str)
     {
-        None => Ok(USAGE.to_string()),
-        Some("help") => Ok(USAGE.to_string()),
-        Some("check") => Ok(render(
-            json,
-            "check",
-            "the fetch/verify/install pipeline lands in #504-D through #504-F",
-        )),
-        Some("status") => Ok(render(
-            json,
-            "status",
-            "beacon status reporting lands with the scheduler (#504-F)",
-        )),
-        Some(other) => Err(format!("unknown command: {other}\n\n{USAGE}")),
+        None | Some("help") => Cmd::Help,
+        Some("check") => Cmd::Check { feed_base, json },
+        Some("status") => Cmd::Status { json },
+        Some(other) => Cmd::Unknown(other.to_string()),
     }
 }
 
-/// Render a stub result either as a human line or, with `--json`, a stable JSON object.
-fn render(json: bool, command: &str, detail: &str) -> String {
+/// The value following a `--flag <value>` option, if present.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// Resolve the feed ladder: an explicit override (flag) wins; else `$DIG_UPDATER_FEED_BASE`; else
+/// the production ladder. Only the feed URL is overridable — never the trusted key.
+fn resolve_feed(feed_base: Option<String>) -> Vec<FeedSource> {
+    let override_base = feed_base.or_else(|| std::env::var("DIG_UPDATER_FEED_BASE").ok());
+    match override_base {
+        Some(base) => vec![FeedSource::new(base)],
+        None => production_feed_ladder(),
+    }
+}
+
+/// Run a dry verification pass and print the report.
+fn run_check(feed_base: Option<String>, json: bool) -> ExitCode {
+    let broker = match Broker::new() {
+        Ok(b) => b,
+        Err(e) => return fail(&e, json),
+    };
+    match broker.dry_check(resolve_feed(feed_base)) {
+        Ok(report) => {
+            println!("{}", render_report(&report, json));
+            match report {
+                WorkerReport::Verified(_) => ExitCode::SUCCESS,
+                WorkerReport::Rejected { .. } => ExitCode::from(2),
+            }
+        }
+        Err(e) => fail(&e, json),
+    }
+}
+
+/// Print the beacon's persisted trust state.
+fn run_status(json: bool) -> ExitCode {
+    let broker = match Broker::new() {
+        Ok(b) => b,
+        Err(e) => return fail(&e, json),
+    };
+    let store = TrustStateStore::at(broker.state_dir());
+    match store.load() {
+        Ok(loaded) => {
+            println!(
+                "{}",
+                render_status(&loaded.state, &store.path().display().to_string(), json)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e, json),
+    }
+}
+
+/// Render a verification report as JSON or a human summary. Pure, so it is unit-testable.
+fn render_report(report: &WorkerReport, json: bool) -> String {
+    if json {
+        // The report is already a stable tagged object; emit it verbatim.
+        return serde_json::to_string(report)
+            .unwrap_or_else(|e| format!(r#"{{"status":"error","detail":"{e}"}}"#));
+    }
+    match report {
+        WorkerReport::Verified(plan) => {
+            let mut out = format!(
+                "verified feed from {} (sequence {}, {} artifact(s) staged):",
+                plan.source,
+                plan.sequence,
+                plan.artifacts.len()
+            );
+            for a in &plan.artifacts {
+                out.push_str(&format!(
+                    "\n  {} {} [{}-{}] -> {}",
+                    a.component, a.version, a.os, a.arch, a.staged_path
+                ));
+            }
+            out
+        }
+        WorkerReport::Rejected { reason, detail } => format!("rejected ({reason}): {detail}"),
+    }
+}
+
+/// Render the persisted trust state as JSON or a human line. Pure.
+fn render_status(state: &TrustState, state_path: &str, json: bool) -> String {
     if json {
         serde_json::json!({
-            "command": command,
-            "implemented": false,
-            "status": "not-yet-implemented",
-            "detail": detail,
+            "command": "status",
+            "trust_state": state,
+            "state_path": state_path,
             "version": env!("CARGO_PKG_VERSION"),
         })
         .to_string()
     } else {
-        format!("dig-updater {command}: not yet implemented — {detail}")
+        format!(
+            "dig-updater {} — trust state: root_version={} sequence={} generated={} rollback_floor_build={}",
+            env!("CARGO_PKG_VERSION"),
+            state.root_version,
+            state.sequence,
+            state.generated,
+            state.rollback_floor_build,
+        )
     }
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // --version short-circuits (kept out of dispatch so the version literal has one home).
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("dig-updater {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
+/// Report a broker error and return a non-zero exit code.
+fn fail(err: &BrokerError, json: bool) -> ExitCode {
+    if json {
+        let out = serde_json::json!({ "status": "error", "detail": err.to_string() });
+        println!("{out}");
+    } else {
+        eprintln!("dig-updater: {err}");
     }
-    match dispatch(&args) {
-        Ok(out) => {
-            println!("{out}");
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::from(2)
-        }
-    }
+    ExitCode::from(2)
 }
 
 #[cfg(test)]
@@ -93,55 +212,135 @@ mod tests {
     use super::*;
 
     fn v(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+        args.iter().map(|s| (*s).to_string()).collect()
     }
 
     #[test]
-    fn no_args_prints_usage() {
-        assert!(dispatch(&[]).unwrap().contains("USAGE:"));
+    fn no_args_is_help() {
+        assert_eq!(parse(&[]), Cmd::Help);
+        assert_eq!(parse(&v(&["help"])), Cmd::Help);
     }
 
     #[test]
-    fn help_prints_usage() {
-        assert!(dispatch(&v(&["help"])).unwrap().contains("COMMANDS:"));
+    fn version_flag_short_circuits() {
+        assert_eq!(parse(&v(&["-V"])), Cmd::Version);
+        assert_eq!(parse(&v(&["check", "--version"])), Cmd::Version);
     }
 
     #[test]
-    fn check_reports_unimplemented_human() {
-        let out = dispatch(&v(&["check", "--now"])).unwrap();
-        assert!(out.contains("check"));
-        assert!(out.contains("not yet implemented"));
+    fn check_parses_flags() {
+        assert_eq!(
+            parse(&v(&["check", "--dry-run", "--json"])),
+            Cmd::Check {
+                feed_base: None,
+                json: true
+            }
+        );
     }
 
     #[test]
-    fn status_json_is_machine_readable() {
-        let out = dispatch(&v(&["status", "--json"])).unwrap();
+    fn check_parses_feed_base_override() {
+        assert_eq!(
+            parse(&v(&["check", "--feed-base", "http://localhost:8080/feed"])),
+            Cmd::Check {
+                feed_base: Some("http://localhost:8080/feed".to_string()),
+                json: false
+            }
+        );
+    }
+
+    #[test]
+    fn leading_option_is_not_mistaken_for_command() {
+        assert_eq!(parse(&v(&["--json", "status"])), Cmd::Status { json: true });
+    }
+
+    #[test]
+    fn unknown_command_is_reported() {
+        assert_eq!(
+            parse(&v(&["frobnicate"])),
+            Cmd::Unknown("frobnicate".to_string())
+        );
+    }
+
+    #[test]
+    fn feed_override_flag_beats_production_ladder() {
+        let sources = resolve_feed(Some("http://x/feed".to_string()));
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].base, "http://x/feed");
+    }
+
+    #[test]
+    fn no_override_uses_production_ladder() {
+        // Ensure the env override is not set for this assertion.
+        std::env::remove_var("DIG_UPDATER_FEED_BASE");
+        let sources = resolve_feed(None);
+        assert_eq!(sources.len(), 2);
+    }
+
+    fn verified_report() -> WorkerReport {
+        use dig_updater_worker::{StagedArtifact, VerifiedPlan};
+        WorkerReport::Verified(VerifiedPlan {
+            source: "https://updates.dig.net/v1/alpha".into(),
+            schema: 1,
+            root_version: 1,
+            sequence: 42,
+            generated: 1000,
+            rollback_floor_build: 20,
+            artifacts: vec![StagedArtifact {
+                component: "dig-node".into(),
+                version: "0.26.0".into(),
+                build: 26,
+                os: "linux".into(),
+                arch: "x64".into(),
+                sha256: "ab".into(),
+                size: 10,
+                staged_path: "/tmp/staging/dig-node".into(),
+            }],
+        })
+    }
+
+    #[test]
+    fn render_verified_report_human_lists_artifacts() {
+        let out = render_report(&verified_report(), false);
+        assert!(out.contains("verified feed"));
+        assert!(out.contains("sequence 42"));
+        assert!(out.contains("dig-node 0.26.0 [linux-x64]"));
+    }
+
+    #[test]
+    fn render_verified_report_json_is_machine_readable() {
+        let out = render_report(&verified_report(), true);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
-        assert_eq!(parsed["command"], "status");
-        assert_eq!(parsed["implemented"], false);
-        assert_eq!(parsed["status"], "not-yet-implemented");
-        assert!(parsed["detail"].is_string());
-        assert!(parsed["version"].is_string());
+        assert_eq!(parsed["status"], "verified");
+        assert_eq!(parsed["sequence"], 42);
     }
 
     #[test]
-    fn check_json_is_machine_readable() {
-        let out = dispatch(&v(&["check", "--json"])).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["command"], "check");
+    fn render_rejected_report_shows_reason() {
+        let report = WorkerReport::Rejected {
+            reason: "manifest_expired".into(),
+            detail: "expired at 1, now 2".into(),
+        };
+        assert!(render_report(&report, false).contains("rejected (manifest_expired)"));
+        let json: serde_json::Value = serde_json::from_str(&render_report(&report, true)).unwrap();
+        assert_eq!(json["reason"], "manifest_expired");
     }
 
     #[test]
-    fn unknown_command_errors() {
-        let err = dispatch(&v(&["frobnicate"])).unwrap_err();
-        assert!(err.contains("unknown command: frobnicate"));
-    }
-
-    #[test]
-    fn options_before_command_still_parse() {
-        // A leading --json must not be mistaken for the command.
-        let out = dispatch(&v(&["--json", "status"])).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["command"], "status");
+    fn render_status_human_and_json() {
+        let state = TrustState {
+            root_version: 1,
+            sequence: 7,
+            generated: 100,
+            rollback_floor_build: 3,
+        };
+        assert!(
+            render_status(&state, "/var/lib/dig-updater/trust-state.json", false)
+                .contains("sequence=7")
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_status(&state, "/x", true)).unwrap();
+        assert_eq!(json["command"], "status");
+        assert_eq!(json["trust_state"]["sequence"], 7);
     }
 }

@@ -190,15 +190,27 @@ A `component` groups one release (`version`, `build`) and its per-OS/arch `artif
 component. `build` is the monotonic identity used for anti-downgrade comparisons; `version` is
 for display and MUST correspond to `build`.
 
-### 5.4 Canonical signing bytes
+### 5.4 Signed bytes — the signer canonicalizes, the verifier checks the RECEIVED slice
 
-A signature is computed over the UTF-8 JSON serialization of the **payload** object
-(`delegation` or `manifest`) — NOT the envelope, and NOT including the `signature` field. The
-serialization MUST be deterministic: fields are emitted in the declaration order given in §5.1
-/ §5.2, with no insignificant whitespace and no maps/unordered collections. The signer and the
-verifier MUST produce identical bytes for identical payloads. (The reference implementation
-uses `serde_json` over the payload struct, whose field order is fixed and which contains no
-maps.)
+A signature covers the UTF-8 JSON bytes of the **payload** object (`delegation` or `manifest`) —
+NOT the envelope, and NOT the `signature` field.
+
+- **Signer.** A signer produces the payload deterministically: fields in the declaration order of
+  §5.1 / §5.2, no insignificant whitespace, no maps/unordered collections. (The reference signer
+  serializes the payload struct with `serde_json`, whose field order is fixed and which contains
+  no maps.) It signs exactly those bytes and embeds them verbatim in the envelope.
+- **Verifier.** A verifier MUST verify the signature over the **exact payload bytes as received on
+  the wire** — the raw substring of the envelope's `delegation`/`manifest` value — and MUST NOT
+  re-serialize the parsed payload and verify over that. The reference verifier captures the raw
+  slice with a `serde_json` `RawValue` envelope (`SignedManifest::from_json` /
+  `SignedDelegation::from_json`).
+
+This distinction is what makes schema evolution (§5.2) **forward-compatible**: a future feed may
+add an additive field an older verifier does not know. Those bytes are still inside the signed
+message, so verifying over the received slice still succeeds; the verifier parses the fields it
+understands and ignores the rest. Re-serializing the parsed struct would drop the unknown field
+and compute different bytes, wrongly rejecting a valid newer feed — so verifiers MUST NOT do that.
+An implementation MUST include a test that a manifest carrying an unknown field still verifies.
 
 ---
 
@@ -301,27 +313,31 @@ Given the pinned root key `R`, the persisted `TrustState S`, a `SignedDelegation
 abort (install nothing) on the first failure:
 
 1. **Verify the delegation.** Decode `D.signature` (base64→64 bytes). Verify it strictly over
-   `signing_bytes(D.delegation)` under `R`. On failure → reject. Then require
+   `D`'s **received payload bytes** (§5.4) under `R`. On failure → reject. Then require
    `now <= D.delegation.expires`. Decode `D.delegation.targets_pubkey` (base64→32 bytes) into
    the targets key `T`.
-2. **Verify the manifest signature.** Decode `M.signature`. Verify it strictly over
-   `signing_bytes(M.manifest)` under `T`. On failure → reject.
+2. **Verify the manifest signature.** Decode `M.signature`. Verify it strictly over `M`'s
+   **received payload bytes** (§5.4) under `T`. On failure → reject.
 3. **Bind manifest to delegation.** Require `M.manifest.root_version ==
    D.delegation.root_version`.
 4. **Enforce freshness (§7).** Require not-expired, `sequence >= S.sequence`,
    `generated >= S.generated`, `root_version >= S.root_version`.
 5. **Enforce the rollback floor (§7.5).** For every component, `build >= rollback_floor_build`.
-6. **Per artifact, before install:** download the bytes from `artifact.url`, compute their
-   SHA-256, and require it equals `artifact.sha256` (lowercase-hex compare). On mismatch →
-   reject that artifact and MUST NOT install it. This is **verify-then-install**, never
-   install-then-verify.
+6. **Per artifact, before install:** stream the bytes from `artifact.url` into a staging file,
+   hashing incrementally, and require the SHA-256 equals `artifact.sha256` (lowercase-hex
+   compare). On mismatch → reject that artifact and MUST NOT install it (and remove the staged
+   bytes). This is **verify-then-install**, never install-then-verify. The download is bounded by
+   a hard size cap of `min(4 × artifact.size, 2 GiB)`: a stream exceeding the cap is rejected
+   before the disk can be filled (a disk-fill DoS guard against a hostile CDN). Because it streams
+   with a fixed buffer, the beacon's memory does not grow with artifact size.
 7. **On success:** install (§9.5), then advance `S` (§6) and persist it. `S` MUST NOT be
-   advanced before a successful, health-gated install.
+   advanced before a successful, health-gated install. (A `check --dry-run` performs steps 1–6 —
+   including staging + digest verification — but NEVER installs and NEVER advances `S`.)
 
 Every rejection MUST be a distinct, catalogued reason (bad signature, expired, sequence
 regressed, generated regressed, root_version regressed/mismatch, below floor, digest mismatch,
-malformed encoding) so failures are diagnosable and machine-classifiable. The checks fail
-CLOSED: any error, malformed field, or unmet condition rejects.
+artifact too large, malformed encoding) so failures are diagnosable and machine-classifiable. The
+checks fail CLOSED: any error, malformed field, or unmet condition rejects.
 
 ### 9.5 Health-gated install + rollback
 
@@ -389,24 +405,37 @@ alpha ships on the pinned-key + monotonic-freshness floor without them:
 
 ---
 
-## 12. Conformance + scope of this scaffold
+## 12. Conformance + implemented scope
 
-This repository currently implements the **trust core** (`dig-updater-trust`): the wire types
-(§5), the monotonic trust state (§6), the freshness checks (§7), and the signature + digest
-verification (§9 steps 1–6, minus network I/O), all unit-tested, plus the pinned root key
-(§4.2). The broker and worker are documented stubs that return an explicit "unimplemented"
-result; the CLI (`dig-updater`) exposes `check` / `status` as wired stubs.
+This repository implements the **beacon core** (the trust core plus the wired fetch → verify →
+plan pipeline, #504-A/-C/-D):
+
+- **`dig-updater-trust`** — the wire types (§5), the monotonic trust state (§6), the freshness
+  checks (§7), the signature + digest verification (§9, no I/O), and the pinned root key (§4.2).
+  Signatures are verified over the **received payload bytes** (§5.4), so an additive future field
+  still verifies (forward-compatible).
+- **`dig-updater-worker`** — the unprivileged fetch/verify worker (the network edge): the feed URL
+  ladder, the full §9 chain steps 1–5 against the pinned key + persisted trust state, and per
+  artifact streaming SHA-256 download-to-staging with the §9-step-6 size cap. It emits a JSON
+  verification report and holds NO install capability. Only this binary pins the root key; the
+  library takes the key as a parameter (tested with throwaway keys — no runtime key override).
+- **`dig-updater-broker`** — the privileged half: it spawns the worker UNPRIVILEGED (Unix
+  `setuid`/`setgid` drop; Windows restricted token, §8.3) and persists the Admin/SYSTEM-only,
+  atomic, forward-compatible trust state (§6, §9.3). `Broker::dry_check` runs §9 steps 1–6 and
+  NEVER advances the state.
+- **`dig-updater` (CLI)** — `check` (a dry verify pass) and `status`, with `--json` and a
+  `--feed-base` transport override (the key is never overridable).
 
 The following are follow-up tickets under epic #504 and are OUT of scope here:
 
-- **#504-D** beacon core: the wired fetch → verify → plan pipeline (worker) end to end.
 - **#504-E** enumerate installed components + ACL self-check + install + health gate + rollback
-  (broker, §9.5).
+  (broker, §9.5) — the install path that advances the trust state.
 - **#504-F** scheduler artifacts (Task Scheduler / systemd timer / launchd) with Admin/SYSTEM
-  DACLs, the single-instance lock, boot recovery, and beacon self-update (§8); the Windows
-  `asInvoker` manifest.
+  DACLs, the single-instance lock, boot recovery, and beacon self-update (§8).
 - **#504-G/-I/-H/-J/-K/-L** CLI completion, `updates.dig.net` feed + nightly signing CI,
   beacon native packages + installer registration, `dig-node` updater RPC proxy, Updates UI,
   and docs.
+- **#534** the full Windows AppContainer worker sandbox (the alpha ships the restricted-token
+  floor).
 
 A conformant beacon MUST implement §§1–9 before it installs anything on a user machine.

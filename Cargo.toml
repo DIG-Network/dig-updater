@@ -29,7 +29,7 @@ members = [
 # The RELEASE version of the beacon. The tag-on-merge + version-increment CI reads this
 # `[workspace.package].version` from the ROOT manifest (§3.6); the members inherit it via
 # `version.workspace = true`, so a release fires off this single value.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-updater"
@@ -39,10 +39,37 @@ authors = ["DIG Network"]
 ed25519-dalek = "2"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` lets the verifier capture a signed payload's EXACT received byte slice
+# (`serde_json::value::RawValue`) instead of a re-serialization of the parsed struct — the
+# forward-compatibility fix at the heart of #504-D (SPEC §5.4).
+serde_json = { version = "1", features = ["raw_value"] }
 base64 = "0.22"
 hex = "0.4"
 thiserror = "1"
+# The worker's only network dependency: a small, blocking HTTP/HTTPS client (rustls). The
+# beacon is a transient single-pass process, so blocking I/O is the right model and avoids an
+# async runtime in the security-sensitive fetch path.
+ureq = "2"
+# OS privilege primitives for the privileged broker's sandboxed spawn + state-dir hardening.
+# These live ONLY in the broker's `platform` module (the sole `unsafe` surface); every other
+# crate keeps `#![forbid(unsafe_code)]`.
+libc = "0.2"
+# Test-only: a minimal blocking HTTP server so the fetch/verify pipeline is exercised over a
+# real socket on every OS runner.
+tiny_http = "0.12"
+tempfile = "3"
+
+[workspace.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Console",
+]
 
 # Release hardening (matches dig-node/digstore): keep integer-overflow checks ON in
 # release. The beacon parses an untrusted signed feed and does length/offset arithmetic

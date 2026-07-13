@@ -46,5 +46,5 @@ pub use pinned_key::{beacon_root_verifying_key, BEACON_ROOT_PUBKEY_B64};
 pub use trust_state::TrustState;
 pub use verify::{
     verify_artifact_digest, verify_delegation, verify_freshness, verify_manifest_signature,
-    verify_update_chain, TrustError,
+    verify_rollback_floor, verify_sha256, verify_update_chain, TrustError,
 };

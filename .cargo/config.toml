@@ -1,0 +1,17 @@
+# Windows UAC Installer-Detection auto-elevates any executable whose file name contains
+# "update"/"updater"/"install"/"setup"/"patch" unless the binary embeds an application
+# manifest that declares `requestedExecutionLevel level="asInvoker"`. Every beacon binary
+# (dig-updater, dig-updater-worker, and the test harnesses) is named "*updater*", so without
+# this manifest Windows refuses to launch them in a non-elevated context (os error 740) and
+# the privileged broker could not spawn the UNPRIVILEGED worker at all.
+#
+# The beacon runs at the privilege it is GIVEN (SYSTEM broker, low-integrity worker) — it must
+# never silently self-elevate via the UAC heuristic. `asInvoker` disables that heuristic. This
+# is the Windows `asInvoker` manifest that #504-F tracks, brought forward because the -D
+# binaries cannot run or spawn without it. `/MANIFESTUAC` makes link.exe synthesize + embed
+# the manifest, so it also covers the `cargo test` harness executables.
+[target.'cfg(windows)']
+rustflags = [
+    "-C", "link-arg=/MANIFEST:EMBED",
+    "-C", "link-arg=/MANIFESTUAC:level='asInvoker' uiAccess='false'",
+]

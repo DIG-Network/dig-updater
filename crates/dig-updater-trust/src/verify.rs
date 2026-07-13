@@ -3,7 +3,12 @@
 //!
 //! Every check fails **closed** with a specific [`TrustError`]. The signature checks use
 //! `ed25519_dalek`'s strict verification (`verify_strict`), which rejects small-order /
-//! non-canonical public keys and malleable signatures.
+//! non-canonical public keys and malleable signatures. Signatures are always checked over the
+//! **exact received payload bytes** ([`SignedDelegation::signed_payload`] /
+//! [`SignedManifest::signed_payload`]), never over a re-serialization — see the [`manifest`]
+//! module docs for why (forward-compatibility, SPEC §5.4).
+//!
+//! [`manifest`]: crate::manifest
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -13,7 +18,8 @@ use crate::manifest::{Artifact, Manifest, SignedDelegation, SignedManifest};
 use crate::trust_state::TrustState;
 
 /// Everything that can make an update untrusted. Each variant is a distinct, testable
-/// rejection reason; nothing is collapsed into a generic "invalid".
+/// rejection reason; nothing is collapsed into a generic "invalid". [`TrustError::code`]
+/// exposes a stable machine-classifiable string for each (§6.2).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TrustError {
     /// A signature string was not valid base64 or not a 64-byte Ed25519 signature.
@@ -22,6 +28,9 @@ pub enum TrustError {
     /// A public-key string was not valid base64 or not a valid 32-byte Ed25519 key.
     #[error("malformed key encoding: {0}")]
     BadKeyEncoding(String),
+    /// A signed feed object (envelope or payload) was not well-formed JSON.
+    #[error("malformed JSON: {0}")]
+    MalformedJson(String),
     /// The delegation's signature did not verify under the pinned root key.
     #[error("delegation signature does not verify under the pinned root key")]
     DelegationSignatureInvalid,
@@ -102,6 +111,30 @@ pub enum TrustError {
     BadDigestHex(String),
 }
 
+impl TrustError {
+    /// A stable, machine-classifiable snake_case code for this rejection. Stable codes let the
+    /// broker, logs, and agents branch on the reason without parsing human prose (§6.2).
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::BadSignatureEncoding(_) => "bad_signature_encoding",
+            Self::BadKeyEncoding(_) => "bad_key_encoding",
+            Self::MalformedJson(_) => "malformed_json",
+            Self::DelegationSignatureInvalid => "delegation_signature_invalid",
+            Self::ManifestSignatureInvalid => "manifest_signature_invalid",
+            Self::DelegationExpired { .. } => "delegation_expired",
+            Self::ManifestExpired { .. } => "manifest_expired",
+            Self::RootVersionRegressed { .. } => "root_version_regressed",
+            Self::SequenceRegressed { .. } => "sequence_regressed",
+            Self::GeneratedRegressed { .. } => "generated_regressed",
+            Self::RootVersionMismatch { .. } => "root_version_mismatch",
+            Self::BelowRollbackFloor { .. } => "below_rollback_floor",
+            Self::DigestMismatch { .. } => "digest_mismatch",
+            Self::BadDigestHex(_) => "bad_digest_hex",
+        }
+    }
+}
+
 /// Decode a base64 32-byte Ed25519 public key.
 fn decode_verifying_key(b64: &str) -> Result<VerifyingKey, TrustError> {
     let bytes = base64::engine::general_purpose::STANDARD
@@ -129,14 +162,14 @@ fn decode_signature(b64: &str) -> Result<Signature, TrustError> {
 ///
 /// This is step 1 of the chain: it establishes which key is currently allowed to sign
 /// manifests. A delegation that is unsigned-by-root, malformed, or expired yields no
-/// targets key.
+/// targets key. The signature is checked over the delegation's exact received bytes.
 pub fn verify_delegation(
     root: &VerifyingKey,
     signed: &SignedDelegation,
     now: u64,
 ) -> Result<VerifyingKey, TrustError> {
     let sig = decode_signature(&signed.signature)?;
-    root.verify_strict(&signed.delegation.signing_bytes(), &sig)
+    root.verify_strict(signed.signed_payload(), &sig)
         .map_err(|_| TrustError::DelegationSignatureInvalid)?;
     if now > signed.delegation.expires {
         return Err(TrustError::DelegationExpired {
@@ -147,15 +180,16 @@ pub fn verify_delegation(
     decode_verifying_key(&signed.delegation.targets_pubkey)
 }
 
-/// Verify a [`SignedManifest`]'s signature under the given **targets** key. This checks the
-/// signature ONLY; freshness/expiry/monotonicity are [`verify_freshness`].
+/// Verify a [`SignedManifest`]'s signature under the given **targets** key, over the manifest's
+/// exact received bytes. This checks the signature ONLY; freshness/expiry/monotonicity are
+/// [`verify_freshness`].
 pub fn verify_manifest_signature(
     targets: &VerifyingKey,
     signed: &SignedManifest,
 ) -> Result<(), TrustError> {
     let sig = decode_signature(&signed.signature)?;
     targets
-        .verify_strict(&signed.manifest.signing_bytes(), &sig)
+        .verify_strict(signed.signed_payload(), &sig)
         .map_err(|_| TrustError::ManifestSignatureInvalid)
 }
 
@@ -209,12 +243,14 @@ pub fn verify_rollback_floor(manifest: &Manifest) -> Result<(), TrustError> {
     Ok(())
 }
 
-/// Verify that `bytes` hash to the artifact's declared SHA-256. This is the last gate
-/// before a downloaded artifact reaches the privileged installer: verify-then-install,
-/// never install-then-verify.
-pub fn verify_artifact_digest(artifact: &Artifact, bytes: &[u8]) -> Result<(), TrustError> {
-    let expected = artifact.sha256.to_ascii_lowercase();
-    // Validate the declared digest is well-formed 32-byte hex before comparing.
+/// Verify that a computed SHA-256 equals a declared lowercase-hex digest. The declared digest
+/// MUST be well-formed 32-byte hex or the check fails closed with [`TrustError::BadDigestHex`].
+///
+/// This is the shared digest gate: [`verify_artifact_digest`] uses it for an in-memory slice,
+/// and the worker's streaming downloader uses it for the incrementally-hashed artifact — so a
+/// hostile CDN's bytes are rejected identically whether hashed at once or in chunks.
+pub fn verify_sha256(expected_hex: &str, actual: &[u8; 32]) -> Result<(), TrustError> {
+    let expected = expected_hex.to_ascii_lowercase();
     let expected_raw =
         hex::decode(&expected).map_err(|e| TrustError::BadDigestHex(e.to_string()))?;
     if expected_raw.len() != 32 {
@@ -223,11 +259,21 @@ pub fn verify_artifact_digest(artifact: &Artifact, bytes: &[u8]) -> Result<(), T
             expected_raw.len()
         )));
     }
-    let actual = hex::encode(Sha256::digest(bytes));
-    if actual != expected {
-        return Err(TrustError::DigestMismatch { expected, actual });
+    if expected_raw.as_slice() != actual.as_slice() {
+        return Err(TrustError::DigestMismatch {
+            expected,
+            actual: hex::encode(actual),
+        });
     }
     Ok(())
+}
+
+/// Verify that `bytes` hash to the artifact's declared SHA-256. This is the last gate
+/// before a downloaded artifact reaches the privileged installer: verify-then-install,
+/// never install-then-verify.
+pub fn verify_artifact_digest(artifact: &Artifact, bytes: &[u8]) -> Result<(), TrustError> {
+    let actual: [u8; 32] = Sha256::digest(bytes).into();
+    verify_sha256(&artifact.sha256, &actual)
 }
 
 /// The full trust chain, applied in order: verify the delegation under the pinned root key,
@@ -261,8 +307,8 @@ pub fn verify_update_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Artifact, Component, Delegation};
-    use ed25519_dalek::{Signer, SigningKey};
+    use crate::manifest::{Artifact, Component, Delegation, SignedDelegation, SignedManifest};
+    use ed25519_dalek::SigningKey;
 
     // Deterministic test keys (fixed seeds — no rng). These are TEST keys only; they are
     // unrelated to the pinned production root key (whose private half is a CI secret).
@@ -279,21 +325,6 @@ mod tests {
 
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
-    }
-
-    fn sign_delegation(sk: &SigningKey, d: Delegation) -> SignedDelegation {
-        let signature = b64(&sk.sign(&d.signing_bytes()).to_bytes());
-        SignedDelegation {
-            delegation: d,
-            signature,
-        }
-    }
-    fn sign_manifest(sk: &SigningKey, m: Manifest) -> SignedManifest {
-        let signature = b64(&sk.sign(&m.signing_bytes()).to_bytes());
-        SignedManifest {
-            manifest: m,
-            signature,
-        }
     }
 
     fn sample_manifest() -> Manifest {
@@ -319,20 +350,21 @@ mod tests {
         }
     }
 
+    fn sample_delegation(root_version: u32, expires: u64, targets: &VerifyingKey) -> Delegation {
+        Delegation {
+            root_version,
+            targets_pubkey: b64(&targets.to_bytes()),
+            expires,
+        }
+    }
+
     /// The whole chain accepts a correctly-signed, fresh, in-floor update.
     #[test]
     fn full_chain_accepts_valid_update() {
         let (rk, rv) = root_keys();
         let (tk, tv) = targets_keys();
-        let deleg = sign_delegation(
-            &rk,
-            Delegation {
-                root_version: 1,
-                targets_pubkey: b64(&tv.to_bytes()),
-                expires: 5000,
-            },
-        );
-        let man = sign_manifest(&tk, sample_manifest());
+        let deleg = SignedDelegation::sign(sample_delegation(1, 5000, &tv), &rk);
+        let man = SignedManifest::sign(sample_manifest(), &tk);
         let state = TrustState::initial();
         assert_eq!(verify_update_chain(&rv, &state, &deleg, &man, 1500), Ok(()));
     }
@@ -341,18 +373,28 @@ mod tests {
     #[test]
     fn good_manifest_signature_passes() {
         let (tk, tv) = targets_keys();
-        let man = sign_manifest(&tk, sample_manifest());
+        let man = SignedManifest::sign(sample_manifest(), &tk);
         assert_eq!(verify_manifest_signature(&tv, &man), Ok(()));
     }
 
-    /// Tampering with the manifest payload after signing invalidates the signature.
+    /// Tampering with the manifest payload after parsing invalidates the signature: the
+    /// signature covers the received bytes, so a re-serialized tampered payload no longer
+    /// matches. (We tamper by re-signing bytes that differ from the envelope's payload.)
     #[test]
-    fn tampered_manifest_fails_signature() {
+    fn tampered_manifest_body_fails_signature() {
         let (tk, tv) = targets_keys();
-        let mut man = sign_manifest(&tk, sample_manifest());
-        man.manifest.components[0].version = "9.9.9".to_string(); // tamper post-sign
+        // Sign the honest manifest, then splice its signature onto a DIFFERENT payload.
+        let honest = SignedManifest::sign(sample_manifest(), &tk);
+        let mut evil = sample_manifest();
+        evil.components[0].version = "9.9.9".to_string();
+        let evil_json = format!(
+            r#"{{"manifest":{},"signature":"{}"}}"#,
+            String::from_utf8(evil.signing_bytes()).unwrap(),
+            honest.signature
+        );
+        let spliced = SignedManifest::from_json(&evil_json).unwrap();
         assert_eq!(
-            verify_manifest_signature(&tv, &man),
+            verify_manifest_signature(&tv, &spliced),
             Err(TrustError::ManifestSignatureInvalid)
         );
     }
@@ -360,11 +402,10 @@ mod tests {
     /// A manifest signed by the wrong (undelegated) key is rejected.
     #[test]
     fn manifest_signed_by_wrong_key_fails() {
-        let (_rk, _rv) = root_keys();
+        let (rk, _rv) = root_keys();
         let (_tk, tv) = targets_keys();
         // Sign with the ROOT key but verify under the TARGETS key.
-        let (rk, _) = root_keys();
-        let man = sign_manifest(&rk, sample_manifest());
+        let man = SignedManifest::sign(sample_manifest(), &rk);
         assert_eq!(
             verify_manifest_signature(&tv, &man),
             Err(TrustError::ManifestSignatureInvalid)
@@ -377,14 +418,7 @@ mod tests {
         let (_rk, rv) = root_keys();
         let (tk, tv) = targets_keys();
         // Sign the delegation with the TARGETS key instead of the root key.
-        let deleg = sign_delegation(
-            &tk,
-            Delegation {
-                root_version: 1,
-                targets_pubkey: b64(&tv.to_bytes()),
-                expires: 5000,
-            },
-        );
+        let deleg = SignedDelegation::sign(sample_delegation(1, 5000, &tv), &tk);
         assert_eq!(
             verify_delegation(&rv, &deleg, 1000),
             Err(TrustError::DelegationSignatureInvalid)
@@ -410,14 +444,7 @@ mod tests {
     fn expired_delegation_fails() {
         let (rk, rv) = root_keys();
         let (_tk, tv) = targets_keys();
-        let deleg = sign_delegation(
-            &rk,
-            Delegation {
-                root_version: 1,
-                targets_pubkey: b64(&tv.to_bytes()),
-                expires: 100,
-            },
-        );
+        let deleg = SignedDelegation::sign(sample_delegation(1, 100, &tv), &rk);
         assert_eq!(
             verify_delegation(&rv, &deleg, 101),
             Err(TrustError::DelegationExpired {
@@ -477,15 +504,8 @@ mod tests {
     fn root_version_mismatch_fails() {
         let (rk, rv) = root_keys();
         let (tk, tv) = targets_keys();
-        let deleg = sign_delegation(
-            &rk,
-            Delegation {
-                root_version: 2, // delegation says 2
-                targets_pubkey: b64(&tv.to_bytes()),
-                expires: 5000,
-            },
-        );
-        let man = sign_manifest(&tk, sample_manifest()); // manifest says 1
+        let deleg = SignedDelegation::sign(sample_delegation(2, 5000, &tv), &rk); // says 2
+        let man = SignedManifest::sign(sample_manifest(), &tk); // says 1
         assert_eq!(
             verify_update_chain(&rv, &TrustState::initial(), &deleg, &man, 1500),
             Err(TrustError::RootVersionMismatch {
@@ -535,6 +555,16 @@ mod tests {
         assert!(matches!(err, TrustError::BadDigestHex(_)));
     }
 
+    /// A declared digest of the wrong byte length is rejected as bad hex.
+    #[test]
+    fn digest_wrong_length_fails() {
+        let short = hex::encode([0u8; 16]);
+        assert!(matches!(
+            verify_sha256(&short, &[0u8; 32]),
+            Err(TrustError::BadDigestHex(_))
+        ));
+    }
+
     /// Malformed signature/key encodings are rejected with the specific error.
     #[test]
     fn malformed_encodings_fail() {
@@ -560,18 +590,86 @@ mod tests {
     #[test]
     fn delegation_bad_targets_key_fails() {
         let (rk, rv) = root_keys();
-        let deleg = sign_delegation(
-            &rk,
+        let deleg = SignedDelegation::sign(
             Delegation {
                 root_version: 1,
                 targets_pubkey: "not-a-key".to_string(),
                 expires: 5000,
             },
+            &rk,
         );
         assert!(matches!(
             verify_delegation(&rv, &deleg, 1000),
             Err(TrustError::BadKeyEncoding(_))
         ));
+    }
+
+    /// Every rejection carries a distinct, stable code (no two variants collide).
+    #[test]
+    fn error_codes_are_distinct_and_stable() {
+        use std::collections::HashSet;
+        let errors = [
+            TrustError::BadSignatureEncoding(String::new()),
+            TrustError::BadKeyEncoding(String::new()),
+            TrustError::MalformedJson(String::new()),
+            TrustError::DelegationSignatureInvalid,
+            TrustError::ManifestSignatureInvalid,
+            TrustError::DelegationExpired { expires: 0, now: 0 },
+            TrustError::ManifestExpired { expires: 0, now: 0 },
+            TrustError::RootVersionRegressed {
+                trusted: 0,
+                manifest: 0,
+            },
+            TrustError::SequenceRegressed {
+                trusted: 0,
+                manifest: 0,
+            },
+            TrustError::GeneratedRegressed {
+                trusted: 0,
+                manifest: 0,
+            },
+            TrustError::RootVersionMismatch {
+                manifest: 0,
+                delegation: 0,
+            },
+            TrustError::BelowRollbackFloor {
+                name: String::new(),
+                build: 0,
+                floor: 0,
+            },
+            TrustError::DigestMismatch {
+                expected: String::new(),
+                actual: String::new(),
+            },
+            TrustError::BadDigestHex(String::new()),
+        ];
+        let codes: HashSet<_> = errors.iter().map(TrustError::code).collect();
+        assert_eq!(codes.len(), errors.len(), "codes must be unique");
+    }
+
+    /// A manifest carrying an unknown, additive field STILL verifies (SPEC §5.2/§5.4
+    /// forward-compatibility). This is the regression proof for the #504-D fix: the signature
+    /// is checked over the received bytes (which include the unknown field), so an old reader
+    /// that cannot interpret the field still accepts the message.
+    #[test]
+    fn unknown_field_manifest_still_verifies() {
+        let (tk, tv) = targets_keys();
+        // A signer emits a canonical manifest AND an additive future field, and signs the
+        // exact bytes it emits.
+        let canonical = String::from_utf8(sample_manifest().signing_bytes()).unwrap();
+        // Insert `"future_flag":true,` right after the opening brace (still valid JSON).
+        let with_extra = format!("{{\"future_flag\":true,{}", &canonical[1..]);
+        let sig = b64(&{
+            use ed25519_dalek::Signer;
+            tk.sign(with_extra.as_bytes()).to_bytes()
+        });
+        let envelope = format!(r#"{{"manifest":{with_extra},"signature":"{sig}"}}"#);
+
+        let parsed = SignedManifest::from_json(&envelope).expect("well-formed JSON");
+        // The old reader parsed the known fields and ignored `future_flag`...
+        assert_eq!(parsed.manifest.sequence, 10);
+        // ...and the signature STILL verifies over the received bytes.
+        assert_eq!(verify_manifest_signature(&tv, &parsed), Ok(()));
     }
 
     /// `TrustState::advance` folds the manifest's marks forward and never regresses.
@@ -598,16 +696,5 @@ mod tests {
     fn errors_display() {
         let e = TrustError::ManifestExpired { expires: 1, now: 2 };
         assert!(e.to_string().contains("expired"));
-    }
-
-    /// Manifest lookups by component/artifact resolve as expected.
-    #[test]
-    fn manifest_lookups() {
-        let m = sample_manifest();
-        assert!(m.component("dig-node").is_some());
-        assert!(m.component("nope").is_none());
-        let c = m.component("dig-node").unwrap();
-        assert!(c.artifact("linux", "x64").is_some());
-        assert!(c.artifact("windows", "x64").is_none());
     }
 }
