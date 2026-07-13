@@ -128,11 +128,20 @@ impl TrustStateStore {
     }
 }
 
-/// Read a required unsigned-integer field, failing closed if it is absent or not a `u64`.
+/// Read a required monotonic mark, failing closed if it is absent or not a `u64`.
+///
+/// A mark that is MISSING from a state file that otherwise exists is treated as corruption, NOT as
+/// a `0` default: the four marks have existed since the first on-disk format, so their absence
+/// means the file was truncated or tampered with — and defaulting the missing mark to `0` would
+/// silently lower an anti-rollback high-water-mark, re-enabling a downgrade (SPEC §6). A genuinely
+/// fresh install is the WHOLE-file-absent case, handled in [`TrustStateStore::load`] before this
+/// is ever reached. (Unknown EXTRA fields a newer beacon added are still carried forward verbatim
+/// via `LoadedState::raw`; only the four known marks are required here.)
 fn read_u64(raw: &Map<String, Value>, key: &str) -> Result<u64, BrokerError> {
     match raw.get(key) {
-        // A fresh field a newer beacon has not yet written defaults to 0 (the safe baseline).
-        None => Ok(0),
+        None => Err(BrokerError::StateCorrupt(format!(
+            "required mark `{key}` is missing from an existing state file"
+        ))),
         Some(v) => v.as_u64().ok_or_else(|| {
             BrokerError::StateCorrupt(format!("`{key}` is not an unsigned integer"))
         }),
@@ -216,14 +225,38 @@ mod tests {
     }
 
     #[test]
-    fn non_integer_mark_is_rejected() {
+    fn existing_file_missing_a_known_mark_fails_closed() {
+        // A state file that EXISTS but lacks a known mark is corruption/tampering — NOT a fresh
+        // install. Defaulting the missing mark to 0 would silently lower an anti-rollback
+        // high-water-mark (SPEC §6), so it must fail closed instead.
         let (dir, store) = store();
         std::fs::write(
             dir.path().join("trust-state.json"),
-            br#"{"sequence":"lots"}"#,
+            // `sequence` is deliberately omitted.
+            br#"{"root_version":1,"generated":100,"rollback_floor_build":3}"#,
         )
         .unwrap();
-        assert!(matches!(store.load(), Err(BrokerError::StateCorrupt(_))));
+        let err = store
+            .load()
+            .expect_err("a missing mark must not default to 0");
+        assert!(matches!(err, BrokerError::StateCorrupt(_)));
+        assert!(err.to_string().contains("sequence"));
+    }
+
+    #[test]
+    fn non_integer_mark_is_rejected() {
+        let (dir, store) = store();
+        // All four marks present, but `sequence` is a string — a corrupt value, not a missing one.
+        std::fs::write(
+            dir.path().join("trust-state.json"),
+            br#"{"root_version":1,"sequence":"lots","generated":100,"rollback_floor_build":3}"#,
+        )
+        .unwrap();
+        let err = store
+            .load()
+            .expect_err("a non-integer mark must be rejected");
+        assert!(matches!(err, BrokerError::StateCorrupt(_)));
+        assert!(err.to_string().contains("not an unsigned integer"));
     }
 
     #[test]

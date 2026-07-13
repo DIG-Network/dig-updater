@@ -95,6 +95,11 @@ pub fn run(request: &WorkerRequest, root: &VerifyingKey) -> Result<VerifiedPlan,
         sequence: m.sequence,
         generated: m.generated,
         rollback_floor_build: m.rollback_floor_build,
+        // Carry the exact verified feed bytes back so the privileged broker re-verifies the whole
+        // chain under its own pinned key before installing (SPEC §8.3) — the worker is never
+        // trusted to have verified on the install path.
+        delegation_json: feed.delegation_json,
+        manifest_json: feed.manifest_json,
         artifacts,
     })
 }

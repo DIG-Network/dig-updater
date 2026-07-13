@@ -10,9 +10,20 @@ authors.workspace = true
 [dependencies]
 dig-updater-trust = { path = "../dig-updater-trust" }
 dig-updater-worker = { path = "../dig-updater-worker" }
+# The SHARED, already-released component-resolution + Install/Update/Skip decision matrix
+# (factored out of dig-installer, #508). The broker consumes `detect_installed_version` + `decide`
+# so the enumeration decision is IDENTICAL to what the installer ships — never a second copy that
+# could drift (SPEC §12, CLAUDE.md §4.1 release-first). Pinned to the released tag.
+dig-release-resolver = { git = "https://github.com/DIG-Network/dig-release-resolver", tag = "v0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Streaming SHA-256 for the broker's independent staging re-verify + rollback-cache re-verify — it
+# never trusts the worker's reported digest on the install path (SPEC §8.3).
+sha2 = { workspace = true }
+# The pinned root VerifyingKey the broker RE-VERIFIES each plan under (SPEC §8.3) — the broker is a
+# second, independent verifier of the whole chain, not a consumer of the worker's word.
+ed25519-dalek = { workspace = true }
 
 # OS privilege primitives — the ONLY `unsafe` in the whole workspace lives in `src/sandbox.rs`,
 # gated behind these per-OS deps.

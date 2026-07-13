@@ -286,6 +286,8 @@ mod tests {
             sequence: 42,
             generated: 1000,
             rollback_floor_build: 20,
+            delegation_json: "{}".into(),
+            manifest_json: "{}".into(),
             artifacts: vec![StagedArtifact {
                 component: "dig-node".into(),
                 version: "0.26.0".into(),
