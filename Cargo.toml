@@ -41,7 +41,7 @@ members = [
 # The RELEASE version of the beacon. The tag-on-merge + version-increment CI reads this
 # `[workspace.package].version` from the ROOT manifest (§3.6); the members inherit it via
 # `version.workspace = true`, so a release fires off this single value.
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-updater"
