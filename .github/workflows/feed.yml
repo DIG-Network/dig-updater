@@ -39,6 +39,15 @@ env:
 jobs:
   sign-verify-publish:
     name: Sign, verify end-to-end, publish
+    # H1 (#540): the signing capability is bound to REVIEWED main code. A workflow_dispatch (or any
+    # on:push) from an unreviewed branch must never sign with the real pinned key + publish to the
+    # `feed` release every shipped beacon trusts — that would bypass the §2.4 PR-review gate. The
+    # cron + the production dispatch both run on main, so this guard costs nothing legitimate.
+    if: github.ref == 'refs/heads/main'
+    # BEACON_SIGNING_KEY MUST be a main-scoped GitHub Environment secret with a required reviewer
+    # (env `feed-signing`, #540) — NEVER a plain repo secret. Referencing the environment here readies
+    # that binding (an as-yet-uncreated environment is inert; @mt-dev adds the protected secret to it).
+    environment: feed-signing
     runs-on: ubuntu-latest
     steps:
       - name: Require BEACON_SIGNING_KEY (else no-op)
