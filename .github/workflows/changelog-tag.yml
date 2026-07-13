@@ -1,0 +1,97 @@
+# On merge to main: regenerate CHANGELOG.md from Conventional Commits (git-cliff), commit
+# it to main, THEN tag that commit vX.Y.Z and push the tag. The changelog is therefore
+# INCLUDED in the tag. The pushed tag triggers the binary release workflow (release.yml,
+# wired `on: push: tags: ['v*']`). See the ecosystem release contract (§3.6).
+#
+# The tag is pushed with RELEASE_TOKEN (an org-level PAT): a tag pushed by the default
+# GITHUB_TOKEN does NOT trigger downstream workflows (GitHub anti-recursion), and the PAT's
+# identity is allowed past branch protection (enforce_admins is off) to push the changelog
+# commit. If RELEASE_TOKEN is not yet configured on this repo, the whole job NO-OPS with a
+# clear warning instead of half-releasing — add the org secret to enable releases.
+#
+# Idempotent + loop-safe: no-op if the version's tag already exists; skips its own
+# `chore(release):` changelog commit.
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Changelog + tag
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require RELEASE_TOKEN (else no-op)
+        id: token
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::warning::RELEASE_TOKEN is not set on this repo. The changelog+tag release is a NO-OP until the org-level PAT secret is added (see runbooks/ + SPEC.md). Merges will not release."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Resolve version + skip if already tagged
+        if: steps.token.outputs.present == 'true'
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          crg() {
+            [ -f Cargo.toml ] || { echo ""; return; }
+            python3 -c 'import tomllib; d=tomllib.load(open("Cargo.toml","rb")); v=d.get("package",{}).get("version") or d.get("workspace",{}).get("package",{}).get("version") or ""; print(v if isinstance(v,str) else "")' 2>/dev/null || echo ""
+          }
+          VER="$(crg)"
+          if [ -z "$VER" ]; then echo "skip=true" >>"$GITHUB_OUTPUT"; echo "No version file — nothing to release."; exit 0; fi
+          TAG="v$VER"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+             || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"; echo "Tag $TAG already exists — no-op."; exit 0
+          fi
+          echo "skip=false" >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+          echo "Releasing $TAG"
+
+      - name: Install git-cliff
+        if: steps.token.outputs.present == 'true' && steps.ver.outputs.skip == 'false'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Generate changelog
+        if: steps.token.outputs.present == 'true' && steps.ver.outputs.skip == 'false'
+        run: git-cliff --config cliff.toml --tag "${{ steps.ver.outputs.tag }}" --output CHANGELOG.md
+
+      - name: Commit changelog, tag, push
+        if: steps.token.outputs.present == 'true' && steps.ver.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "dig-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add CHANGELOG.md
+          # `chore(release):` prefix so this workflow skips its own push (loop guard above).
+          git commit -m "chore(release): ${{ steps.ver.outputs.tag }}" || echo "changelog unchanged"
+          git tag -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
+          git push origin "HEAD:main"
+          git push origin "${{ steps.ver.outputs.tag }}"
+          echo "Pushed changelog commit + ${{ steps.ver.outputs.tag }} — release-on-tag will fire."
