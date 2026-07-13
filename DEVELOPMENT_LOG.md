@@ -50,3 +50,35 @@ change diary.
   Missing file = fresh install (initial). Writes are atomic (temp + rename). Unknown fields are
   preserved across a load→save round-trip so a fleet rollback to an older beacon never destroys
   state a newer one wrote.
+
+## Feed signing (-I)
+
+- **One serializer, shared by signer + verifier.** `dig-updater-feedsign` signs via the trust
+  core's own `SignedManifest::sign` / `SignedDelegation::sign` and emits with `.to_json()` (the raw
+  signed payload embedded verbatim). It NEVER re-implements the wire format. That is what makes the
+  signer/verifier agreement structural rather than hopeful — the hermetic `produced_feed_verifies_
+  end_to_end` test and the CI keystone (pinned-key beacon verifies the signed feed) both prove it.
+- **`BEACON_SIGNING_KEY` shape is uncertain, so normalize + assert.** The alpha key was made with
+  `openssl genpkey -algorithm ed25519`, so the secret is most likely a PKCS#8 PEM. feedsign accepts
+  three shapes — PKCS#8 PEM, base64 PKCS#8 DER, or base64 of the raw 32-byte seed — by stripping PEM
+  armor, base64-decoding, and taking the 32-byte seed (raw, or the tail after the fixed 16-byte
+  PKCS#8-v1 Ed25519 prefix `30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20`). Then it asserts the
+  DERIVED public key equals the pinned `BEACON_ROOT_PUBKEY_B64` and refuses to sign otherwise — a
+  key-hygiene mistake becomes a loud CI failure, never a silently-unverifiable feed.
+- **`generated`/`sequence` is the wall clock, supplied IN.** The workflow passes `date +%s`; the
+  signer never calls the clock (determinism + reproducibility). The unix timestamp doubles as the
+  monotonic anti-freeze/anti-rollback high-water-mark, so the 6h cadence naturally advances it.
+- **`build` packs `major·10⁶ + minor·10³ + patch`** (minor/patch < 1000, enforced) so a higher
+  release always sorts higher for the anti-downgrade floor. Per component; the manifest-level
+  `rollback_floor_build` is a single value compared to every component's build (alpha floor 0).
+- **Asset match is exact.** `{prefix}-{version}-{token}` where token ∈ {`linux-x64`,`macos-arm64`,
+  `macos-x64`,`windows-x64.exe`}. Exactness is load-bearing: a digstore release also ships `digs-…`
+  and `digstore-…-x86_64-unknown-linux-gnu.tar.gz`; only the exact binary name is an artifact.
+- **The `feed` release MUST be `--prerelease --latest=false`.** Otherwise it shadows the dig-updater
+  component's own `/releases/latest`, since the feed resolves dig-updater from the SAME repo it
+  publishes the feed to.
+- **Publish is gated on the end-to-end verify.** feed.yml orders sign → serve locally →
+  pinned-key `dig-updater check --feed-base …` (must report `status:verified`) → publish. A feed
+  that does not verify is never served; the previous feed simply expires (12h) if a run is skipped.
+- **Byte-identical serving is a hard requirement.** The verifier checks the signature over the
+  RECEIVED bytes, so any transport transform of the JSON breaks it. Origins must serve verbatim.

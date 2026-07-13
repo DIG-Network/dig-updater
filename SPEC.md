@@ -354,22 +354,76 @@ prior build, so a rollback never bricks on unreadable state and never destroys d
 
 ## 10. The feed + signing (CI)
 
-The signed feed is published at `updates.dig.net` (its own infrastructure). CI on
-`DIG-Network/dig-updater` signs it:
+The signed feed is two UTF-8 JSON documents — `delegation.json` (§5.1) and `manifest.json` (§5.2)
+— served under a **feed base URL**. The beacon fetches `{base}/delegation.json` and
+`{base}/manifest.json` from each base in its ladder (untrusted transport, §1); the first base that
+serves BOTH wins.
 
-- On each nightly/release run, CI builds the components' artifacts, computes each artifact's
-  SHA-256, assembles the manifest with a fresh `sequence`/`generated`/`expires`, and signs it
-  with `BEACON_SIGNING_KEY` (the targets key). It publishes the current delegation (signed by
-  the root key) alongside.
-- A heartbeat job re-signs the manifest (fresh `generated`/`expires`) at least every 12 hours
-  (§7) even when no component changed, so clients can always obtain an unexpired manifest.
-- The private key exists ONLY as the CI secret (§4.2). Signing MUST occur inside CI; the key
-  MUST NOT be exported.
+### 10.1 Feed URLs
 
-`updates.dig.net`, the `dig-release-resolver` crate that maps a component+os+arch to its GitHub
-release asset, the beacon's own native packages, the installer's registration of the beacon
-service, and the `dig-node` updater RPC proxy are specified/built in the follow-up tickets
-(§12) and are out of scope for this scaffold.
+| Tier | Base URL | delegation | manifest |
+|------|----------|------------|----------|
+| Primary (production) | `https://updates.dig.net/v1/alpha` | `…/v1/alpha/delegation.json` | `…/v1/alpha/manifest.json` |
+| Fallback (alpha, baked-in) | `https://github.com/DIG-Network/dig-updater/releases/download/feed` | `…/feed/delegation.json` | `…/feed/manifest.json` |
+
+The alpha channel ships on the FALLBACK — a rolling GitHub release tagged `feed` — so it works with
+NO AWS dependency. `updates.dig.net` (its own S3+CloudFront, ticket #504-I(b)) becomes primary by a
+deploy-time flip once its OIDC role lands; that is a transport change, not a code change, because
+both bases are untrusted (§1).
+
+### 10.2 Cadence + freshness
+
+CI re-signs the feed **every 6 hours** (`cron: 0 */6 * * *`, plus on demand). Each run stamps a
+fresh `generated` == `sequence` == the run's unix time, a manifest `expires` = `generated + 12h`
+(§7), and a delegation `expires` = `generated + 30d`. The 6-hour cadence against the 12-hour
+manifest expiry leaves 6 hours of slack, so a single skipped/failed run never leaves clients without
+an unexpired manifest. Because `generated`/`sequence` is the wall-clock time, it is monotonic across
+runs and IS the anti-freeze/anti-rollback high-water-mark directly. The `generated` timestamp is
+supplied INTO the signer by the workflow (not read from the signer's clock), so a run is
+deterministic and reproducible.
+
+### 10.3 What the manifest states
+
+For every configured component the signer resolves the **latest GitHub release**, selects the
+per-OS/arch binary assets — named `{prefix}-{version}-{platform-token}` (e.g.
+`dig-node-0.29.0-linux-x64`, `digstore-0.13.1-windows-x64.exe`; sibling `.tar.gz`/companion assets
+are excluded) — downloads each, and records its SHA-256 + size. The component `build` is the packed
+monotonic number `major·10⁶ + minor·10³ + patch`, so a higher release always sorts higher (§5.3);
+`minor`/`patch` MUST stay below 1000 to preserve that ordering. The alpha component set is
+**dig-node, digstore, dig-updater, dig-dns**; `rollback_floor_build` comes from the committed
+`feed-config.json` (alpha default `0`). The component set, floor, and freshness windows all live in
+that one reviewable file — never hard-coded in the signer.
+
+### 10.4 Byte-identical serving — NO transform (normative)
+
+A verifier checks the signature over the payload bytes **exactly as received** (§5.4). The feed
+objects MUST therefore be served **byte-for-byte as signed** — no re-encoding, re-minification,
+whitespace/newline normalization, BOM insertion, or CDN "optimization" of the JSON. Any transform of
+`delegation.json`/`manifest.json` in transit invalidates the signature and is a SERVING bug, not a
+client bug. Both origins (the GitHub `feed` release and updates.dig.net, #504-I(b)) MUST serve the
+objects verbatim with a content type that triggers no transformation.
+
+### 10.5 Signer + secret hygiene
+
+Signing runs ONLY in CI (`.github/workflows/feed.yml`), in the `dig-updater-feedsign` crate — a
+CI-only workspace member NEVER packaged into a shipped beacon binary. It signs through the SAME
+trust core the beacon verifies with (`SignedManifest::sign` / `SignedDelegation::sign` over
+`signing_bytes`, §5.4), so the signer and the verifier cannot drift. The private key exists only as
+the `BEACON_SIGNING_KEY` secret (§4.2); it flows secret → env → the signer process and is NEVER
+exported or logged (the job summary prints only the sequence, timestamp, and public digests). Before
+signing, the signer confirms the key derives the pinned root public key (§4.2) and refuses to sign
+otherwise (fail closed). The alpha floor signs the delegation AND the manifest with the one key
+(root == targets, §4.3).
+
+### 10.6 Self-proving publish
+
+Every run PROVES itself before it publishes: CI has the freshly-built beacon — pinning the REAL root
+key — verify the just-signed feed end-to-end (delegation + manifest signatures, freshness, and each
+artifact digest) from a clean build. Publish to the `feed` release happens ONLY if that verification
+passes, so a feed that does not verify is never served. The `dig-release-resolver` crate (a cleaner
+replacement for the inline GitHub-release resolution), the beacon's own native packages, the
+installer's registration of the beacon service, and the `dig-node` updater RPC proxy are follow-up
+tickets (§12).
 
 ---
 
@@ -425,6 +479,12 @@ plan pipeline, #504-A/-C/-D):
   NEVER advances the state.
 - **`dig-updater` (CLI)** — `check` (a dry verify pass) and `status`, with `--json` and a
   `--feed-base` transport override (the key is never overridable).
+- **`dig-updater-feedsign`** — the CI-only feed signer (§10): resolves the latest release per
+  component, downloads + digests the per-OS/arch assets, assembles the manifest + delegation, and
+  signs them through the trust core (`SignedManifest::sign`/`SignedDelegation::sign`). Its
+  `feed.yml` workflow re-signs every 6h, has the freshly-built pinned-key beacon verify the result
+  end-to-end, and only then publishes the byte-exact feed to the rolling GitHub `feed` release. It
+  is NEVER packaged into a shipped beacon binary.
 
 The following are follow-up tickets under epic #504 and are OUT of scope here:
 
@@ -432,9 +492,9 @@ The following are follow-up tickets under epic #504 and are OUT of scope here:
   (broker, §9.5) — the install path that advances the trust state.
 - **#504-F** scheduler artifacts (Task Scheduler / systemd timer / launchd) with Admin/SYSTEM
   DACLs, the single-instance lock, boot recovery, and beacon self-update (§8).
-- **#504-G/-I/-H/-J/-K/-L** CLI completion, `updates.dig.net` feed + nightly signing CI,
-  beacon native packages + installer registration, `dig-node` updater RPC proxy, Updates UI,
-  and docs.
+- **#504-G/-I(b)/-H/-J/-K/-L** CLI completion, the `updates.dig.net` S3+CloudFront feed origin
+  (the signer + nightly CI itself, #504-I(a), ships here — see §10), beacon native packages +
+  installer registration, `dig-node` updater RPC proxy, Updates UI, and docs.
 - **#534** the full Windows AppContainer worker sandbox (the alpha ships the restricted-token
   floor).
 

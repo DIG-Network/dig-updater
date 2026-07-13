@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "root_version": 1,
+  "rollback_floor_build": 0,
+  "manifest_ttl_secs": 43200,
+  "delegation_ttl_secs": 2592000,
+  "components": [
+    { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node" },
+    { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore" },
+    { "name": "dig-updater", "repo": "DIG-Network/dig-updater", "asset_prefix": "dig-updater" },
+    { "name": "dig-dns", "repo": "DIG-Network/dig-dns", "asset_prefix": "dig-dns" }
+  ]
+}
