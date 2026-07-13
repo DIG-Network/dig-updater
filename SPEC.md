@@ -233,8 +233,13 @@ TrustState {
 - After a manifest is accepted, each field is advanced to `max(current, manifest value)`. The
   marks are strictly monotonic — they never move backward, even if `advance` is fed an older
   manifest.
+- All four marks — including `rollback_floor_build` — are ENFORCED as monotonic at verify time:
+  §7 rejects any manifest that regresses one (`root_version`/`sequence`/`generated`/
+  `rollback_floor_build`) against the persisted state, and §9 step 4 applies that enforcement.
 - The state MUST be persisted in an Admin/SYSTEM-only location (§9.3) so an unprivileged
-  process cannot roll it back to re-enable a downgrade.
+  process cannot roll it back to re-enable a downgrade. A persisted state file that EXISTS but is
+  missing a known mark (a truncation/tamper) MUST fail closed, NOT be read as a zeroed baseline —
+  only a wholly-absent state file is a fresh install.
 
 ---
 
@@ -248,7 +253,12 @@ enforce, in addition to the signature checks (§9):
 2. **Anti-rollback (sequence).** `manifest.sequence >= state.sequence`.
 3. **Anti-freeze (generated).** `manifest.generated >= state.generated`.
 4. **Delegation monotonicity.** `manifest.root_version >= state.root_version`.
-5. **Anti-downgrade (build floor).** For every component, `component.build >=
+5. **Floor monotonicity.** `manifest.rollback_floor_build >= state.rollback_floor_build`. The
+   floor is a monotonic high-water-mark (§6): a manifest MAY raise it but MUST NOT lower it. This
+   is a distinct check from item 6 — it defends the FLOOR itself, blocking a compromised targets
+   key from resetting the floor (e.g. to 0) within a `root_version` epoch to re-open a downgrade
+   window; only a higher-`root_version` delegation from the pinned root could legitimately do that.
+6. **Anti-downgrade (build floor).** For every component, `component.build >=
    manifest.rollback_floor_build`. A build strictly below the floor MUST NOT be installed even
    if the manifest is otherwise valid.
 
@@ -304,6 +314,22 @@ The broker MUST re-verify (or receive proof of verification for) any artifact be
 it; it MUST NOT trust the worker to have verified correctly on a security-relevant path where
 re-verification is cheap (digests are).
 
+The staging directory is writable by the (privilege-dropped) worker, so its contents and the paths
+the worker reports are untrusted. The broker therefore MUST:
+
+- **Contain the staged path.** Canonicalize the worker-reported staged path and REJECT (a distinct,
+  catalogued error) anything that does not resolve strictly inside the broker-owned staging
+  directory, BEFORE reading a byte — an absolute path elsewhere (`/tmp/evil`) or a `..` escape is
+  refused.
+- **Hash what it installs.** The bytes that are hashed MUST be the bytes that are installed. The
+  broker copies the staged artifact ONCE into a broker-private file the worker cannot write, hashing
+  from the same read, and installs from that private copy — so a swap of the staging file after the
+  hash cannot change what is installed. Equivalently, hash and install from a single held fd. It
+  MUST NOT hash a staging path and then re-open it by path to install (a TOCTOU window).
+- **Invoke native installers by absolute path.** `msiexec`/`installer`/`dpkg` MUST be run from their
+  absolute, trusted locations (e.g. `%SystemRoot%\System32\msiexec.exe`, `/usr/sbin/installer`,
+  `/usr/bin/dpkg`), never a bare name resolved through `PATH`/CWD.
+
 ---
 
 ## 9. Verification algorithm (normative)
@@ -321,8 +347,9 @@ abort (install nothing) on the first failure:
 3. **Bind manifest to delegation.** Require `M.manifest.root_version ==
    D.delegation.root_version`.
 4. **Enforce freshness (§7).** Require not-expired, `sequence >= S.sequence`,
-   `generated >= S.generated`, `root_version >= S.root_version`.
-5. **Enforce the rollback floor (§7.5).** For every component, `build >= rollback_floor_build`.
+   `generated >= S.generated`, `root_version >= S.root_version`, and
+   `rollback_floor_build >= S.rollback_floor_build` (floor monotonicity, §7.5).
+5. **Enforce the rollback floor (§7.6).** For every component, `build >= rollback_floor_build`.
 6. **Per artifact, before install:** stream the bytes from `artifact.url` into a staging file,
    hashing incrementally, and require the SHA-256 equals `artifact.sha256` (lowercase-hex
    compare). On mismatch → reject that artifact and MUST NOT install it (and remove the staged
@@ -345,7 +372,10 @@ After installing verified artifacts, the broker MUST run a health check appropri
 component (e.g. the service starts and answers a liveness probe). If the health check fails,
 the broker MUST roll back to the last known-good build and MUST re-verify the rollback target
 against the trust chain before reinstating it (a rollback is an install and gets the same
-verification). A rollback MUST NOT downgrade below `rollback_floor_build`. State migrations
+verification). A rollback MUST NOT downgrade below `rollback_floor_build`; a manual/out-of-band
+rollback MUST read that floor from the PERSISTED (Admin/SYSTEM-only) trust state, never a
+caller-supplied value, since the last-known-good record's digest is self-recorded beside the cached
+bytes. State migrations
 MUST be backward-compatible: a build's on-disk state MUST remain readable by the immediately
 prior build, so a rollback never bricks on unreadable state and never destroys data
 (no destructive down-migration).
@@ -461,8 +491,9 @@ alpha ships on the pinned-key + monotonic-freshness floor without them:
 
 ## 12. Conformance + implemented scope
 
-This repository implements the **beacon core** (the trust core plus the wired fetch → verify →
-plan pipeline, #504-A/-C/-D):
+This repository implements the **beacon core plus the install path** (the trust core, the wired
+fetch → verify → plan pipeline, and the privileged enumerate → install → health-gate → rollback,
+#504-A/-C/-D/-E):
 
 - **`dig-updater-trust`** — the wire types (§5), the monotonic trust state (§6), the freshness
   checks (§7), the signature + digest verification (§9, no I/O), and the pinned root key (§4.2).
@@ -476,7 +507,27 @@ plan pipeline, #504-A/-C/-D):
 - **`dig-updater-broker`** — the privileged half: it spawns the worker UNPRIVILEGED (Unix
   `setuid`/`setgid` drop; Windows restricted token, §8.3) and persists the Admin/SYSTEM-only,
   atomic, forward-compatible trust state (§6, §9.3). `Broker::dry_check` runs §9 steps 1–6 and
-  NEVER advances the state.
+  NEVER advances the state. `Broker::run_once` runs the FULL pass (#504-E): an ACL self-check that
+  hardens the state / staging / last-known-good directories and refuses to proceed if the beacon
+  binary or those directories are writable by a non-privileged identity (fail-closed); an
+  INDEPENDENT re-verification of the whole chain under the broker's OWN pinned root key + persisted
+  state (never trusting the worker's report, §8.3); enumeration of the installed components against
+  the re-verified manifest (Install/Update/Skip, via the shared `dig-release-resolver` decision
+  matrix); a **containment check** that refuses any worker-reported staged path which does not
+  canonicalize strictly inside the broker-owned staging directory; a **copy-then-verify** of the
+  staged bytes into a broker-private file — the bytes are streamed once into a file the worker
+  cannot write while being hashed against the re-verified digest, so the hashed bytes ARE the
+  installed bytes (the reverify→install TOCTOU is closed by construction, not by timing); a silent
+  per-OS install FROM THAT PRIVATE COPY (`msiexec /qn`, `installer -pkg`, `dpkg -i` — each invoked
+  by the installer's ABSOLUTE trusted path, never a bare name resolved through `PATH`; or a
+  retry-with-backoff raw-binary rename that DEFERS a locked target to the next pass); a per-component
+  health gate; and a re-verified, floor-bounded rollback to a last-known-good snapshot on failure.
+  The trust state advances ONLY after every actionable component installs AND passes its health gate,
+  and only after the state directory is hardened. The state, last-known-good, and apply directories
+  are all created AND explicitly hardened (Admin/SYSTEM-only) up front; staging is a broker-owned,
+  non-world-writable directory (NOT `/tmp`); and the broker's file reads on the install path refuse
+  to follow symlinks. A manual `Broker::rollback` reads its rollback floor from the PERSISTED trust
+  state, never a caller-supplied value, so a below-floor cached build can never be reinstated.
 - **`dig-updater` (CLI)** — `check` (a dry verify pass) and `status`, with `--json` and a
   `--feed-base` transport override (the key is never overridable).
 - **`dig-updater-feedsign`** — the CI-only feed signer (§10): resolves the latest release per
@@ -488,10 +539,10 @@ plan pipeline, #504-A/-C/-D):
 
 The following are follow-up tickets under epic #504 and are OUT of scope here:
 
-- **#504-E** enumerate installed components + ACL self-check + install + health gate + rollback
-  (broker, §9.5) — the install path that advances the trust state.
 - **#504-F** scheduler artifacts (Task Scheduler / systemd timer / launchd) with Admin/SYSTEM
-  DACLs, the single-instance lock, boot recovery, and beacon self-update (§8).
+  DACLs, the single-instance lock, boot recovery, and beacon self-update (§8). The single-instance
+  lock and the scheduler artifact join the broker's ACL self-check guarded-path set at that point;
+  the beacon's own self-replace uses the raw-binary DEFER-on-lock behaviour (§9.5) until then.
 - **#504-G/-I(b)/-H/-J/-K/-L** CLI completion, the `updates.dig.net` S3+CloudFront feed origin
   (the signer + nightly CI itself, #504-I(a), ships here — see §10), beacon native packages +
   installer registration, `dig-node` updater RPC proxy, Updates UI, and docs.

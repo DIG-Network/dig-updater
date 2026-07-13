@@ -75,9 +75,16 @@ impl WorkerReport {
     }
 }
 
-/// A fully-verified update plan: the accepted manifest's freshness marks plus the staged,
-/// digest-verified artifacts. This is what the worker returns on success and what the broker
-/// (in -E) installs behind a health gate before advancing the trust state.
+/// A fully-verified update plan: the accepted manifest's freshness marks, the staged
+/// digest-verified artifacts, AND the exact signed feed bytes the worker verified. This is what
+/// the worker returns on success and what the privileged broker (in -E) INDEPENDENTLY re-verifies
+/// under its own pinned root key before installing — the worker's word is never trusted on the
+/// install path (SPEC §8.3).
+///
+/// The `delegation_json` / `manifest_json` fields carry the exact envelope bytes the worker
+/// fetched so the broker re-runs the whole signature chain without touching the network itself:
+/// even a fully compromised worker cannot fabricate a plan that survives the broker's re-verify,
+/// because it does not hold a key that chains to the pinned root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedPlan {
     /// The feed source base URL that served the accepted feed.
@@ -92,6 +99,12 @@ pub struct VerifiedPlan {
     pub generated: u64,
     /// The accepted manifest `rollback_floor_build`.
     pub rollback_floor_build: u64,
+    /// The exact `delegation.json` envelope bytes the worker fetched + verified, so the broker can
+    /// re-verify the delegation signature under its OWN pinned root key (SPEC §8.3).
+    pub delegation_json: String,
+    /// The exact `manifest.json` envelope bytes the worker fetched + verified, so the broker can
+    /// re-verify the manifest signature + freshness + floor under its own pinned key.
+    pub manifest_json: String,
     /// The staged, digest-verified artifacts for the requested platform.
     pub artifacts: Vec<StagedArtifact>,
 }

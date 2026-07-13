@@ -77,6 +77,19 @@ pub enum TrustError {
         /// The candidate manifest's `generated`.
         manifest: u64,
     },
+    /// The manifest's `rollback_floor_build` is LOWER than the highest floor ever accepted. The
+    /// floor is a monotonic high-water-mark (SPEC §6) — it may rise but never fall — so a manifest
+    /// that lowers it is rejected. This blocks a compromised targets key from setting the floor
+    /// back to 0 to re-enable a downgrade to an old, validly-signed, vulnerable build within a
+    /// `root_version` epoch (the pinned root would otherwise have to rotate the delegation to
+    /// undo it).
+    #[error("rollback floor regressed: trusted {trusted}, manifest {manifest}")]
+    RollbackFloorRegressed {
+        /// The highest `rollback_floor_build` already trusted.
+        trusted: u64,
+        /// The candidate manifest's `rollback_floor_build`.
+        manifest: u64,
+    },
     /// The manifest's `root_version` does not match the delegation that carried the key
     /// which signed it (a mixed/mismatched delegation+manifest pair).
     #[error(
@@ -127,6 +140,7 @@ impl TrustError {
             Self::RootVersionRegressed { .. } => "root_version_regressed",
             Self::SequenceRegressed { .. } => "sequence_regressed",
             Self::GeneratedRegressed { .. } => "generated_regressed",
+            Self::RollbackFloorRegressed { .. } => "rollback_floor_regressed",
             Self::RootVersionMismatch { .. } => "root_version_mismatch",
             Self::BelowRollbackFloor { .. } => "below_rollback_floor",
             Self::DigestMismatch { .. } => "digest_mismatch",
@@ -193,9 +207,15 @@ pub fn verify_manifest_signature(
         .map_err(|_| TrustError::ManifestSignatureInvalid)
 }
 
-/// Enforce freshness against prior [`TrustState`]: not expired, and no regression of
-/// `root_version` / `sequence` / `generated`. This is what defeats freeze and rollback
-/// replays of authentically-signed but stale manifests.
+/// Enforce freshness against prior [`TrustState`]: not expired, and no regression of any
+/// monotonic high-water-mark — `root_version`, `sequence`, `generated`, or `rollback_floor_build`.
+/// This is what defeats freeze and rollback replays of authentically-signed but stale manifests,
+/// and (via the floor mark) an authentically-signed manifest that tries to LOWER the anti-downgrade
+/// floor to re-enable a downgrade.
+///
+/// All four marks are strictly monotonic per SPEC §6 — they may rise but never fall — so the four
+/// checks here are the runtime enforcement of that invariant. A caller that accepts the manifest
+/// then folds it in with [`TrustState::advance`] keeps the marks moving forward only.
 pub fn verify_freshness(
     state: &TrustState,
     manifest: &Manifest,
@@ -223,6 +243,15 @@ pub fn verify_freshness(
         return Err(TrustError::GeneratedRegressed {
             trusted: state.generated,
             manifest: manifest.generated,
+        });
+    }
+    // The rollback floor is a monotonic mark too (SPEC §6): a manifest may raise it but never lower
+    // it. Rejecting a lowered floor blocks a compromised targets key from re-opening a downgrade
+    // window within the current `root_version` epoch.
+    if manifest.rollback_floor_build < state.rollback_floor_build {
+        return Err(TrustError::RollbackFloorRegressed {
+            trusted: state.rollback_floor_build,
+            manifest: manifest.rollback_floor_build,
         });
     }
     Ok(())
@@ -499,6 +528,34 @@ mod tests {
         );
     }
 
+    /// A manifest that LOWERS the rollback floor below the accepted high-water-mark is rejected
+    /// (anti-downgrade of the floor itself). This is the regression proof for the #504-E finding:
+    /// a compromised targets key must not be able to reset the floor to re-enable a downgrade.
+    #[test]
+    fn lowered_rollback_floor_fails() {
+        let mut state = TrustState::initial();
+        state.rollback_floor_build = 20; // we've accepted a floor of 20
+        let mut m = sample_manifest();
+        m.rollback_floor_build = 0; // a manifest trying to drop the floor back to 0
+        assert_eq!(
+            verify_freshness(&state, &m, 1500),
+            Err(TrustError::RollbackFloorRegressed {
+                trusted: 20,
+                manifest: 0
+            })
+        );
+    }
+
+    /// A manifest that RAISES the floor is accepted (the floor may rise).
+    #[test]
+    fn raised_rollback_floor_passes() {
+        let mut state = TrustState::initial();
+        state.rollback_floor_build = 5;
+        let mut m = sample_manifest();
+        m.rollback_floor_build = 10; // raising the floor is allowed
+        assert_eq!(verify_freshness(&state, &m, 1500), Ok(()));
+    }
+
     /// A manifest whose root_version disagrees with the delegation is rejected.
     #[test]
     fn root_version_mismatch_fails() {
@@ -625,6 +682,10 @@ mod tests {
                 manifest: 0,
             },
             TrustError::GeneratedRegressed {
+                trusted: 0,
+                manifest: 0,
+            },
+            TrustError::RollbackFloorRegressed {
                 trusted: 0,
                 manifest: 0,
             },

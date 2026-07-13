@@ -49,6 +49,37 @@ pub fn spawn_worker_process(
     imp::spawn(worker, input, sandbox).map_err(|e| BrokerError::Spawn(e.to_string()))
 }
 
+/// Prepare a directory the (possibly privilege-dropped) worker must WRITE into — the staging
+/// directory — so it is broker-owned and non-world-writable, NOT world-writable `/tmp` (SPEC §8.3;
+/// #504-E staging finding).
+///
+/// It is created and hardened to privileged identities. On Unix, when the broker is root and will
+/// drop the worker to `nobody` ([`Sandbox::Restricted`]), the directory is additionally chowned to
+/// that uid so the dropped worker can write while the directory stays `0700` (only `nobody` + root)
+/// — closing the "any local user swaps staged bytes" vector that a shared `/tmp` leaves open. When
+/// the worker inherits the broker's identity (tests, non-root), the broker owner already has write
+/// access, so no chown is needed.
+///
+/// # Errors
+///
+/// [`BrokerError::Io`] if the directory cannot be created, hardened, or chowned.
+pub fn prepare_worker_writable_dir(dir: &Path, sandbox: Sandbox) -> Result<(), BrokerError> {
+    std::fs::create_dir_all(dir).map_err(|e| BrokerError::Io(e.to_string()))?;
+    crate::secure::harden_state_dir(dir)?;
+    #[cfg(unix)]
+    {
+        if sandbox == Sandbox::Restricted && imp::is_root() {
+            let (uid, gid) = imp::nobody_ids();
+            imp::chown_dir(dir, uid, gid)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sandbox;
+    }
+    Ok(())
+}
+
 // ----------------------------------- Unix ----------------------------------------
 
 #[cfg(unix)]
@@ -60,13 +91,28 @@ mod imp {
 
     /// True when the broker runs as root (uid 0) and therefore MUST drop privilege before running
     /// network-facing code.
-    fn is_root() -> bool {
+    pub(super) fn is_root() -> bool {
         // SAFETY: `geteuid` is always safe to call and has no preconditions.
         unsafe { libc::geteuid() == 0 }
     }
 
+    /// Give ownership of `dir` to `(uid, gid)` so a privilege-dropped worker can write into a
+    /// directory that otherwise stays `0700` (root + that uid only).
+    pub(super) fn chown_dir(dir: &Path, uid: u32, gid: u32) -> Result<(), BrokerError> {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+            .map_err(|e| BrokerError::Io(e.to_string()))?;
+        // SAFETY: `chown` reads the NUL-terminated path and two plain integers; its result is
+        // checked and no memory is retained past the call.
+        let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+        if rc != 0 {
+            return Err(BrokerError::Io(io::Error::last_os_error().to_string()));
+        }
+        Ok(())
+    }
+
     /// Resolve the `nobody` account's uid/gid, falling back to the conventional 65534.
-    fn nobody_ids() -> (u32, u32) {
+    pub(super) fn nobody_ids() -> (u32, u32) {
         let name = std::ffi::CString::new("nobody").expect("static string");
         // SAFETY: `getpwnam` takes a valid NUL-terminated C string and returns either NULL or a
         // pointer to a static `passwd` we only read (never store past this call).

@@ -135,10 +135,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-release-resolver"
+version = "0.1.0"
+source = "git+https://github.com/DIG-Network/dig-release-resolver?tag=v0.1.0#fab180e0cf5b70a933aade7c98114d11988a51d1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "dig-updater-broker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
+ "dig-release-resolver",
  "dig-updater-trust",
  "dig-updater-worker",
  "ed25519-dalek",
@@ -155,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dig-updater-broker",
  "dig-updater-trust",
@@ -165,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-feedsign"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "dig-updater-trust",
@@ -182,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-trust"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -195,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-worker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "dig-updater-trust",

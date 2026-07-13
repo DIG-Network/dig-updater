@@ -51,6 +51,32 @@ change diary.
   preserved across a load→save round-trip so a fleet rollback to an older beacon never destroys
   state a newer one wrote.
 
+## Install path — the privileged act (-E)
+
+- **hashed == installed must be STRUCTURAL, not timed.** The staging dir is writable by the
+  privilege-dropped worker, so hashing a staging file and then re-opening it BY PATH to install is a
+  TOCTOU: a compromised worker swaps the bytes between the two opens. The fix is not a tighter
+  window but no window: copy the staged bytes ONCE into a broker-private file the worker cannot
+  write (a `dest` sibling for a raw binary → atomic rename; the hardened `<state>/apply` dir for a
+  native package), hashing from the same read, then install from that private copy. A swap of
+  staging afterward is inert. Proof test: `a_swap_of_staging_after_verify_does_not_change_the_installed_bytes`.
+- **The worker's staged PATH is untrusted too, not just its bytes.** Canonicalize it and refuse
+  anything that does not resolve strictly inside the staging dir (`StagedPathEscapesStaging`) before
+  reading a byte — else `/tmp/evil` or a `..` escape redirects the install.
+- **Native installers by ABSOLUTE path only.** `msiexec`/`installer`/`dpkg` spawned by bare name do
+  a `PATH`/CWD search → root/SYSTEM code-exec if either is influenceable. Pin the absolute trusted
+  location (`%SystemRoot%\System32\msiexec.exe`, `/usr/sbin/installer`, `/usr/bin/dpkg`) and reject
+  if it is not there — never fall back to a name lookup.
+- **Windows ACL self-check does NOT harden on its own.** The alpha-floor `classify_writability`
+  reports every EXISTING path `AdminOnly` on Windows, so the repair-harden branch never fires there.
+  A dir that is only "hardened" through `acl_self_check` is created but never `icacls`-locked on
+  Windows. Harden the state / lkg / apply dirs EXPLICITLY up front (the lkg dir receives snapshots
+  before any state advance, so it can't wait for the advance-time harden).
+- **A manual rollback's floor comes from persisted state, not the caller.** The lkg record's digest
+  is self-recorded beside the cached bytes, so a caller who also picks the floor could reinstate a
+  below-floor (vulnerable) build. Read `rollback_floor_build` from the persisted, Admin/SYSTEM-only
+  trust state instead. (`Broker::rollback` takes no floor arg.)
+
 ## Feed signing (-I)
 
 - **One serializer, shared by signer + verifier.** `dig-updater-feedsign` signs via the trust
