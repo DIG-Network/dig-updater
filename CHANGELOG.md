@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.3.0] - 2026-07-13
+
+### Features
+- Nightly signed feed — feed-signer crate + CI (#513-I) (#3)
+
 ## [0.2.0] - 2026-07-13
 
 ### Features
