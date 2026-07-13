@@ -1,0 +1,12 @@
+[package]
+name = "dig-updater-broker"
+description = "DIG auto-update beacon PRIVILEGED broker (scaffold stub): orchestrates one update pass — spawn the unprivileged worker, apply verified installs, health-gate, roll back. Install/rollback/scheduler are follow-up tickets."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+dig-updater-trust = { path = "../dig-updater-trust" }
+thiserror = { workspace = true }

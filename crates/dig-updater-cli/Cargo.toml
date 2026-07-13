@@ -1,0 +1,20 @@
+[package]
+name = "dig-updater-cli"
+description = "The `dig-updater` beacon CLI (scaffold stub): `check --now` / `status --json`. The verify/install/scheduler pipeline is wired in follow-up tickets."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The produced binary is `dig-updater` (the repo/crate is `dig-updater-cli` so the crate
+# name and the binary name don't collide, mirroring dig-node-service -> `dig-node`).
+[[bin]]
+name = "dig-updater"
+path = "src/main.rs"
+
+[dependencies]
+dig-updater-broker = { path = "../dig-updater-broker" }
+dig-updater-worker = { path = "../dig-updater-worker" }
+dig-updater-trust = { path = "../dig-updater-trust" }
+serde_json = { workspace = true }
