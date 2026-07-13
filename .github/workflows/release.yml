@@ -86,6 +86,11 @@ jobs:
           rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build both beacon binaries
+        # `shell: bash` is REQUIRED: GitHub's Windows runner defaults `run:` to PowerShell, which
+        # does not understand the bash `\` line-continuation and parses the wrapped `--bin` as its
+        # `--` unary operator ("Missing expression after unary operator '--'"). That broke the
+        # v0.5.0 release (#504). Git Bash ships on every hosted runner, so bash is portable here.
+        shell: bash
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
             --bin dig-updater --bin dig-updater-worker

@@ -165,3 +165,17 @@ change diary.
   elevated CI job on the ubuntu runner). Fix: a single `static Mutex<()>` in the test file, held
   for each test's full body — the same shape as `dig-relay`'s `ENV_LOCK` for its env-mutating
   tests, applied here to OS-mutating ones instead.
+
+## Release CI
+
+- **A GitHub Actions `run:` step defaults to PowerShell on the Windows runner — a bash `\`
+  line-continuation silently breaks there.** The v0.5.0 release went red because `release.yml`'s
+  "Build both beacon binaries" step wrapped its cargo invocation across two lines with a trailing
+  `\` but did not set `shell: bash`. On `windows-latest` PowerShell ran it, read the second line's
+  `--bin` as its own `--` unary operator, and died with "Missing expression after unary operator
+  '--'" — so no binaries staged and no GitHub Release published (run 29289135877, #504). The PR's
+  `ci.yml` build never caught it because that job builds with a SINGLE-LINE command, which
+  PowerShell handles. Rule: any `run:` step that relies on bash syntax (`\` continuation, `$VAR`,
+  `[ ]` tests) on a multi-OS matrix MUST declare `shell: bash` (Git Bash ships on every hosted
+  runner). Regression guard: `tests/release_workflow_shell.rs` asserts every `\`-continuation step
+  in `release.yml` declares `shell: bash`.
