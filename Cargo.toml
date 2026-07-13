@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+# The DIG auto-update beacon workspace. The beacon is a TRANSIENT, scheduled process
+# that wakes daily, performs ONE verified update pass, and exits — there is no resident
+# socket. It is split into a privileged broker and an unprivileged fetch/verify worker
+# so a compromise of the network-facing verify path cannot escalate to install/replace
+# privilege. See SPEC.md for the normative trust contract.
+#
+#   * dig-updater-trust   — the SECURITY CORE (crate `dig_updater_trust`): the signed
+#                           manifest + root->targets delegation types, the monotonic
+#                           trust state (anti-rollback / anti-freeze / anti-downgrade),
+#                           the Ed25519 signature + SHA-256 digest verify surface, and
+#                           the pinned root public key. Pure, no I/O — trivially testable.
+#   * dig-updater-broker  — the PRIVILEGED orchestration crate (stub): drives one update
+#                           pass, spawns the worker, applies verified installs, health-gates
+#                           and rolls back. (Install/rollback are follow-up tickets #504-E/-F.)
+#   * dig-updater-worker  — the UNPRIVILEGED, sandboxed fetch/verify crate (stub): downloads
+#                           the feed + artifacts and verifies them against the trust core,
+#                           holding no install privilege. (Fetch pipeline is ticket #504-D.)
+#   * dig-updater-cli     — the `dig-updater` binary (stub): `check --now` / `status --json`.
+members = [
+    "crates/dig-updater-trust",
+    "crates/dig-updater-broker",
+    "crates/dig-updater-worker",
+    "crates/dig-updater-cli",
+]
+
+[workspace.package]
+# The RELEASE version of the beacon. The tag-on-merge + version-increment CI reads this
+# `[workspace.package].version` from the ROOT manifest (§3.6); the members inherit it via
+# `version.workspace = true`, so a release fires off this single value.
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+repository = "https://github.com/DIG-Network/dig-updater"
+authors = ["DIG Network"]
+
+[workspace.dependencies]
+ed25519-dalek = "2"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+thiserror = "1"
+
+# Release hardening (matches dig-node/digstore): keep integer-overflow checks ON in
+# release. The beacon parses an untrusted signed feed and does length/offset arithmetic
+# over downloaded bytes; silent wrapping in release could turn a length bug into a
+# memory/logic hazard on the privileged install path.
+[profile.release]
+overflow-checks = true
