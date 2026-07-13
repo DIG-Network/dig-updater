@@ -466,6 +466,224 @@ fn a_plan_that_does_not_chain_to_the_pinned_root_is_rejected_on_reverify() {
     assert!(!dest.exists(), "nothing installed when re-verify fails");
 }
 
+/// A manifest with TWO components — the beacon's own ("dig-updater", listed FIRST) and an
+/// ordinary one ("digstore") — each with its own artifact served at a distinct URL.
+fn manifest_with_self_and_other(
+    base: &str,
+    self_artifact: &[u8],
+    other_artifact: &[u8],
+) -> Manifest {
+    let p = Platform::current();
+    Manifest {
+        schema: 1,
+        root_version: 1,
+        sequence: 100,
+        generated: 500_000,
+        expires: FAR_FUTURE,
+        rollback_floor_build: 0,
+        components: vec![
+            Component {
+                name: "dig-updater".into(),
+                version: "0.6.0".into(),
+                build: 6_000,
+                artifacts: vec![Artifact {
+                    os: p.os.clone(),
+                    arch: p.arch.clone(),
+                    url: format!("{base}/self-artifact"),
+                    sha256: hex(&Sha256::digest(self_artifact)),
+                    size: self_artifact.len() as u64,
+                }],
+            },
+            Component {
+                name: "digstore".into(),
+                version: "0.2.0".into(),
+                build: 2_000,
+                artifacts: vec![Artifact {
+                    os: p.os,
+                    arch: p.arch,
+                    url: format!("{base}/other-artifact"),
+                    sha256: hex(&Sha256::digest(other_artifact)),
+                    size: other_artifact.len() as u64,
+                }],
+            },
+        ],
+    }
+}
+
+/// The signed-feed routes for [`manifest_with_self_and_other`]'s two distinct artifact URLs.
+fn routes_with_self_and_other(
+    manifest: &Manifest,
+    self_artifact: &[u8],
+    other_artifact: &[u8],
+) -> HashMap<String, Vec<u8>> {
+    let delegation = SignedDelegation::sign(
+        Delegation {
+            root_version: 1,
+            targets_pubkey: b64(&test_targets().verifying_key().to_bytes()),
+            expires: FAR_FUTURE,
+        },
+        &test_root(),
+    );
+    let signed = SignedManifest::sign(manifest.clone(), &test_targets());
+    HashMap::from([
+        (
+            "/delegation.json".to_string(),
+            delegation.to_json().into_bytes(),
+        ),
+        ("/manifest.json".to_string(), signed.to_json().into_bytes()),
+        ("/self-artifact".to_string(), self_artifact.to_vec()),
+        ("/other-artifact".to_string(), other_artifact.to_vec()),
+    ])
+}
+
+/// Drive a two-component pass ("dig-updater" self + "digstore" other) and return the report,
+/// generalizing [`apply`] to a caller-supplied catalog (both components share one retry policy).
+fn apply_self_and_other(
+    report: &WorkerReport,
+    home: &Path,
+    self_dest: &Path,
+    other_dest: &Path,
+) -> PassReport {
+    let store = TrustStateStore::at(home);
+    let loaded = store.load().expect("load state");
+    let lkg = LkgCache::at(home.join("lkg"));
+    let staging_dir = home.join("staging");
+    let apply_dir = home.join("apply");
+    std::fs::create_dir_all(&apply_dir).unwrap();
+    let catalog = Catalog::new(vec![
+        ComponentTarget {
+            name: "dig-updater".into(),
+            method: InstallMethod::RawBinary,
+            dest: self_dest.to_path_buf(),
+        },
+        ComponentTarget {
+            name: "digstore".into(),
+            method: InstallMethod::RawBinary,
+            dest: other_dest.to_path_buf(),
+        },
+    ]);
+    let platform = Platform::current();
+    let detect = |_: &Path| DetectedVersion::Absent;
+    let health = |p: &Path| {
+        if p == self_dest {
+            DetectedVersion::Present("dig-updater 0.6.0".to_string())
+        } else {
+            DetectedVersion::Present("digstore 0.2.0".to_string())
+        }
+    };
+    let installer = Installer {
+        store: &store,
+        catalog: &catalog,
+        platform: &platform,
+        lkg: &lkg,
+        staging_dir: &staging_dir,
+        apply_dir: &apply_dir,
+        retry: RetryPolicy {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        },
+        now: NOW,
+        detect: &detect,
+        health: &health,
+    };
+    installer
+        .apply(&test_root().verifying_key(), report, loaded)
+        .expect("apply completes")
+}
+
+#[test]
+fn self_update_is_reported_after_every_other_component() {
+    // Both components are fresh installs (SPEC §8.1: self applies LAST, but nothing stops it from
+    // succeeding when everything else does too) — this proves the ORDERING half of the contract
+    // on every OS; the Windows-only test below proves the trust-state-INDEPENDENCE half using a
+    // deterministic self-install failure that has no portable Unix equivalent (see its comment).
+    let home = tempfile::tempdir().unwrap();
+    let self_dest = home.path().join("dig-updater");
+    let other_dest = home.path().join("digstore");
+
+    let self_artifact = b"the-new-beacon-binary";
+    let other_artifact = b"the-new-digstore-binary";
+    let srv = Server::bind();
+    let m = manifest_with_self_and_other(&srv.base, self_artifact, other_artifact);
+    let _guard = srv.serve(routes_with_self_and_other(
+        &m,
+        self_artifact,
+        other_artifact,
+    ));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let result = apply_self_and_other(&report, home.path(), &self_dest, &other_dest);
+
+    assert_eq!(result.components.len(), 2, "both components reported");
+    assert_eq!(
+        result.components[0].component, "digstore",
+        "the ordinary component is reported BEFORE the beacon's own — self applies LAST"
+    );
+    assert_eq!(
+        result.components[1].component, "dig-updater",
+        "the beacon's own component is reported LAST"
+    );
+    assert_eq!(result.components[0].result, ComponentResult::Installed);
+    assert_eq!(result.components[1].result, ComponentResult::Installed);
+    assert!(result.state_advanced);
+    assert_eq!(std::fs::read(&self_dest).unwrap(), self_artifact);
+    assert_eq!(std::fs::read(&other_dest).unwrap(), other_artifact);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_deferred_self_update_never_gates_the_other_components_state_advance() {
+    // Force the self-swap to fail deterministically WITHOUT touching its destination's type or
+    // its parent directory (either of which would abort the whole pass earlier, at the snapshot
+    // or staging step, rather than exercising the install step this test targets): hold `dest`
+    // open with an EXPLICIT share mode that grants read (so the snapshot's digest read succeeds)
+    // but denies write/delete (so any RENAME onto it fails) — Rust's std actually opens files
+    // with all three share flags by default (incl. `FILE_SHARE_DELETE`), so reproducing "locked
+    // against rename" on Windows needs this explicit override. Unix has no equivalent — a rename
+    // there succeeds against an open file by design (see `selfupdate.rs`), which is exactly why
+    // this half of the contract is Windows-only.
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+    let home = tempfile::tempdir().unwrap();
+    let self_dest = home.path().join("dig-updater.exe");
+    let other_dest = home.path().join("digstore.exe");
+    std::fs::write(&self_dest, b"old-beacon-bytes").unwrap();
+    let _holds_dest_open_read_only_share = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&self_dest)
+        .unwrap();
+
+    let self_artifact = b"the-new-beacon-binary";
+    let other_artifact = b"the-new-digstore-binary";
+    let srv = Server::bind();
+    let m = manifest_with_self_and_other(&srv.base, self_artifact, other_artifact);
+    let _guard = srv.serve(routes_with_self_and_other(
+        &m,
+        self_artifact,
+        other_artifact,
+    ));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let result = apply_self_and_other(&report, home.path(), &self_dest, &other_dest);
+
+    assert_eq!(result.components[0].component, "digstore");
+    assert_eq!(result.components[0].result, ComponentResult::Installed);
+    assert_eq!(result.components[1].component, "dig-updater");
+    assert_ne!(
+        result.components[1].result,
+        ComponentResult::Installed,
+        "the held-open destination must block the self-swap: {:?}",
+        result.components[1].result
+    );
+    assert!(
+        result.state_advanced,
+        "digstore's success alone must advance state — the self component's outcome never gates it"
+    );
+    assert_eq!(std::fs::read(&other_dest).unwrap(), other_artifact);
+}
+
 #[cfg(unix)]
 #[test]
 fn acl_self_check_aborts_on_a_world_writable_binary() {

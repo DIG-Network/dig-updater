@@ -8,12 +8,13 @@
 //! [`dig_updater_worker`] to fetch + verify, receives only a verified plan back, and — in the
 //! install path (#504-E) — applies installs behind a health gate and rolls back on failure.
 //!
-//! This crate implements the -D + -E surface: loading the persisted trust state, spawning the
-//! worker with dropped privileges ([`sandbox`]), a **dry check** ([`Broker::dry_check`]) that
-//! verifies without installing, and the full install path ([`Broker::run_once`]) — enumerate,
-//! ACL self-check, independent re-verify under the pinned key, staging re-verify, silent per-OS
-//! install, health gate, and re-verified rollback ([`pass::Installer`]). The scheduler /
-//! single-instance lock / self-update (#504-F) remain a separate ticket.
+//! This crate implements the -D + -E + -F surface: loading the persisted trust state, spawning
+//! the worker with dropped privileges ([`sandbox`]), a **dry check** ([`Broker::dry_check`]) that
+//! verifies without installing, and the full install path ([`Broker::run_once`]) — a
+//! single-instance lock ([`lock`]), ACL self-check, independent re-verify under the pinned key,
+//! staging re-verify, silent per-OS install, health gate, re-verified rollback
+//! ([`pass::Installer`]), and — always last — the beacon's own self-update ([`selfupdate`]). The
+//! per-OS scheduler artifact that WAKES a pass daily lives in [`scheduler`].
 //!
 //! ## Never trust the worker on the install path (SPEC §8.3)
 //!
@@ -23,22 +24,28 @@
 //! re-verified digest immediately before it is applied. The trust state advances ONLY after a
 //! component installs AND passes its health gate, and never before the state directory is hardened.
 //!
-//! ## The one `unsafe` in the workspace
+//! ## The `unsafe` in the workspace
 //!
-//! Privilege-dropping needs OS primitives, so [`sandbox`] is the single module that uses
-//! `unsafe` (Unix `setuid`/`setgid`; Windows restricted-token spawn). Every other module — and
+//! Privilege-dropping needs OS primitives, so [`sandbox`] uses `unsafe` (Unix `setuid`/`setgid`;
+//! Windows restricted-token spawn). On Windows only, [`lock`] also uses `unsafe` for the
+//! DACL-restricted named mutex (`CreateMutexW`/`ReleaseMutex`/`LocalFree` have no safe wrapper);
+//! its Unix half is safe, built on the same `fs4` flock wrapper `dig-node-core` already uses, so
+//! the beacon never grows a second hand-rolled unsafe locking primitive. Every other module — and
 //! every other crate — is safe.
 
 mod error;
 mod hashing;
 pub mod health;
 pub mod install;
+pub mod lock;
 mod pass;
 pub mod paths;
 pub mod plan;
 pub mod rollback;
 pub mod sandbox;
+pub mod scheduler;
 pub mod secure;
+mod selfupdate;
 mod spawn;
 pub mod state;
 
@@ -58,7 +65,9 @@ pub use error::BrokerError;
 pub use health::VersionProbe;
 pub use install::RetryPolicy;
 pub use pass::{ComponentOutcome, ComponentResult, Installer, PassReport};
-pub use plan::{Catalog, ComponentTarget, InstallMethod, Plan, PlannedComponent};
+pub use plan::{
+    Catalog, ComponentTarget, InstallMethod, Plan, PlannedComponent, BEACON_COMPONENT_NAME,
+};
 pub use rollback::LkgCache;
 pub use sandbox::Sandbox;
 pub use secure::Repair;
@@ -114,10 +123,16 @@ impl Broker {
         Ok(report)
     }
 
-    /// Run exactly one FULL update pass: ACL self-check → spawn the unprivileged worker to fetch +
-    /// verify + stage → INDEPENDENTLY re-verify under the pinned key → enumerate → silent per-OS
-    /// install behind a health gate → re-verified rollback on failure → advance the trust state
-    /// only on full success. This is the beacon's production entry point (SPEC §9, §9.5).
+    /// Run exactly one FULL update pass: single-instance lock → ACL self-check → spawn the
+    /// unprivileged worker to fetch + verify + stage → INDEPENDENTLY re-verify under the pinned
+    /// key → enumerate → silent per-OS install behind a health gate → re-verified rollback on
+    /// failure → advance the trust state only on full success → the beacon's own self-update,
+    /// always last. This is the beacon's production entry point (SPEC §8.2, §9, §9.5) — the one a
+    /// scheduled wake (or a manual `dig-updater run`) invokes.
+    ///
+    /// If a prior pass is still holding the lock (its schedule overran), this returns a
+    /// [`PassReport::already_running`] immediately rather than an error — SPEC §8.2 makes that an
+    /// ordinary, expected outcome, not a failure.
     ///
     /// # Errors
     ///
@@ -126,6 +141,14 @@ impl Broker {
     /// if the worker's plan fails the broker's independent re-verification; [`BrokerError::RollbackFailed`]
     /// if a rollback cannot complete; [`BrokerError::Io`] on a filesystem error.
     pub fn run_once(&self) -> Result<PassReport, BrokerError> {
+        // Acquired before ANY other work, per SPEC §8.2 — including before `run_pass`'s own
+        // harden-then-ACL-check step. On Unix this is safe because the lock creates `state_dir`
+        // itself, owner-only, on first touch (see `lock::imp::create_dir_owner_only`) rather than
+        // depending on a later, separate harden call to close what would otherwise be a brief
+        // insecure-permissions window.
+        let Some(_guard) = lock::SingleInstanceLock::try_acquire(&self.state_dir)? else {
+            return Ok(PassReport::already_running());
+        };
         let root = beacon_root_verifying_key();
         let probe = pass::spawn_version_probe();
         self.run_pass(
@@ -412,5 +435,25 @@ mod tests {
     #[test]
     fn now_is_after_2020() {
         assert!(now_unix_secs() > 1_577_836_800); // 2020-01-01
+    }
+
+    #[test]
+    #[ignore = "the production lock's Administrators/SYSTEM-only DACL (lock.rs) means only an \
+                elevated console can even OPEN it to probe contention; run explicitly (`cargo \
+                test -- --ignored`) from an elevated console, or via the elevated scheduler CI job"]
+    fn run_once_exits_immediately_when_the_lock_is_already_held() {
+        // A prior pass (or a manual run racing the schedule) still holds the production lock —
+        // `run_once` must report `already_running` (SPEC §8.2) rather than attempting to spawn
+        // the worker / touch the network at all.
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        let _held = lock::SingleInstanceLock::try_acquire(broker.state_dir())
+            .expect("acquire the production lock")
+            .expect("the lock starts unheld");
+
+        let report = broker
+            .run_once()
+            .expect("a held lock is a benign no-op, not an error");
+        assert_eq!(report, PassReport::already_running());
     }
 }

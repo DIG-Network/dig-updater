@@ -1,16 +1,18 @@
-# On a version tag (v*), build the self-contained `dig-updater` beacon binary for every
-# supported OS/arch and attach them to a GitHub Release. The tag is created by the
-# tag-on-merge workflow (changelog-tag.yml), so the changelog is already in the tag.
-# A push to main also builds (no publish) so a broken build is caught before tagging.
+# On a version tag (v*), build BOTH beacon binaries — `dig-updater` (the broker/CLI) and
+# `dig-updater-worker` (the unprivileged fetch/verify half it spawns, SPEC §8.3) — for every
+# supported OS/arch and attach them to a GitHub Release. The two MUST ship together: the broker
+# resolves the worker as a sibling in its own directory (`paths::sibling_worker_binary`), so a
+# release with only `dig-updater` cannot run a real pass. The tag is created by the tag-on-merge
+# workflow (changelog-tag.yml), so the changelog is already in the tag. A push to main also
+# builds (no publish) so a broken build is caught before tagging.
 #
 # The gate runs fmt + clippy only — the PR's own CI (ci.yml) already ran the full
 # fmt/clippy/test/coverage set against this merged tree before merge (§2.4a). fmt/clippy
 # are deterministic, so they stay as a cheap fail-fast before spending build minutes.
 #
-# NOTE: the shipped Windows binary is named `dig-updater.exe`; "updater" trips Windows UAC
-# installer-detection, so the release build must eventually embed an `asInvoker` manifest
-# (a scheduler/OS-integration follow-up, #504-F). This scaffold produces the binary; the
-# manifest lands with the OS-integration work.
+# The shipped Windows binaries are named `*updater*`, which trips Windows UAC installer-detection
+# (error 740); `.cargo/config.toml` embeds an `asInvoker` manifest at link time so both binaries
+# — and the `cargo test` harness — launch unelevated.
 name: Release dig-updater
 
 on:
@@ -54,22 +56,22 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: dig-updater.exe
+            ext: ".exe"
             out_name: windows-x64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: dig-updater
+            ext: ""
             out_name: linux-x64
           # Both macOS arches build on the fast Apple-silicon macos-14 runner; the Intel
           # binary is cross-compiled there (the beacon's deps are pure Rust — ed25519-dalek/
           # sha2/serde — so no C/openssl cross-compile is involved).
           - os: macos-14
             target: aarch64-apple-darwin
-            bin: dig-updater
+            ext: ""
             out_name: macos-arm64
           - os: macos-14
             target: x86_64-apple-darwin
-            bin: dig-updater
+            ext: ""
             out_name: macos-x64
     runs-on: ${{ matrix.os }}
     steps:
@@ -83,19 +85,23 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-updater
-      - name: Stage artifact
+      - name: Build both beacon binaries
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            --bin dig-updater --bin dig-updater-worker
+      - name: Stage both artifacts
         shell: bash
         run: |
           VER="${GITHUB_REF_NAME#v}"
           [ "$GITHUB_REF_TYPE" = "tag" ] || VER="g$(git rev-parse --short HEAD)"
           mkdir -p dist
-          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
-          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
-          cp "$SRC" "dist/dig-updater-${VER}-${{ matrix.out_name }}"
+          for bin in dig-updater dig-updater-worker; do
+            SRC="target/${{ matrix.target }}/release/${bin}${{ matrix.ext }}"
+            test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
+            cp "$SRC" "dist/${bin}-${VER}-${{ matrix.out_name }}"
+          done
           ls -la dist
-      - name: Upload build artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dig-updater-${{ matrix.out_name }}

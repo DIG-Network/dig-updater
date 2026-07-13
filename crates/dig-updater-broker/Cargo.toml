@@ -1,6 +1,6 @@
 [package]
 name = "dig-updater-broker"
-description = "DIG auto-update beacon PRIVILEGED broker: spawns the UNPRIVILEGED fetch/verify worker in a sandbox (Unix setuid-drop / Windows restricted token), persists the Admin/SYSTEM-only monotonic trust state (atomic, forward-compatible), and (in follow-ups) applies verified installs behind a health gate + rollback."
+description = "DIG auto-update beacon PRIVILEGED broker: spawns the UNPRIVILEGED fetch/verify worker in a sandbox (Unix setuid-drop / Windows restricted token), persists the Admin/SYSTEM-only monotonic trust state (atomic, forward-compatible), applies verified installs behind a health gate + rollback, holds the single-instance lock, and manages the per-OS scheduler artifact + beacon self-update."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,10 +25,12 @@ sha2 = { workspace = true }
 # second, independent verifier of the whole chain, not a consumer of the worker's word.
 ed25519-dalek = { workspace = true }
 
-# OS privilege primitives — the ONLY `unsafe` in the whole workspace lives in `src/sandbox.rs`,
-# gated behind these per-OS deps.
+# OS privilege primitives — the ONLY `unsafe` in the whole workspace lives in `src/sandbox.rs`
+# (privilege-drop) and `src/lock.rs` (the Windows named-mutex DACL), gated behind these per-OS deps.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# The safe `flock` wrapper behind the Unix single-instance lock (src/lock.rs) — no new `unsafe`.
+fs4 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

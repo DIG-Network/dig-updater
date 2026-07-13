@@ -217,7 +217,15 @@ pub fn install_from_private(
 
 /// Atomically move the verified private copy over `dest`, retrying a locked rename with backoff and
 /// DEFERRING if the target stays locked (SPEC §9.5). On give-up the private copy is cleaned up.
-fn rename_into_place(private: &Path, dest: &Path, policy: &RetryPolicy) -> InstallOutcome {
+///
+/// `pub(crate)`: [`crate::selfupdate`] reuses this verbatim for the beacon's OWN Unix self-update
+/// — on Unix there is nothing self-replace-specific to do, replacing a running executable's
+/// directory entry works exactly like any other raw-binary component (see that module's doc).
+pub(crate) fn rename_into_place(
+    private: &Path,
+    dest: &Path,
+    policy: &RetryPolicy,
+) -> InstallOutcome {
     if let Some(parent) = dest.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             let _ = std::fs::remove_file(private);
@@ -347,11 +355,15 @@ fn dpkg_program() -> Result<PathBuf, String> {
 
 /// Return `path` iff it is absolute and names an existing regular file — otherwise reject it, so a
 /// missing/relocated system installer never silently falls through to a `PATH` search.
+///
+/// `pub(crate)`: [`crate::scheduler`] reuses this to resolve `schtasks.exe`/`systemctl`/
+/// `launchctl` by absolute path too — the same "never a bare name resolved through `PATH`"
+/// discipline this module applies to `msiexec`/`installer`/`dpkg`.
 #[cfg_attr(
     not(any(windows, target_os = "macos", target_os = "linux")),
     allow(dead_code)
 )]
-fn trusted_absolute(path: PathBuf) -> Result<PathBuf, String> {
+pub(crate) fn trusted_absolute(path: PathBuf) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("{} is not an absolute path", path.display()));
     }
@@ -366,8 +378,8 @@ fn trusted_absolute(path: PathBuf) -> Result<PathBuf, String> {
 }
 
 /// The first of `candidates` that passes [`trusted_absolute`], or an error listing them all.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn first_trusted(candidates: &[&str]) -> Result<PathBuf, String> {
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn first_trusted(candidates: &[&str]) -> Result<PathBuf, String> {
     for candidate in candidates {
         if let Ok(path) = trusted_absolute(PathBuf::from(candidate)) {
             return Ok(path);
