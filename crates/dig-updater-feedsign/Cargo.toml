@@ -1,0 +1,31 @@
+[package]
+name = "dig-updater-feedsign"
+description = "CI-only feed signer for the DIG auto-update beacon: resolves the latest release per component, assembles a signed update manifest + root->targets delegation, and emits byte-exact feed JSON signed with the same trust core the beacon verifies against. NEVER shipped in the beacon binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The trust core is the SINGLE source of the wire types + `signing_bytes` canonicalization, so the
+# signer and the verifier can never drift: feedsign signs with `SignedManifest::sign` /
+# `SignedDelegation::sign` and emits with `.to_json()`, exactly what the worker parses + verifies.
+dig-updater-trust = { path = "../dig-updater-trust" }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+# The only network dependency: a small blocking HTTP client for the GitHub REST API + asset
+# downloads. feedsign runs once per CI invocation, so blocking I/O is the right model.
+ureq = { workspace = true }
+
+[dev-dependencies]
+# A minimal local HTTP server so the GitHub-API + asset-download edge is exercised over a real
+# socket without touching the network, and the end-to-end keystone (assemble -> sign -> verify)
+# runs hermetically with a throwaway key.
+tiny_http = { workspace = true }
+tempfile = { workspace = true }

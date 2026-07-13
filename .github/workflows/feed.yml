@@ -1,0 +1,150 @@
+# The nightly SIGNED FEED (#504-I). Every 6 hours (and on demand) this workflow:
+#
+#   1. resolves the latest release of each configured component (feed-config.json),
+#   2. downloads each binary asset + computes its SHA-256,
+#   3. assembles + SIGNS the manifest + root->targets delegation with the trust core,
+#   4. PROVES the signed feed verifies end-to-end — the freshly-built #509-D beacon, with the REAL
+#      pinned root key, verifies the produced feed from a clean build (the keystone trust proof),
+#   5. and only then PUBLISHES the byte-exact feed to the rolling `feed` GitHub release (the
+#      beacon's baked-in fallback URL, FALLBACK_FEED_BASE).
+#
+# Cadence vs freshness: a 6-hour cron against a 12-hour manifest expiry (SPEC §7) leaves 6 hours of
+# slack, so a single skipped/failed run never lets clients see an expired feed. Publish is the LAST
+# step and is gated on the verify passing, so a feed that does not verify is never served.
+#
+# Key hygiene: BEACON_SIGNING_KEY flows secret -> env -> the feedsign process only. It is never
+# echoed; the job summary prints only the sequence, timestamp, and public per-artifact digests.
+#
+# updates.dig.net (the S3+CloudFront primary, #504-I(b)) is a deploy-time flip gated on the AWS
+# OIDC role (#535); the beacon already ships pointing at BOTH bases, so alpha runs on this GitHub
+# `feed` release with no AWS dependency.
+name: Feed
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: feed
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sign-verify-publish:
+    name: Sign, verify end-to-end, publish
+    # H1 (#540): the signing capability is bound to REVIEWED main code. A workflow_dispatch (or any
+    # on:push) from an unreviewed branch must never sign with the real pinned key + publish to the
+    # `feed` release every shipped beacon trusts — that would bypass the §2.4 PR-review gate. The
+    # cron + the production dispatch both run on main, so this guard costs nothing legitimate.
+    if: github.ref == 'refs/heads/main'
+    # BEACON_SIGNING_KEY MUST be a main-scoped GitHub Environment secret with a required reviewer
+    # (env `feed-signing`, #540) — NEVER a plain repo secret. Referencing the environment here readies
+    # that binding (an as-yet-uncreated environment is inert; @mt-dev adds the protected secret to it).
+    environment: feed-signing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require BEACON_SIGNING_KEY (else no-op)
+        id: secret
+        env:
+          BEACON_SIGNING_KEY: ${{ secrets.BEACON_SIGNING_KEY }}
+        run: |
+          if [ -z "$BEACON_SIGNING_KEY" ]; then
+            echo "::warning::BEACON_SIGNING_KEY is not set on this repo — the signed feed is a NO-OP until the signing secret is added (see SPEC.md §4.2/§10)."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.secret.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        if: steps.secret.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.secret.outputs.present == 'true'
+
+      # Build the signer AND the beacon binaries the keystone verifies with, from this clean tree.
+      # `dig-updater` (CLI) spawns its sibling `dig-updater-worker`, so both must sit in the same
+      # directory — `cargo build` places them together in target/release.
+      - name: Build feedsign + beacon (release)
+        if: steps.secret.outputs.present == 'true'
+        run: cargo build --release --locked -p dig-updater-feedsign -p dig-updater-cli -p dig-updater-worker
+
+      - name: Timestamp
+        if: steps.secret.outputs.present == 'true'
+        id: ts
+        run: echo "generated=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # Assemble + sign the feed. The generated timestamp is supplied in (determinism, SPEC §10).
+      - name: Sign the feed
+        if: steps.secret.outputs.present == 'true'
+        env:
+          BEACON_SIGNING_KEY: ${{ secrets.BEACON_SIGNING_KEY }}
+          FEEDSIGN_GENERATED: ${{ steps.ts.outputs.generated }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./target/release/dig-updater-feedsign --config feed-config.json --out feed-out | tee feed-summary.txt
+
+      # THE KEYSTONE: the freshly-built beacon, pinning the REAL root key, verifies the just-signed
+      # feed served from a local origin. `check` fetches delegation.json + manifest.json locally,
+      # then downloads each artifact from its real (untrusted) URL and digest-verifies it — the full
+      # trust chain, end-to-end. This is the first true proof the signer + verifier agree in
+      # production. It runs BEFORE publish, so an unverifiable feed is never served.
+      - name: Verify the signed feed end-to-end (pinned key)
+        if: steps.secret.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8099 --bind 127.0.0.1 --directory feed-out &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -sf "http://127.0.0.1:8099/manifest.json" >/dev/null && break
+            sleep 0.2
+          done
+
+          REPORT="$(./target/release/dig-updater check --feed-base http://127.0.0.1:8099 --json)"
+          echo "beacon verdict: $REPORT"
+          echo "$REPORT" | jq -e '.status == "verified"' >/dev/null \
+            || { echo "::error::the pinned-key beacon did NOT verify the signed feed"; exit 1; }
+          echo "End-to-end trust chain verified: signer output accepted by the pinned-key beacon."
+
+      # Publish the byte-exact feed to the rolling `feed` release. It is a prerelease + not "latest"
+      # so it never shadows a component's real version release when the feed resolves that component.
+      - name: Publish to the rolling `feed` release
+        if: steps.secret.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view feed --repo "${{ github.repository }}" >/dev/null 2>&1 \
+            || gh release create feed \
+                 --repo "${{ github.repository }}" \
+                 --target main \
+                 --title "DIG beacon signed feed" \
+                 --notes "The signed update feed (delegation.json + manifest.json), re-signed every 6h. Served byte-for-byte as signed — do NOT edit assets by hand." \
+                 --prerelease \
+                 --latest=false
+          gh release upload feed feed-out/delegation.json feed-out/manifest.json \
+            --repo "${{ github.repository }}" --clobber
+
+      - name: Job summary
+        if: always() && steps.secret.outputs.present == 'true'
+        run: |
+          {
+            echo '### DIG beacon signed feed'
+            echo '```'
+            cat feed-summary.txt 2>/dev/null || echo 'feed was not signed'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

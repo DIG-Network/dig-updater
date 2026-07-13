@@ -18,18 +18,27 @@ resolver = "2"
 #                           the feed + artifacts and verifies them against the trust core,
 #                           holding no install privilege. (Fetch pipeline is ticket #504-D.)
 #   * dig-updater-cli     — the `dig-updater` binary (stub): `check --now` / `status --json`.
+#   * dig-updater-feedsign — the CI-ONLY feed signer (crate `dig_updater_feedsign` + binary
+#                           `dig-updater-feedsign`): resolves the latest release per component,
+#                           assembles the signed manifest + root->targets delegation, and emits
+#                           byte-exact feed JSON. It signs with the SAME `signing_bytes` the trust
+#                           core verifies against, so signer and verifier can never drift. It is
+#                           NEVER packaged into the shipped beacon binary (release.yml builds only
+#                           `--bin dig-updater`); it lives in the workspace purely so CI builds,
+#                           lints, tests, and coverage-gates it (#504-I). See SPEC.md §10.
 members = [
     "crates/dig-updater-trust",
     "crates/dig-updater-broker",
     "crates/dig-updater-worker",
     "crates/dig-updater-cli",
+    "crates/dig-updater-feedsign",
 ]
 
 [workspace.package]
 # The RELEASE version of the beacon. The tag-on-merge + version-increment CI reads this
 # `[workspace.package].version` from the ROOT manifest (§3.6); the members inherit it via
 # `version.workspace = true`, so a release fires off this single value.
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-updater"
