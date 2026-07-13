@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+
+# Coverage
+*.profraw
+*.profdata
+coverage-summary.txt
+lcov.info
+
+# Key material — the beacon's private signing key MUST NEVER be committed. It lives ONLY
+# in the `BEACON_SIGNING_KEY` GitHub Actions secret. Ignore every private-key shape so an
+# accidental local key export can never be staged. (The PUBLIC key keys/beacon-root.pub is
+# tracked deliberately and is not matched by these patterns.)
+*.pem
+!keys/beacon-root.pub
+*.key
+*_ed25519
+*_ed25519.*
+id_ed25519*
+secret-key*
+signing-key*
+beacon-signing*
+*.priv
+
+# Node (commitlint tooling if ever run locally)
+node_modules/
+
+# Misc
+*.log
+.env
+.DS_Store
+dist/
