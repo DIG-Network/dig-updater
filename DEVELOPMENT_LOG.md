@@ -82,3 +82,7 @@ change diary.
   that does not verify is never served; the previous feed simply expires (12h) if a run is skipped.
 - **Byte-identical serving is a hard requirement.** The verifier checks the signature over the
   RECEIVED bytes, so any transport transform of the JSON breaks it. Origins must serve verbatim.
+- **Branch guard on signing (#540, H1).** The feed.yml job is guarded with `if: github.ref == 'refs/heads/main'`
+  so a `workflow_dispatch` or unreviewed-branch push can never sign/publish. BEACON_SIGNING_KEY is a GitHub
+  Environment secret with a required reviewer, binding the signing capability to reviewed main code. This
+  closes H1: an unreviewed branch can no longer sign a feed that every beacon trusts.

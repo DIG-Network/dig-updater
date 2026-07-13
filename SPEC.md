@@ -415,6 +415,14 @@ signing, the signer confirms the key derives the pinned root public key (§4.2) 
 otherwise (fail closed). The alpha floor signs the delegation AND the manifest with the one key
 (root == targets, §4.3).
 
+**SECURITY (H1):** The signing capability is bound to REVIEWED main code. The workflow's
+sign-verify-publish job is guarded by `if: github.ref == 'refs/heads/main'` — a `workflow_dispatch`
+trigger or unreviewed-branch push can never sign with the real key or publish to the `feed` release
+(the one every beacon trusts). `BEACON_SIGNING_KEY` MUST be a GitHub Environment secret with a
+required human reviewer (environment `feed-signing`, #540), enforcing that signing happens only
+after main-branch code review. This closes the branch-dispatch bypass vector (H1 from the adversarial
+gate).
+
 ### 10.6 Self-proving publish
 
 Every run PROVES itself before it publishes: CI has the freshly-built beacon — pinning the REAL root
