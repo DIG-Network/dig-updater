@@ -16,63 +16,84 @@ use std::path::{Path, PathBuf};
 
 use crate::error::BrokerError;
 
-/// Restrict `dir` so only privileged identities can read or write it (and, by inheritance, the
-/// files inside it).
+/// Restrict `path` so only privileged identities can read or write it — a DIRECTORY (and, by
+/// inheritance, the files inside it) or a single FILE (a scheduler artifact, #504-F).
 ///
 /// - **Unix:** `chmod 0700` — owner-only. When the broker runs as root this is root-only.
 /// - **Windows:** `icacls` removes inheritance and grants Full Control to *only* the
 ///   Administrators (`S-1-5-32-544`) and Local System (`S-1-5-18`) SIDs, so the DACL matches the
-///   "Admin + SYSTEM only" requirement and child files inherit it.
+///   "Admin + SYSTEM only" requirement and (for a directory) child files inherit it.
 ///
 /// # Errors
 ///
 /// [`BrokerError::Io`] if the permissions could not be applied (fail-closed — the beacon must not
 /// proceed with a world-writable trust store).
-pub fn harden_state_dir(dir: &Path) -> Result<(), BrokerError> {
+pub fn harden_state_dir(path: &Path) -> Result<(), BrokerError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(dir, perms).map_err(|e| BrokerError::Io(e.to_string()))
+        std::fs::set_permissions(path, perms).map_err(|e| BrokerError::Io(e.to_string()))
     }
     #[cfg(windows)]
     {
-        harden_windows_dir(dir)
+        harden_windows_path(path)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = dir;
+        let _ = path;
         Ok(())
     }
 }
 
-/// Apply an Administrators + SYSTEM (+ owner) DACL to `dir` via `icacls`.
+/// Apply an Administrators + SYSTEM (+ owner) DACL to `path` via the absolute, trusted `icacls`.
 ///
 /// The grant is Administrators + Local System + OWNER RIGHTS. The owner ACE (`S-1-3-4`) ensures the
-/// identity that created the directory always retains access — in production that is SYSTEM (the
+/// identity that created the path always retains access — in production that is SYSTEM (the
 /// service), but it also lets an unelevated admin process (whose Administrators group is deny-only
 /// under UAC) still write what it owns. It is NOT a weakening: taking ownership of a file is itself
 /// a privileged operation, so an unprivileged process cannot gain the owner ACE. No `Users` /
-/// `Everyone` ACE is granted, so the directory stays non-world-writable.
+/// `Everyone` ACE is granted, so the path stays non-world-writable.
+///
+/// The `(OI)(CI)` (object-inherit/container-inherit) flags only make sense on a DIRECTORY — icacls
+/// rejects them on a plain file — so they are omitted for a single-file target (a scheduler
+/// artifact) and kept for a directory (the state/staging/last-known-good/apply dirs).
 #[cfg(windows)]
-fn harden_windows_dir(dir: &Path) -> Result<(), BrokerError> {
+fn harden_windows_path(path: &Path) -> Result<(), BrokerError> {
     use std::process::Command;
-    let status = Command::new("icacls")
-        .arg(dir)
+    let inherit = if path.is_dir() { "(OI)(CI)" } else { "" };
+    let status = Command::new(icacls_program()?)
+        .arg(path)
         .arg("/inheritance:r")
-        .args(["/grant:r", "*S-1-5-32-544:(OI)(CI)F"]) // Administrators, full, inherited by children
-        .args(["/grant:r", "*S-1-5-18:(OI)(CI)F"]) // Local System, full, inherited by children
-        .args(["/grant:r", "*S-1-3-4:(OI)(CI)F"]) // Owner rights — the creator keeps access
+        .args(["/grant:r", &format!("*S-1-5-32-544:{inherit}F")]) // Administrators, full
+        .args(["/grant:r", &format!("*S-1-5-18:{inherit}F")]) // Local System, full
+        .args(["/grant:r", &format!("*S-1-3-4:{inherit}F")]) // Owner rights — the creator keeps access
         .output()
         .map_err(|e| BrokerError::Io(format!("could not run icacls: {e}")))?;
     if !status.status.success() {
         return Err(BrokerError::Io(format!(
             "icacls failed to harden {}: {}",
-            dir.display(),
+            path.display(),
             String::from_utf8_lossy(&status.stderr).trim()
         )));
     }
     Ok(())
+}
+
+/// The absolute, trusted path to `icacls.exe` (`%SystemRoot%\System32\icacls.exe`) — never a bare
+/// name resolved through `PATH`, matching the discipline every other native tool invocation in
+/// this crate follows ([`crate::install::trusted_absolute`]).
+#[cfg(windows)]
+fn icacls_program() -> Result<PathBuf, BrokerError> {
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .ok_or_else(|| BrokerError::Io("neither %SystemRoot% nor %windir% is set".into()))?;
+    crate::install::trusted_absolute(
+        PathBuf::from(system_root)
+            .join("System32")
+            .join("icacls.exe"),
+    )
+    .map_err(BrokerError::Io)
 }
 
 /// What the broker may do if a guarded path is found writable by a non-privileged identity.

@@ -11,21 +11,24 @@ resolver = "2"
 #                           trust state (anti-rollback / anti-freeze / anti-downgrade),
 #                           the Ed25519 signature + SHA-256 digest verify surface, and
 #                           the pinned root public key. Pure, no I/O — trivially testable.
-#   * dig-updater-broker  — the PRIVILEGED orchestration crate (stub): drives one update
-#                           pass, spawns the worker, applies verified installs, health-gates
-#                           and rolls back. (Install/rollback are follow-up tickets #504-E/-F.)
-#   * dig-updater-worker  — the UNPRIVILEGED, sandboxed fetch/verify crate (stub): downloads
-#                           the feed + artifacts and verifies them against the trust core,
-#                           holding no install privilege. (Fetch pipeline is ticket #504-D.)
-#   * dig-updater-cli     — the `dig-updater` binary (stub): `check --now` / `status --json`.
+#   * dig-updater-broker  — the PRIVILEGED orchestration crate: drives one update pass, spawns
+#                           the worker, applies verified installs, health-gates and rolls back
+#                           (#504-E), holds the single-instance lock, and owns the per-OS
+#                           scheduler artifact + beacon self-update (#504-F).
+#   * dig-updater-worker  — the UNPRIVILEGED, sandboxed fetch/verify crate: downloads the feed +
+#                           artifacts and verifies them against the trust core, holding no
+#                           install privilege.
+#   * dig-updater-cli     — the `dig-updater` binary: `check --now`, `run` (a full pass),
+#                           `schedule install|uninstall|status`, `status --json`.
 #   * dig-updater-feedsign — the CI-ONLY feed signer (crate `dig_updater_feedsign` + binary
 #                           `dig-updater-feedsign`): resolves the latest release per component,
 #                           assembles the signed manifest + root->targets delegation, and emits
 #                           byte-exact feed JSON. It signs with the SAME `signing_bytes` the trust
 #                           core verifies against, so signer and verifier can never drift. It is
-#                           NEVER packaged into the shipped beacon binary (release.yml builds only
-#                           `--bin dig-updater`); it lives in the workspace purely so CI builds,
-#                           lints, tests, and coverage-gates it (#504-I). See SPEC.md §10.
+#                           NEVER packaged into a shipped beacon release (release.yml builds only
+#                           `--bin dig-updater` + `--bin dig-updater-worker`); it lives in the
+#                           workspace purely so CI builds, lints, tests, and coverage-gates it
+#                           (#504-I). See SPEC.md §10.
 members = [
     "crates/dig-updater-trust",
     "crates/dig-updater-broker",
@@ -38,7 +41,7 @@ members = [
 # The RELEASE version of the beacon. The tag-on-merge + version-increment CI reads this
 # `[workspace.package].version` from the ROOT manifest (§3.6); the members inherit it via
 # `version.workspace = true`, so a release fires off this single value.
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-updater"
@@ -59,26 +62,38 @@ thiserror = "1"
 # beacon is a transient single-pass process, so blocking I/O is the right model and avoids an
 # async runtime in the security-sensitive fetch path.
 ureq = "2"
-# OS privilege primitives for the privileged broker's sandboxed spawn + state-dir hardening.
-# These live ONLY in the broker's `platform` module (the sole `unsafe` surface); every other
-# crate keeps `#![forbid(unsafe_code)]`.
+# OS privilege primitives for the privileged broker's sandboxed spawn (`sandbox.rs`) and — on
+# Unix — the state-dir hardening + single-instance lock's directory creation (`lock.rs`); Windows'
+# lock uses `fs4` instead of `libc` there (see below). These are the only `unsafe` surfaces in the
+# workspace; every other crate keeps `#![forbid(unsafe_code)]`.
 libc = "0.2"
 # Test-only: a minimal blocking HTTP server so the fetch/verify pipeline is exercised over a
 # real socket on every OS runner.
 tiny_http = "0.12"
 tempfile = "3"
+# The Unix side of the #504-F single-instance lock (src/lock.rs): a safe `flock` wrapper, the
+# SAME crate `dig-node-core` already uses for its cross-process cache lock — one proven mechanism,
+# not a second hand-rolled `unsafe` one. Windows uses a native named mutex instead (see below).
+fs4 = { version = "1.1.0", features = ["sync"] }
 
 [workspace.dependencies.windows]
 version = "0.58"
 features = [
     "Win32_Foundation",
     "Win32_Security",
+    # SDDL -> SECURITY_DESCRIPTOR conversion, used to DACL-restrict the #504-F single-instance
+    # mutex to Administrators + Local System (src/lock.rs) the same way `secure.rs` icacls-DACLs
+    # the state/staging/last-known-good directories.
+    "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Console",
 ]
+# `Win32_Foundation` (already above) also carries `LocalFree`/`HLOCAL`, used to release the
+# SECURITY_DESCRIPTOR `ConvertStringSecurityDescriptorToSecurityDescriptorW` allocates for the
+# single-instance mutex's DACL (src/lock.rs) — no extra feature needed for that.
 
 # Release hardening (matches dig-node/digstore): keep integer-overflow checks ON in
 # release. The beacon parses an untrusted signed feed and does length/offset arithmetic

@@ -10,15 +10,23 @@
 //!    fabricate a plan that survives this, because it holds no key that chains to the pinned root.
 //! 2. **Enumerate + plan.** Against the RE-VERIFIED manifest (the authority), decide Install /
 //!    Update / Skip per tracked component ([`crate::plan`]).
-//! 3. **Apply behind the health gate.** For each actionable component: refuse a staged path that
-//!    escapes the broker-owned staging dir, copy the staged bytes ONCE into a broker-private file
-//!    while hashing them against the re-verified digest (so the hashed bytes are the installed
-//!    bytes — the reverify→install TOCTOU is closed by construction), snapshot the current binary
-//!    for rollback, install per-OS from the private copy, then health-probe — rolling back
+//! 3. **Apply every OTHER component behind the health gate.** For each actionable component
+//!    except the beacon's own ([`BEACON_COMPONENT_NAME`]): refuse a staged path that escapes the
+//!    broker-owned staging dir, copy the staged bytes ONCE into a broker-private file while
+//!    hashing them against the re-verified digest (so the hashed bytes are the installed bytes —
+//!    the reverify→install TOCTOU is closed by construction), snapshot the current binary for
+//!    rollback, install per-OS from the private copy, then health-probe — rolling back
 //!    (re-verified, floor-bounded) on failure.
-//! 4. **Advance state last.** The monotonic trust state advances ONLY if every actionable
+//! 4. **Advance state.** The monotonic trust state advances ONLY if every OTHER actionable
 //!    component installed AND passed its health gate (SPEC §9 step 7) — never on a partial or
 //!    failed pass, and never before the state directory is hardened.
+//! 5. **Self-update, always LAST (SPEC §8.1, #504-F).** If the beacon's OWN component is
+//!    actionable, [`Installer::apply_one_self`] runs it through the identical stage → snapshot →
+//!    install → health → rollback skeleton as step 3 — but only now, once every other component
+//!    has already settled, and via [`crate::selfupdate`]'s platform-specific swap in place of the
+//!    generic per-OS installer. Applying it any earlier would risk leaving another component's
+//!    in-flight install inconsistent if this process died mid-self-replace; applying it last costs
+//!    nothing, because the transient process model (SPEC §8.1) means this pass exits right after.
 
 use std::path::Path;
 
@@ -37,9 +45,10 @@ use crate::install::{
     contained_staged_path, install_from_private, private_target, stage_and_verify_private,
     InstallOutcome, RetryPolicy,
 };
-use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent};
+use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONENT_NAME};
 use crate::rollback::{LkgCache, LkgEntry};
 use crate::secure::harden_state_dir;
+use crate::selfupdate::apply_self_update;
 use crate::state::{LoadedState, TrustStateStore};
 
 /// What one component's apply produced.
@@ -106,6 +115,16 @@ impl PassReport {
             components: Vec::new(),
             state_advanced: false,
         }
+    }
+
+    /// A prior pass is still holding the single-instance lock (SPEC §8.2) — this invocation exits
+    /// immediately without touching anything. An ordinary, expected outcome, not a failure.
+    #[must_use]
+    pub fn already_running() -> Self {
+        Self::nothing_to_do(
+            "already_running",
+            "a prior pass still holds the single-instance lock; exited without acting",
+        )
     }
 }
 
@@ -175,9 +194,11 @@ impl Installer<'_> {
             self.detect,
         )?;
 
-        // 3. Apply each actionable component behind the health gate.
+        // 3. Apply every OTHER actionable component behind the health gate. The beacon's own
+        // component is set aside (`self_component`) rather than applied here — see step 5.
         let mut components = Vec::with_capacity(plan.components.len());
         let mut all_succeeded = true;
+        let mut self_component = None;
         for pc in &plan.components {
             if pc.action == UpdateAction::Skip {
                 components.push(ComponentOutcome::from(
@@ -187,6 +208,10 @@ impl Installer<'_> {
                 ));
                 continue;
             }
+            if pc.name == BEACON_COMPONENT_NAME {
+                self_component = Some(pc);
+                continue;
+            }
             let outcome = self.apply_one(pc, manifest.rollback_floor_build)?;
             if outcome.result != ComponentResult::Installed {
                 all_succeeded = false;
@@ -194,13 +219,22 @@ impl Installer<'_> {
             components.push(outcome);
         }
 
-        // 4. Advance the trust state ONLY on a fully-successful pass (SPEC §9 step 7).
+        // 4. Advance the trust state ONLY once every OTHER component fully succeeded (SPEC §9
+        // step 7). Deliberately independent of the self-update outcome below: the trust state
+        // tracks MANIFEST freshness, not which binary the beacon itself currently is, so a merely
+        // Deferred self-swap (a common, benign outcome — see `crate::selfupdate`) must never mask
+        // an otherwise fully successful pass for everything else.
         let state_advanced = if all_succeeded {
             self.advance_state(manifest, &loaded)?;
             true
         } else {
             false
         };
+
+        // 5. Self-update LAST, after the rest of the pass has fully settled (SPEC §8.1).
+        if let Some(pc) = self_component {
+            components.push(self.apply_one_self(pc, manifest.rollback_floor_build)?);
+        }
 
         Ok(PassReport {
             applied: true,
@@ -227,17 +261,46 @@ impl Installer<'_> {
         Ok(manifest)
     }
 
-    /// Apply one actionable component: contain the staged path → copy-and-verify into a
-    /// broker-private file → snapshot → install from that private copy → health → rollback.
+    /// Apply one ordinary (non-self) actionable component via the generic, per-OS installer
+    /// ([`install::install_from_private`](crate::install::install_from_private)).
+    fn apply_one(
+        &self,
+        pc: &PlannedComponent,
+        floor: u64,
+    ) -> Result<ComponentOutcome, BrokerError> {
+        self.apply_component(pc, floor, |private, policy| {
+            install_from_private(pc, private, policy)
+        })
+    }
+
+    /// Apply the beacon's OWN component via [`crate::selfupdate::apply_self_update`] — the
+    /// platform-specific self-swap — in place of the generic installer. Called ONLY from
+    /// [`Self::apply`], and only after every other component has already settled (see the module
+    /// doc's step 5).
+    fn apply_one_self(
+        &self,
+        pc: &PlannedComponent,
+        floor: u64,
+    ) -> Result<ComponentOutcome, BrokerError> {
+        self.apply_component(pc, floor, |private, policy| {
+            apply_self_update(private, &pc.dest, policy)
+        })
+    }
+
+    /// The shared per-component skeleton every actionable component — the beacon's own included —
+    /// goes through: contain the staged path → copy-and-verify into a broker-private file →
+    /// snapshot → run `install_step` from that private copy → health → rollback. Only the
+    /// `install_step` itself differs between an ordinary component and the beacon's self-update.
     ///
     /// The containment + private-copy steps make the hashed-is-installed invariant structural: the
     /// worker-reported path is refused unless it resolves inside the broker-owned staging dir, and
     /// the bytes that are hashed are the exact bytes copied into a file the worker cannot touch and
     /// then installed — closing the reverify→install TOCTOU (SPEC §8.3).
-    fn apply_one(
+    fn apply_component(
         &self,
         pc: &PlannedComponent,
         floor: u64,
+        install_step: impl Fn(&std::path::Path, &RetryPolicy) -> InstallOutcome,
     ) -> Result<ComponentOutcome, BrokerError> {
         // Refuse a staged path that escapes the broker-owned staging dir, BEFORE reading a byte.
         let staged = contained_staged_path(&pc.staged_path, self.staging_dir, &pc.name)?;
@@ -252,7 +315,7 @@ impl Installer<'_> {
         // Snapshot the currently-installed binary so a failed health gate can revert to it.
         let snapshot = self.lkg.snapshot(&pc.name, &pc.dest, pc.installed_build)?;
 
-        match install_from_private(pc, &private, &self.retry) {
+        match install_step(&private, &self.retry) {
             InstallOutcome::Installed => match check_health(&pc.dest, &pc.version, self.health) {
                 Ok(()) => Ok(ComponentOutcome::from(
                     pc,

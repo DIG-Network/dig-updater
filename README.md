@@ -25,36 +25,56 @@ The full, normative contract is **[`SPEC.md`](./SPEC.md)** — read it before ch
 
 ## Architecture (at a glance)
 
-- **Transient scheduled process.** The beacon is not a resident daemon: the OS scheduler wakes
-  it daily (plus boot-recovery), it runs one verified pass, and it exits — which dissolves the
-  self-replace deadlock and leaves no socket to attack.
+- **Transient scheduled process.** The beacon is not a resident daemon: a per-OS scheduler
+  artifact (a Windows Scheduled Task / a systemd timer / a launchd LaunchDaemon) wakes it daily,
+  jittered, with boot-recovery for a missed run; it runs one verified pass, and it exits — which
+  dissolves the self-replace deadlock and leaves no socket to attack.
 - **Privileged broker + unprivileged sandboxed worker.** Only the worker touches the network
   (fetch + verify); it holds no install privilege. The broker applies verified installs behind
-  a health gate and rolls back (re-verified, floor-bounded, no data loss) on failure.
+  a health gate and rolls back (re-verified, floor-bounded, no data loss) on failure. A
+  single-instance lock (Admin/SYSTEM-only) keeps two passes from ever overlapping.
+- **The beacon updates itself too.** Its own tracked component goes through the SAME
+  stage → snapshot → install → health → rollback pipeline as every other component, applied
+  LAST in a pass so a self-swap can never leave another component's install mid-flight.
 
 ## Workspace
 
 | Crate | Role |
 |-------|------|
-| `crates/dig-updater-trust` | **Security core** (implemented + tested): signed manifest + delegation types, monotonic trust state, Ed25519 + SHA-256 verification, the pinned root key. |
-| `crates/dig-updater-broker` | Privileged orchestration (stub — #504-E/-F). |
-| `crates/dig-updater-worker` | Unprivileged fetch/verify worker (stub — #504-D). |
-| `crates/dig-updater-cli` | The `dig-updater` binary: `check` / `status` (wired stubs). |
+| `crates/dig-updater-trust` | **Security core:** signed manifest + delegation types, monotonic trust state, Ed25519 + SHA-256 verification, the pinned root key. |
+| `crates/dig-updater-broker` | Privileged orchestration: spawn the sandboxed worker, the single-instance lock, ACL self-check, install/health-gate/rollback, the per-OS scheduler artifact (`scheduler` module), and the beacon's own self-update (`selfupdate` module). |
+| `crates/dig-updater-worker` | Unprivileged fetch/verify worker — the only part that touches the network. |
+| `crates/dig-updater-cli` | The `dig-updater` binary: `check` (dry verify), `run` (a full pass — what the schedule invokes), `schedule install\|uninstall\|status`, `status`. |
+| `crates/dig-updater-feedsign` | CI-only feed signer (never shipped in the beacon binary). |
 
 ## Build
 
 ```bash
 cargo build --workspace          # build everything
-cargo test  --workspace          # run the trust-core test suite
+cargo test  --workspace          # the full test suite (OS-mutating scheduler/lock tests are
+                                  # #[ignore]d — see below)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo llvm-cov --workspace --fail-under-lines 80 --summary-only   # coverage gate
 ```
 
 > **Windows local-dev note.** A test/binary whose filename contains "updater" trips Windows UAC
-> installer-detection (error 740) when run unelevated. CI runs tests on Linux, so this is a
-> local nuisance only; to run the suite on Windows without elevation, set
-> `__COMPAT_LAYER=RunAsInvoker`. The shipped Windows binary will carry an `asInvoker` manifest
-> (an OS-integration follow-up).
+> installer-detection (error 740) when run unelevated; `.cargo/config.toml` embeds an
+> `asInvoker` manifest at link time (covering the shipped binaries AND the `cargo test`
+> harness), so this runs unelevated on every OS the beacon ships to.
+
+### Elevated tests
+
+A handful of tests mutate real, privileged OS state — a Scheduled Task, systemd units, a
+LaunchDaemon, the production single-instance mutex — and therefore require the SAME privilege
+the beacon runs at (Administrator on Windows, root on Unix). They are `#[ignore]`d by default;
+run them explicitly from an elevated console/`sudo`:
+
+```bash
+cargo test -p dig-updater-broker --lib -- --ignored             # the production lock contention test
+cargo test -p dig-updater-broker --test scheduler -- --ignored  # install/status/uninstall + ACL checks
+```
+
+The dedicated `scheduler-elevated` CI job runs both on all three OSes on every PR.
 
 ## The pinned key
 
@@ -65,6 +85,8 @@ cargo llvm-cov --workspace --fail-under-lines 80 --summary-only   # coverage gat
 
 ## Status
 
-Alpha scaffold: the trust core + full CI/release gate set are in place; the fetch/install/
-scheduler pipeline lands in follow-up tickets under epic **#504**. Nothing is released to users
-yet. License: **GPL-2.0-only**.
+Alpha: the trust core, the install path, and the scheduling/self-update surface are implemented
+and tested (epic **#504**, work-units -A/-C/-D/-E/-F). Remaining follow-ups — CLI polish
+(channel/pause), the `updates.dig.net` feed origin, native packages + installer registration,
+the `dig-node` updater RPC proxy, an Updates UI, and docs — are tracked under #504. Nothing is
+released to users yet. License: **GPL-2.0-only**.

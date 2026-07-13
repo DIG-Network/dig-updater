@@ -2,20 +2,27 @@
 
 //! The `dig-updater` beacon CLI.
 //!
-//! Manual entry point to the beacon. In this (-D) milestone the wired command is
-//! `check --dry-run`: it runs one privileged pass that loads the trust state, spawns the
-//! unprivileged worker to fetch + verify + stage, and prints the verification report — WITHOUT
-//! installing anything and WITHOUT advancing the trust state (the install path is #504-E). Both a
-//! human line and a `--json` object are offered so the CLI is agent-consumable from day one
-//! (§6.2).
+//! Manual + scheduled entry point to the beacon:
 //!
-//! The feed location can be overridden for a custom/test feed via `--feed-base <url>` or
-//! `$DIG_UPDATER_FEED_BASE` (transport is untrusted — the signature is the gate — so this is
-//! safe). The trusted root KEY has no such override.
+//! - `check` — a DRY verify pass: fetch + verify the latest feed, but never install or advance
+//!   trust state. For inspecting what the beacon WOULD do.
+//! - `run` — a FULL pass ([`Broker::run_once`]): verify, install behind the health gate, and
+//!   (always last) the beacon's own self-update. This is the command the per-OS scheduler
+//!   artifact ([`dig_updater_broker::scheduler`]) invokes daily.
+//! - `schedule install|uninstall|status` — register/remove/report the daily scheduler artifact
+//!   that invokes `run` (SPEC §8.2, #504-F). Registering requires the privilege the artifact
+//!   itself runs at (Administrator on Windows, root on Unix).
+//! - `status` — report the beacon's persisted trust state.
+//!
+//! Every command offers a human line AND a `--json` object so the CLI is agent-consumable from
+//! day one (§6.2). The feed location can be overridden for a custom/test feed via
+//! `--feed-base <url>` or `$DIG_UPDATER_FEED_BASE` (transport is untrusted — the signature is the
+//! gate — so this is safe); the trusted root KEY has no such override.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use dig_updater_broker::{Broker, BrokerError, TrustStateStore};
+use dig_updater_broker::{scheduler, Broker, BrokerError, PassReport, TrustStateStore};
 use dig_updater_trust::TrustState;
 use dig_updater_worker::{production_feed_ladder, FeedSource, WorkerReport};
 
@@ -26,14 +33,17 @@ USAGE:
     dig-updater <COMMAND> [OPTIONS]
 
 COMMANDS:
-    check      Fetch + verify the latest feed. In this build `check` is a DRY verify pass
-               (no install, no state change); the install path lands in #504-E.
-    status     Report the beacon's persisted trust state.
-    help       Show this help.
+    check                Fetch + verify the latest feed — a DRY pass: no install, no state change.
+    run                  Run one FULL pass: verify, install behind the health gate, and
+                         self-update. This is what the daily schedule invokes.
+    schedule install     Register the daily scheduler artifact that runs `dig-updater run`
+                         (requires Administrator/root).
+    schedule uninstall   Remove the daily scheduler artifact (requires Administrator/root).
+    schedule status      Report whether the daily scheduler artifact is registered.
+    status               Report the beacon's persisted trust state.
+    help                 Show this help.
 
 OPTIONS:
-    --dry-run           Verify only; never install or advance trust state (the default today).
-    --now               Run the pass immediately (the manual default).
     --feed-base <url>   Override the feed base URL (for a custom/test feed). Untrusted transport.
     --json              Emit machine-readable JSON instead of a human line.
     --version, -V       Print the beacon version.";
@@ -45,11 +55,27 @@ enum Cmd {
         feed_base: Option<String>,
         json: bool,
     },
+    Run {
+        json: bool,
+    },
+    Schedule {
+        action: ScheduleAction,
+        json: bool,
+    },
     Status {
         json: bool,
     },
     Help,
     Version,
+    Unknown(String),
+}
+
+/// Which `schedule` subcommand was requested.
+#[derive(Debug, PartialEq, Eq)]
+enum ScheduleAction {
+    Install,
+    Uninstall,
+    Status,
     Unknown(String),
 }
 
@@ -70,6 +96,8 @@ fn main() -> ExitCode {
         }
         Cmd::Status { json } => run_status(json),
         Cmd::Check { feed_base, json } => run_check(feed_base, json),
+        Cmd::Run { json } => run_pass(json),
+        Cmd::Schedule { action, json } => run_schedule(action, json),
     }
 }
 
@@ -80,15 +108,32 @@ fn parse(args: &[String]) -> Cmd {
     }
     let json = args.iter().any(|a| a == "--json");
     let feed_base = flag_value(args, "--feed-base");
-    match args
+    let positionals: Vec<&str> = args
         .iter()
-        .find(|a| !a.starts_with('-'))
+        .filter(|a| !a.starts_with('-'))
         .map(String::as_str)
-    {
+        .collect();
+    match positionals.first().copied() {
         None | Some("help") => Cmd::Help,
         Some("check") => Cmd::Check { feed_base, json },
+        Some("run") => Cmd::Run { json },
         Some("status") => Cmd::Status { json },
+        Some("schedule") => Cmd::Schedule {
+            action: parse_schedule_action(positionals.get(1).copied()),
+            json,
+        },
         Some(other) => Cmd::Unknown(other.to_string()),
+    }
+}
+
+/// Parse the sub-action of `schedule <action>`.
+fn parse_schedule_action(action: Option<&str>) -> ScheduleAction {
+    match action {
+        Some("install") => ScheduleAction::Install,
+        Some("uninstall") => ScheduleAction::Uninstall,
+        Some("status") => ScheduleAction::Status,
+        Some(other) => ScheduleAction::Unknown(other.to_string()),
+        None => ScheduleAction::Unknown(String::new()),
     }
 }
 
@@ -125,6 +170,78 @@ fn run_check(feed_base: Option<String>, json: bool) -> ExitCode {
             }
         }
         Err(e) => fail(&e, json),
+    }
+}
+
+/// Run one FULL update pass — [`Broker::run_once`] — and print the report. This is the command
+/// the daily scheduler artifact invokes; a manual run behaves identically.
+fn run_pass(json: bool) -> ExitCode {
+    let broker = match Broker::new() {
+        Ok(b) => b,
+        Err(e) => return fail(&e, json),
+    };
+    match broker.run_once() {
+        Ok(report) => {
+            println!("{}", render_pass_report(&report, json));
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e, json),
+    }
+}
+
+/// Register, remove, or report the daily scheduler artifact that runs `dig-updater run`.
+fn run_schedule(action: ScheduleAction, json: bool) -> ExitCode {
+    let exe = match current_exe_for_schedule() {
+        Ok(p) => p,
+        Err(e) => return fail(&e, json),
+    };
+    match action {
+        ScheduleAction::Install => match scheduler::install(&exe) {
+            Ok(()) => {
+                print_schedule_outcome("installed", true, json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e, json),
+        },
+        ScheduleAction::Uninstall => match scheduler::uninstall() {
+            Ok(()) => {
+                print_schedule_outcome("uninstalled", false, json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e, json),
+        },
+        ScheduleAction::Status => match scheduler::status() {
+            Ok(status) => {
+                println!("{}", render_schedule_status(&status, json));
+                if status.installed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+            Err(e) => fail(&e, json),
+        },
+        ScheduleAction::Unknown(action) => {
+            eprintln!("unknown schedule action: {action}\n\n{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The executable path the scheduler artifact should invoke — this running binary itself.
+fn current_exe_for_schedule() -> Result<PathBuf, BrokerError> {
+    std::env::current_exe().map_err(|e| BrokerError::Io(e.to_string()))
+}
+
+/// Print a one-line confirmation for `schedule install`/`uninstall`.
+fn print_schedule_outcome(verb: &str, installed: bool, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "command": "schedule", "installed": installed })
+        );
+    } else {
+        println!("dig-updater: daily schedule {verb}");
     }
 }
 
@@ -171,6 +288,53 @@ fn render_report(report: &WorkerReport, json: bool) -> String {
             out
         }
         WorkerReport::Rejected { reason, detail } => format!("rejected ({reason}): {detail}"),
+    }
+}
+
+/// Render a FULL pass's report ([`Broker::run_once`]) as JSON or a human summary. Pure.
+fn render_pass_report(report: &PassReport, json: bool) -> String {
+    if json {
+        return serde_json::to_string(report)
+            .unwrap_or_else(|e| format!(r#"{{"status":"error","detail":"{e}"}}"#));
+    }
+    if !report.applied {
+        let reason = report.reason.as_deref().unwrap_or("unknown");
+        let detail = report.detail.as_deref().unwrap_or("");
+        return format!("nothing applied ({reason}): {detail}");
+    }
+    let mut out = format!(
+        "pass applied ({} component(s), trust state {}advanced):",
+        report.components.len(),
+        if report.state_advanced { "" } else { "NOT " }
+    );
+    for c in &report.components {
+        out.push_str(&format!(
+            "\n  {} [{}] {:?}: {}",
+            c.component, c.action, c.result, c.detail
+        ));
+    }
+    out
+}
+
+/// Render the scheduler artifact's registration status as JSON or a human line. Pure.
+fn render_schedule_status(status: &scheduler::ScheduleStatus, json: bool) -> String {
+    if json {
+        serde_json::json!({
+            "command": "schedule status",
+            "installed": status.installed,
+            "detail": status.detail,
+        })
+        .to_string()
+    } else {
+        format!(
+            "dig-updater: daily schedule {} — {}",
+            if status.installed {
+                "REGISTERED"
+            } else {
+                "NOT REGISTERED"
+            },
+            status.detail
+        )
     }
 }
 
@@ -230,10 +394,59 @@ mod tests {
     #[test]
     fn check_parses_flags() {
         assert_eq!(
-            parse(&v(&["check", "--dry-run", "--json"])),
+            parse(&v(&["check", "--json"])),
             Cmd::Check {
                 feed_base: None,
                 json: true
+            }
+        );
+    }
+
+    #[test]
+    fn run_parses_json_flag() {
+        assert_eq!(parse(&v(&["run"])), Cmd::Run { json: false });
+        assert_eq!(parse(&v(&["run", "--json"])), Cmd::Run { json: true });
+    }
+
+    #[test]
+    fn schedule_parses_each_action() {
+        assert_eq!(
+            parse(&v(&["schedule", "install"])),
+            Cmd::Schedule {
+                action: ScheduleAction::Install,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(&v(&["schedule", "uninstall", "--json"])),
+            Cmd::Schedule {
+                action: ScheduleAction::Uninstall,
+                json: true
+            }
+        );
+        assert_eq!(
+            parse(&v(&["schedule", "status"])),
+            Cmd::Schedule {
+                action: ScheduleAction::Status,
+                json: false
+            }
+        );
+    }
+
+    #[test]
+    fn schedule_with_no_or_unknown_action_is_reported() {
+        assert_eq!(
+            parse(&v(&["schedule"])),
+            Cmd::Schedule {
+                action: ScheduleAction::Unknown(String::new()),
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(&v(&["schedule", "frobnicate"])),
+            Cmd::Schedule {
+                action: ScheduleAction::Unknown("frobnicate".to_string()),
+                json: false
             }
         );
     }
@@ -344,5 +557,76 @@ mod tests {
             serde_json::from_str(&render_status(&state, "/x", true)).unwrap();
         assert_eq!(json["command"], "status");
         assert_eq!(json["trust_state"]["sequence"], 7);
+    }
+
+    fn applied_report() -> PassReport {
+        use dig_updater_broker::{ComponentOutcome, ComponentResult};
+        PassReport {
+            applied: true,
+            reason: None,
+            detail: None,
+            components: vec![
+                ComponentOutcome {
+                    component: "digstore".into(),
+                    action: "update".into(),
+                    result: ComponentResult::Installed,
+                    detail: "v0.1.0 -> v0.2.0".into(),
+                },
+                ComponentOutcome {
+                    component: "dig-updater".into(),
+                    action: "skip".into(),
+                    result: ComponentResult::Skipped,
+                    detail: "already current".into(),
+                },
+            ],
+            state_advanced: true,
+        }
+    }
+
+    #[test]
+    fn render_applied_pass_report_human_lists_components_in_order() {
+        let out = render_pass_report(&applied_report(), false);
+        assert!(out.contains("2 component(s)"));
+        assert!(out.contains("trust state advanced"));
+        let digstore_at = out.find("digstore").expect("digstore listed");
+        let updater_at = out.find("dig-updater").expect("dig-updater listed");
+        assert!(
+            digstore_at < updater_at,
+            "digstore must be listed before the beacon's own component"
+        );
+    }
+
+    #[test]
+    fn render_applied_pass_report_json_round_trips_the_report() {
+        let out = render_pass_report(&applied_report(), true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["applied"], true);
+        assert_eq!(parsed["state_advanced"], true);
+        assert_eq!(parsed["components"][0]["component"], "digstore");
+    }
+
+    #[test]
+    fn render_already_running_pass_report_is_a_benign_nothing_applied() {
+        let out = render_pass_report(&PassReport::already_running(), false);
+        assert!(out.contains("nothing applied"));
+        assert!(out.contains("already_running"));
+    }
+
+    #[test]
+    fn render_schedule_status_human_and_json() {
+        let installed = scheduler::ScheduleStatus {
+            installed: true,
+            detail: r"registered at \DIG\dig-updater".into(),
+        };
+        assert!(render_schedule_status(&installed, false).contains("REGISTERED"));
+        let json: serde_json::Value =
+            serde_json::from_str(&render_schedule_status(&installed, true)).unwrap();
+        assert_eq!(json["installed"], true);
+
+        let absent = scheduler::ScheduleStatus {
+            installed: false,
+            detail: "no task registered".into(),
+        };
+        assert!(render_schedule_status(&absent, false).contains("NOT REGISTERED"));
     }
 }

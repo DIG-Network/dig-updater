@@ -108,3 +108,60 @@ change diary.
   that does not verify is never served; the previous feed simply expires (12h) if a run is skipped.
 - **Byte-identical serving is a hard requirement.** The verifier checks the signature over the
   RECEIVED bytes, so any transport transform of the JSON breaks it. Origins must serve verbatim.
+
+## Scheduler, lock, self-update (-F)
+
+- **A Windows named-mutex DACL breaks `CreateMutexW`'s OWN "open existing" path, not just other
+  processes.** `CreateMutexW` on an object that already exists performs an implicit OPEN with a
+  fixed desired access; if the caller's token cannot satisfy the object's DACL, the call fails
+  outright with `ERROR_ACCESS_DENIED` — it does NOT fall back to a lesser access. This means an
+  Administrators/SYSTEM-only DACL (correct for production) makes even a SECOND call from the SAME
+  unprivileged process unable to detect contention — `cargo test`'s default (non-elevated) token
+  cannot probe it. Fix: split the mutex creation path — the fixed production name always uses the
+  restrictive DACL; a separate test-only entry point (`try_acquire_named`) uses the OS default
+  security so contention is exercisable from an ordinary `cargo test` run, and the production DACL
+  itself is only re-verified in the `scheduler-elevated` job in `ci.yml`.
+- **Rust's `std::fs::File` opens with `FILE_SHARE_DELETE` on Windows by default.** Contrary to the
+  classic "can't delete an open file on Windows" folklore, Rust's std opens with all three share
+  flags (read/write/delete) unless you override `share_mode` via `OpenOptionsExt`. A test meaning
+  to simulate "the destination is locked against rename" must explicitly `.share_mode(FILE_SHARE_READ)`
+  (denying write+delete while still allowing a concurrent digest read) — a plain `File::open` will
+  NOT block a rename and silently defeats the test's premise.
+  (`a_deferred_self_update_never_gates_the_other_components_state_advance`.)
+- **A component's OWN pre-existing-directory or broken-parent-directory trick fails at
+  snapshot/staging time, not install time.** Forcing an install-step failure by making `dest` a
+  directory, or its parent a non-directory file, actually errors EARLIER — `LkgCache::snapshot`'s
+  `sha256_file` on a directory, or `stage_and_verify_private`'s `create_dir_all` on a blocked
+  parent — which `?`-propagates as a hard `BrokerError` and aborts the WHOLE pass instead of
+  producing a graceful per-component `Deferred`/`Failed` outcome. To test ONLY the install step,
+  the induced failure must leave `dest` absent (a clean fresh-install snapshot) and its parent a
+  real, writable directory (the file-locking trick above is the portable way to do this on
+  Windows; there is no Unix equivalent, since Unix permits renaming over a busy file by design —
+  see the next point).
+- **On Windows, renaming DIRECTLY onto a currently-executing image is unreliable; the fix is the
+  well-known two-rename dance, not a single `MoveFileEx`.** Rename-over-self "usually" works on
+  Windows because the loader shares delete/rename access on the running image, but relying on a
+  single rename for the SELF case specifically (vs. every other raw-binary component, where a
+  locked target just retries/defers) risks a sharing violation right when it matters most. The
+  robust pattern every long-lived Windows self-updater uses: rename the running image aside to a
+  `.old` sibling FIRST, then rename the verified copy into the vacated name; undo the first rename
+  if the second fails, so the beacon is never left without a working binary.
+- **The XML `encoding=` declaration must match the bytes actually on disk.** `std::fs::write` of a
+  Rust `String` always writes UTF-8; declaring `encoding="UTF-16"` in the Task Scheduler XML
+  prolog while the file is actually UTF-8 bytes is a real mismatch (caught before shipping, not
+  found live) — Task Scheduler's parser decodes per the declared encoding, so encoding and bytes
+  must agree; declare `UTF-8` to match what is actually written.
+- **The self-update's outcome must NOT gate whether the trust state advances for every other
+  component.** The four monotonic marks (§6) track manifest FRESHNESS, not which binary the
+  beacon itself currently is — a merely `Deferred` self-swap (locked target, common and benign) is
+  therefore reported independently and never blocks the rest of a fully-successful pass from
+  being recorded as such.
+- **Real OS-registration tests that target ONE machine-global artifact race under `cargo test`'s
+  default parallelism.** Unlike the lock's mutex (which has an injectable NAME per test), the
+  scheduler artifact has exactly one canonical identity (one Task path / one systemd unit pair /
+  one launchd label) — every test in `tests/scheduler.rs` mutates the SAME one. Running them
+  concurrently let one test's `uninstall` land between another's `install` and its `status` check,
+  failing an assertion that had nothing wrong with the code under test (caught live in the
+  elevated CI job on the ubuntu runner). Fix: a single `static Mutex<()>` in the test file, held
+  for each test's full body — the same shape as `dig-relay`'s `ENV_LOCK` for its env-mutating
+  tests, applied here to OS-mutating ones instead.

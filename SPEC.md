@@ -284,16 +284,40 @@ wakes it (daily, plus boot-recovery), it performs exactly ONE update pass, and i
 There is no long-lived socket and no resident service to attack or to keep patched.
 
 This design dissolves the **self-replace deadlock**: a resident updater cannot overwrite its
-own running executable on Windows (the image is locked) or safely on Unix. Because the beacon
-has exited by the time an install runs — and because self-update of the beacon itself is staged
-for the *next* wake rather than performed in-process — nothing holds the image open at replace
-time.
+own running executable on Windows (the image is locked) or safely on Unix. The beacon's own
+tracked component is applied through the SAME stage → snapshot → install → health → rollback
+pipeline as every other component (§9.5), but MUST be the LAST one applied in a pass, after
+every other component has already settled — a self-swap that raced ahead of the rest of the
+pass would risk leaving another component's in-flight install inconsistent if the process then
+died mid-swap. Applying it at the end of the SAME pass, rather than deferring it to the next
+wake, is safe specifically because the pass is about to exit anyway (nothing else in this
+process depends on the old image surviving past that point):
+
+- **Unix** replaces the running executable with a single atomic rename. The kernel keeps the OLD
+  file open for whichever process is still executing it; the rename only changes which bytes the
+  path resolves to for the NEXT invocation.
+- **Windows** cannot overwrite a loaded image's bytes in place, so the swap is two plain renames:
+  the running image moves aside to a `.old` sibling (permitted — the OS shares delete/rename
+  access on the running file even while it executes), then the verified copy takes its name. If
+  either half fails, the swap MUST be undone rather than left half-applied, so the beacon is
+  never left without a working binary at its own destination.
 
 ### 8.2 Single-instance lock
 
-Each pass MUST acquire a single-instance lock before doing any work and release it on exit. If
-the lock is already held (a prior pass overran), the new invocation MUST exit immediately
-without acting. The lock MUST live in an Admin/SYSTEM-only location.
+Each pass MUST acquire a single-instance lock before doing any work — before the network is
+touched or anything is installed — and release it on exit (including on a crash: the lock MUST
+NOT require an explicit clean shutdown to release). If the lock is already held (a prior pass
+overran), the new invocation MUST exit immediately without acting, reporting a distinct,
+non-error outcome (SPEC §12: `already_running`). The lock MUST live in an Admin/SYSTEM-only
+location:
+
+- **Windows:** a named mutex in the session-independent `Global\` namespace (so a
+  Task-Scheduler-launched SYSTEM pass in Session 0 and a manually-run pass from an interactive
+  elevated console still serialize against each other), DACL'd to Administrators + Local System
+  only — an unprivileged process MUST NOT be able to acquire OR query it.
+- **Unix:** an advisory exclusive file lock on a file inside the Admin/SYSTEM-only state
+  directory (§9.3); the containing directory's own permissions are what keep an unprivileged
+  process from ever reaching the lock file at all.
 
 ### 8.3 Privilege split — privileged broker + unprivileged worker
 
@@ -329,6 +353,27 @@ the worker reports are untrusted. The broker therefore MUST:
 - **Invoke native installers by absolute path.** `msiexec`/`installer`/`dpkg` MUST be run from their
   absolute, trusted locations (e.g. `%SystemRoot%\System32\msiexec.exe`, `/usr/sbin/installer`,
   `/usr/bin/dpkg`), never a bare name resolved through `PATH`/CWD.
+
+### 8.4 Scheduler artifact — what wakes a pass
+
+The beacon does not schedule itself; a per-OS artifact registered OUTSIDE the beacon invokes it
+on a schedule. Registering, removing, and reporting on that artifact is itself a privileged
+operation (Administrator on Windows, root on Unix) — the same precondition the artifact runs at.
+
+| OS | Artifact | Cadence + jitter | Boot recovery | Runs as |
+|----|----------|-------------------|----------------|---------|
+| Windows | a Scheduled Task | daily, native `RandomDelay` (re-drawn every occurrence) | `StartWhenAvailable` | `S-1-5-18` (SYSTEM), highest available run level |
+| Linux | a systemd `.service` (oneshot) + `.timer` pair | daily, native `RandomizedDelaySec` (re-drawn every run) | `Persistent=true` | root (via systemd) |
+| macOS | a `LaunchDaemon` plist | daily at a fixed, per-machine-jittered time-of-day (`StartCalendarInterval`; launchd has no native per-run jitter, so the spread is drawn ONCE at install time) | `RunAtLoad` | root |
+
+Every artifact invokes the SAME command: a full pass (§9), never the dry check. The jitter
+spreads fleet-wide load off a single instant; boot recovery ensures a machine that was off past
+the scheduled time still gets a prompt update on its next boot rather than waiting a full day
+for the next occurrence. The Windows Task definition file, and (on Unix) the unit/plist files
+themselves, MUST be locked down to the same Admin/SYSTEM-or-root bar as every other guarded path
+this beacon depends on (§9.3) — Unix unit/plist files follow the platform convention of
+root-owned, mode `0644` (world-readable, root-writable only, matching how `systemctl status`/
+`launchctl print` are expected to work for any user).
 
 ---
 
@@ -470,11 +515,14 @@ An implementation MUST uphold all of:
 5. **Verify-then-install.** Bytes are digest-verified before reaching privileged install (§9).
 6. **Least privilege.** The network-facing worker holds no install privilege (§8.3).
 7. **No self-replace deadlock.** The transient process model lets the beacon update itself and
-   its peers (§8.1).
+   its peers, applying its own swap LAST in a pass so a self-replace can never corrupt another
+   component's in-flight install (§8.1).
 8. **Fail-closed, diagnosable.** Every check fails closed with a distinct reason (§9).
 9. **Safe rollback.** Rollbacks are re-verified, floor-bounded, and never destroy data (§9.5).
 10. **Secret hygiene.** The signing private key lives only in CI and is never committed/printed
     (§4.2).
+11. **No concurrent passes.** The single-instance lock (§8.2) is Admin/SYSTEM-only, so an
+    unprivileged process can neither race a pass nor deny-of-service the schedule by holding it.
 
 ### 11.2 Hardening path (NOT alpha)
 
@@ -491,9 +539,10 @@ alpha ships on the pinned-key + monotonic-freshness floor without them:
 
 ## 12. Conformance + implemented scope
 
-This repository implements the **beacon core plus the install path** (the trust core, the wired
-fetch → verify → plan pipeline, and the privileged enumerate → install → health-gate → rollback,
-#504-A/-C/-D/-E):
+This repository implements the **beacon core, the install path, and the scheduling/self-update
+surface** (the trust core, the wired fetch → verify → plan pipeline, the privileged enumerate →
+install → health-gate → rollback, and the daily scheduler artifact + single-instance lock +
+beacon self-update, #504-A/-C/-D/-E/-F):
 
 - **`dig-updater-trust`** — the wire types (§5), the monotonic trust state (§6), the freshness
   checks (§7), the signature + digest verification (§9, no I/O), and the pinned root key (§4.2).
@@ -528,7 +577,19 @@ fetch → verify → plan pipeline, and the privileged enumerate → install →
   non-world-writable directory (NOT `/tmp`); and the broker's file reads on the install path refuse
   to follow symlinks. A manual `Broker::rollback` reads its rollback floor from the PERSISTED trust
   state, never a caller-supplied value, so a below-floor cached build can never be reinstated.
-- **`dig-updater` (CLI)** — `check` (a dry verify pass) and `status`, with `--json` and a
+  `Broker::run_once` acquires the single-instance lock (§8.2) BEFORE any of this and reports
+  `already_running` rather than an error if a prior pass still holds it. Within a pass, the
+  beacon's own tracked component is carved out of the ordinary per-component loop and applied
+  LAST, via a platform-specific swap (§8.1) — Unix a plain atomic rename, Windows a two-rename
+  dance with automatic rollback of a failed second half — through the IDENTICAL stage → snapshot
+  → install → health → rollback skeleton every other component uses; its outcome does NOT gate
+  whether the trust state advances for everything else.
+- **`dig-updater-broker::scheduler`** — the per-OS scheduler artifact (§8.4): `install`/
+  `uninstall`/`status` register, remove, and report a Windows Scheduled Task / systemd timer+
+  service pair / launchd LaunchDaemon that invokes `dig-updater run` daily, jittered, with native
+  or baked-in boot-recovery. Registering requires the same privilege the artifact runs at.
+- **`dig-updater` (CLI)** — `check` (a dry verify pass), `run` (a full pass — what the scheduler
+  artifact invokes), `schedule install|uninstall|status`, and `status`, with `--json` and a
   `--feed-base` transport override (the key is never overridable).
 - **`dig-updater-feedsign`** — the CI-only feed signer (§10): resolves the latest release per
   component, downloads + digests the per-OS/arch assets, assembles the manifest + delegation, and
@@ -539,13 +600,10 @@ fetch → verify → plan pipeline, and the privileged enumerate → install →
 
 The following are follow-up tickets under epic #504 and are OUT of scope here:
 
-- **#504-F** scheduler artifacts (Task Scheduler / systemd timer / launchd) with Admin/SYSTEM
-  DACLs, the single-instance lock, boot recovery, and beacon self-update (§8). The single-instance
-  lock and the scheduler artifact join the broker's ACL self-check guarded-path set at that point;
-  the beacon's own self-replace uses the raw-binary DEFER-on-lock behaviour (§9.5) until then.
-- **#504-G/-I(b)/-H/-J/-K/-L** CLI completion, the `updates.dig.net` S3+CloudFront feed origin
-  (the signer + nightly CI itself, #504-I(a), ships here — see §10), beacon native packages +
-  installer registration, `dig-node` updater RPC proxy, Updates UI, and docs.
+- **#504-G/-I(b)/-H/-J/-K/-L** further CLI polish (channel/pause), the `updates.dig.net`
+  S3+CloudFront feed origin (the signer + nightly CI itself, #504-I(a), ships here — see §10),
+  beacon native packages + installer registration, `dig-node` updater RPC proxy, Updates UI, and
+  docs.
 - **#534** the full Windows AppContainer worker sandbox (the alpha ships the restricted-token
   floor).
 

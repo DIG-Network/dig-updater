@@ -116,3 +116,38 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release --locked
+
+  scheduler-elevated:
+    # The #504-F scheduler artifact (Task Scheduler / systemd timer / launchd) and the
+    # single-instance lock's production DACL both require the SAME privilege they run at
+    # (Administrator/root) to even be probed — so their `#[ignore]`d tests (SPEC §8.2, §8.3, §9.3)
+    # run here, elevated, on all three OSes: `dig-updater schedule install` -> assert the artifact
+    # is registered with an Admin/SYSTEM-or-root-owned ACL/mode -> `schedule uninstall` -> assert
+    # clean; and the production single-instance mutex actually refuses a second acquire.
+    #
+    # Windows-hosted GitHub runners already run Administrator-capable without an extra elevation
+    # step; Linux/macOS runners are NOT root by default, so those two invoke `sudo -E` to inherit
+    # the toolchain env into the elevated process.
+    name: Scheduler + lock (elevated, 3 OS)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build test binaries (unprivileged)
+        run: cargo test --workspace --locked --no-run
+      - name: Elevated tests (Windows — already Administrator-capable)
+        if: runner.os == 'Windows'
+        run: |
+          cargo test -p dig-updater-broker --lib --locked -- --ignored
+          cargo test -p dig-updater-broker --test scheduler --locked -- --ignored
+      - name: Elevated tests (Unix — via sudo)
+        if: runner.os != 'Windows'
+        run: |
+          sudo -E env "PATH=$PATH" cargo test -p dig-updater-broker --lib --locked -- --ignored
+          sudo -E env "PATH=$PATH" cargo test -p dig-updater-broker --test scheduler --locked -- --ignored

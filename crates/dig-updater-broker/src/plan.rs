@@ -21,6 +21,11 @@ use dig_updater_worker::{Platform, StagedArtifact};
 
 use crate::error::BrokerError;
 
+/// The manifest component name the beacon tracks for ITSELF. The applier uses this to carve its
+/// own component out of the ordinary per-component loop and apply it LAST, via a platform-specific
+/// self-swap instead of the generic per-OS installer (SPEC §8.1, #504-F).
+pub const BEACON_COMPONENT_NAME: &str = "dig-updater";
+
 /// The radix that keeps a packed `build` number monotonic in the version — the SAME encoding the
 /// feed-signer uses (SPEC §10.3: `major·10⁶ + minor·10³ + patch`), so the broker's anti-downgrade
 /// comparison agrees byte-for-byte with the number the signed manifest carries.
@@ -132,9 +137,9 @@ impl Catalog {
                 dest: exe("dig-dns"),
             },
             ComponentTarget {
-                name: "dig-updater".into(),
+                name: BEACON_COMPONENT_NAME.into(),
                 method: InstallMethod::RawBinary,
-                dest: exe("dig-updater"),
+                dest: exe(BEACON_COMPONENT_NAME),
             },
         ])
     }
