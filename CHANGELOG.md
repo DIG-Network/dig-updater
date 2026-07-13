@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.0] - 2026-07-13
+
+### Features
+- Broker install path — enumerate, ACL harden, silent install, health-gate, rollback (#504-E) (#4)
+
 ## [0.3.0] - 2026-07-13
 
 ### Features
