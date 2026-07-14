@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.8.1] - 2026-07-14
+
+### Bug Fixes
+- **beacon:** Graceful unprivileged check (no bare os-183) + verified-reality status detail (#582) (#14)
+
 ## [0.8.0] - 2026-07-14
 
 ### Bug Fixes
