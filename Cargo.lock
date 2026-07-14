@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-broker"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "base64",
  "dig-release-resolver",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-cli"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "dig-updater-broker",
  "dig-updater-trust",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-feedsign"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "base64",
  "dig-updater-trust",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-trust"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-worker"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "base64",
  "dig-updater-trust",
@@ -491,7 +491,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
 dependencies = [
