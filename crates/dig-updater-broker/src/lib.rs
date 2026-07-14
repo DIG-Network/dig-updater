@@ -8,13 +8,15 @@
 //! [`dig_updater_worker`] to fetch + verify, receives only a verified plan back, and — in the
 //! install path (#504-E) — applies installs behind a health gate and rolls back on failure.
 //!
-//! This crate implements the -D + -E + -F surface: loading the persisted trust state, spawning
-//! the worker with dropped privileges ([`sandbox`]), a **dry check** ([`Broker::dry_check`]) that
-//! verifies without installing, and the full install path ([`Broker::run_once`]) — a
-//! single-instance lock ([`lock`]), ACL self-check, independent re-verify under the pinned key,
-//! staging re-verify, silent per-OS install, health gate, re-verified rollback
-//! ([`pass::Installer`]), and — always last — the beacon's own self-update ([`selfupdate`]). The
-//! per-OS scheduler artifact that WAKES a pass daily lives in [`scheduler`].
+//! This crate implements the -D + -E + -F + -G surface: loading the persisted trust state,
+//! spawning the worker with dropped privileges ([`sandbox`]), a **dry check**
+//! ([`Broker::dry_check`]) that verifies without installing, and the full install path
+//! ([`Broker::run_once_with_feed`]) — a single-instance lock ([`lock`]), ACL self-check,
+//! independent re-verify under the pinned key, staging re-verify, silent per-OS install, health
+//! gate, re-verified rollback ([`pass::Installer`]), and — always last — the beacon's own
+//! self-update ([`selfupdate`]). The per-OS scheduler artifact that WAKES a pass daily lives in
+//! [`scheduler`]; the operator-facing channel/pause CONFIG and the unprivileged STATUS mirror the
+//! CLI (#504-G) is built on live in [`config`] and [`status`] (SPEC §13).
 //!
 //! ## Never trust the worker on the install path (SPEC §8.3)
 //!
@@ -23,6 +25,17 @@
 //! pinned root key ([`pass::Installer`] step 1) and re-hashes each staged artifact against the
 //! re-verified digest immediately before it is applied. The trust state advances ONLY after a
 //! component installs AND passes its health gate, and never before the state directory is hardened.
+//!
+//! ## Two DIFFERENT privilege bars: `state_dir` vs `status_dir` (SPEC §13)
+//!
+//! Every store this crate persists lives under one of two directories, each with the OPPOSITE
+//! grant from the other — never mix them up:
+//!
+//! - [`Broker::state_dir`] — Admin/SYSTEM-only ([`secure::harden_state_dir`]): `trust-state.json`
+//!   ([`state::TrustStateStore`]) and `config.json` ([`config::ConfigStore`]). Mutating either is
+//!   a privileged act, gated by [`elevation::require_elevated`] at the CLI call site.
+//! - [`Broker::status_dir`] — world-readable ([`secure::harden_public_status_path`]):
+//!   `status.json` ([`status::StatusStore`]), a snapshot ANY identity may read without elevation.
 //!
 //! ## The `unsafe` in the workspace
 //!
@@ -33,6 +46,8 @@
 //! the beacon never grows a second hand-rolled unsafe locking primitive. Every other module — and
 //! every other crate — is safe.
 
+pub mod config;
+pub mod elevation;
 mod error;
 mod hashing;
 pub mod health;
@@ -40,6 +55,7 @@ pub mod install;
 pub mod lock;
 mod pass;
 pub mod paths;
+mod persist;
 pub mod plan;
 pub mod rollback;
 pub mod sandbox;
@@ -48,6 +64,7 @@ pub mod secure;
 mod selfupdate;
 mod spawn;
 pub mod state;
+pub mod status;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +77,9 @@ use dig_updater_worker::{
 // Re-exported so consumers (the CLI, tests) can read the enumeration/health probe's inputs +
 // outputs without depending on `dig-release-resolver` directly — the broker owns that contract.
 pub use dig_release_resolver::{DetectedVersion, UpdateAction};
+
+use config::{Channel, ConfigStore, UpdaterConfig};
+use status::{StatusContext, StatusSnapshot, StatusStore};
 
 pub use error::BrokerError;
 pub use health::VersionProbe;
@@ -103,16 +123,25 @@ impl Broker {
         }
     }
 
-    /// The state directory this broker reads/writes.
+    /// The state directory this broker reads/writes (Admin/SYSTEM-only — `trust-state.json` +
+    /// `config.json`).
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
 
+    /// The WORLD-READABLE status directory this broker's `status.json` lives under — a
+    /// [`paths::sibling_status_dir`] of [`Self::state_dir`], never nested inside it (SPEC §13.2).
+    #[must_use]
+    pub fn status_dir(&self) -> PathBuf {
+        paths::sibling_status_dir(&self.state_dir)
+    }
+
     /// Run a **dry** update check: load the persisted trust state, spawn the unprivileged worker
     /// to fetch + verify the feed and stage the artifacts, and return its report. This performs
     /// NO install and NEVER advances the trust state (SPEC §9 step 7 gates advancement on a
-    /// health-checked install, which is #504-E).
+    /// health-checked install, which is #504-E). Also refreshes the unprivileged status mirror
+    /// (SPEC §13.2) — best-effort; a failure to write it never fails the check itself.
     ///
     /// # Errors
     ///
@@ -120,27 +149,57 @@ impl Broker {
     pub fn dry_check(&self, feed_sources: Vec<FeedSource>) -> Result<WorkerReport, BrokerError> {
         let loaded = TrustStateStore::at(&self.state_dir).load()?;
         let report = self.fetch_and_verify(feed_sources, loaded.state, Sandbox::Restricted)?;
+        // The config read here is PURELY for the status mirror (channel/paused to report) — a
+        // corrupt/unreadable config must never fail an otherwise-successful dry check, so it
+        // degrades to the default rather than propagating (contrast `run_once_with_feed`, where
+        // the SAME read gates a real pass and so fails closed).
+        let config = ConfigStore::at(&self.state_dir).load().unwrap_or_default();
+        self.refresh_status_after_check(&report, &config, now_unix_secs(), loaded.state);
         Ok(report)
     }
 
-    /// Run exactly one FULL update pass: single-instance lock → ACL self-check → spawn the
-    /// unprivileged worker to fetch + verify + stage → INDEPENDENTLY re-verify under the pinned
-    /// key → enumerate → silent per-OS install behind a health gate → re-verified rollback on
-    /// failure → advance the trust state only on full success → the beacon's own self-update,
-    /// always last. This is the beacon's production entry point (SPEC §8.2, §9, §9.5) — the one a
-    /// scheduled wake (or a manual `dig-updater run`) invokes.
-    ///
-    /// If a prior pass is still holding the lock (its schedule overran), this returns a
-    /// [`PassReport::already_running`] immediately rather than an error — SPEC §8.2 makes that an
-    /// ordinary, expected outcome, not a failure.
+    /// Run exactly one FULL update pass against the production feed ladder — the entry point the
+    /// daily scheduler artifact invokes. See [`Self::run_once_with_feed`] for the full contract.
     ///
     /// # Errors
     ///
-    /// [`BrokerError::AclViolation`] if a guarded path is unsafely writable; [`BrokerError::Spawn`]
-    /// if the worker cannot be run; [`BrokerError::ReverifyFailed`] / [`BrokerError::StagingReverifyFailed`]
-    /// if the worker's plan fails the broker's independent re-verification; [`BrokerError::RollbackFailed`]
-    /// if a rollback cannot complete; [`BrokerError::Io`] on a filesystem error.
+    /// See [`Self::run_once_with_feed`].
     pub fn run_once(&self) -> Result<PassReport, BrokerError> {
+        self.run_once_with_feed(production_feed_ladder())
+    }
+
+    /// Run exactly one FULL update pass against an explicit feed ladder: single-instance lock →
+    /// the pause gate → ACL self-check → spawn the unprivileged worker to fetch + verify + stage →
+    /// INDEPENDENTLY re-verify under the pinned key → enumerate → silent per-OS install behind a
+    /// health gate → re-verified rollback on failure → advance the trust state only on full
+    /// success → the beacon's own self-update, always last. This is the beacon's production entry
+    /// point (SPEC §8.2, §9, §9.5) — the one a scheduled wake, a manual `dig-updater run`, or
+    /// `check --now` (#504-G) invokes. [`Self::run_once`] is this with the production ladder;
+    /// threading the feed sources through here is what lets the CLI's `--feed-base` override apply
+    /// to EITHER caller without bypassing any of this gating.
+    ///
+    /// If a prior pass is still holding the lock (its schedule overran), this returns a
+    /// [`PassReport::already_running`] immediately rather than an error — SPEC §8.2 makes that an
+    /// ordinary, expected outcome, not a failure. Likewise, if auto-updates are currently paused
+    /// ([`config::UpdaterConfig::is_paused_at`]), this returns [`PassReport::paused`] before the
+    /// network or the ACL self-check are ever touched (SPEC §13.1) — a paused beacon's scheduled
+    /// OR on-demand pass no-ops exactly like an overrun one.
+    ///
+    /// Also refreshes the unprivileged status mirror (SPEC §13.2) with the pass's outcome —
+    /// best-effort; a failure to write it never fails the pass itself.
+    ///
+    /// # Errors
+    ///
+    /// [`BrokerError::StateCorrupt`] if the persisted config is unreadable (the pause gate fails
+    /// CLOSED rather than silently proceeding un-paused); [`BrokerError::AclViolation`] if a
+    /// guarded path is unsafely writable; [`BrokerError::Spawn`] if the worker cannot be run;
+    /// [`BrokerError::ReverifyFailed`] / [`BrokerError::StagingReverifyFailed`] if the worker's
+    /// plan fails the broker's independent re-verification; [`BrokerError::RollbackFailed`] if a
+    /// rollback cannot complete; [`BrokerError::Io`] on a filesystem error.
+    pub fn run_once_with_feed(
+        &self,
+        feed_sources: Vec<FeedSource>,
+    ) -> Result<PassReport, BrokerError> {
         // Acquired before ANY other work, per SPEC §8.2 — including before `run_pass`'s own
         // harden-then-ACL-check step. On Unix this is safe because the lock creates `state_dir`
         // itself, owner-only, on first touch (see `lock::imp::create_dir_owner_only`) rather than
@@ -149,15 +208,23 @@ impl Broker {
         let Some(_guard) = lock::SingleInstanceLock::try_acquire(&self.state_dir)? else {
             return Ok(PassReport::already_running());
         };
+
+        // The pause gate runs next, still before the network or the ACL self-check are touched
+        // (SPEC §13.1). Unlike `dry_check`'s status-only config read, this one GATES a real pass,
+        // so a corrupt config fails closed (`?`) instead of silently defaulting to "not paused".
+        let config = ConfigStore::at(&self.state_dir).load()?;
+        let now = now_unix_secs();
+        if config.is_paused_at(now) {
+            let report = PassReport::paused(config.paused_until);
+            self.refresh_status_after_pass(&report, &config, now);
+            return Ok(report);
+        }
+
         let root = beacon_root_verifying_key();
         let probe = pass::spawn_version_probe();
-        self.run_pass(
-            &root,
-            production_feed_ladder(),
-            Sandbox::Restricted,
-            &probe,
-            &probe,
-        )
+        let report = self.run_pass(&root, feed_sources, Sandbox::Restricted, &probe, &probe)?;
+        self.refresh_status_after_pass(&report, &config, now_unix_secs());
+        Ok(report)
     }
 
     /// Manually roll every cached component back to its last-known-good build, re-verifying the
@@ -188,6 +255,94 @@ impl Broker {
             restored.push(component);
         }
         Ok(restored)
+    }
+
+    /// Read the beacon's unprivileged status mirror (SPEC §13.2) — safe for ANY identity, no
+    /// elevation. Never errors on "nothing recorded yet"
+    /// ([`status::StatusSnapshot::never_checked`]); only a readable-but-corrupt file is a real
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// [`BrokerError::StateCorrupt`] if a status file exists but is not valid JSON.
+    pub fn status(&self) -> Result<StatusSnapshot, BrokerError> {
+        StatusStore::at(&self.status_dir()).load()
+    }
+
+    /// The currently-configured update channel, read via the unprivileged [`Self::status`] mirror
+    /// — so `channel get` (like `status`) never requires elevation (SPEC §13.1).
+    ///
+    /// # Errors
+    ///
+    /// [`BrokerError::StateCorrupt`] if the status mirror exists but is not valid JSON.
+    pub fn channel(&self) -> Result<Channel, BrokerError> {
+        Ok(self.status()?.channel)
+    }
+
+    /// Set the update channel. This mutates the Admin-writable `config.json` and so REQUIRES
+    /// elevation (SPEC §13.1) — checked via the injected `is_elevated` (production passes
+    /// [`elevation::is_elevated`]; tests inject a fixed closure so both branches are deterministic
+    /// regardless of the actual privilege of the `cargo test` process — see [`elevation::require`]).
+    ///
+    /// # Errors
+    ///
+    /// A [`BrokerError::Io`] elevation failure if `is_elevated()` returns `false`; otherwise
+    /// whatever [`config::ConfigStore::load`]/[`config::ConfigStore::save`] can fail with.
+    pub fn set_channel(
+        &self,
+        channel: Channel,
+        is_elevated: impl FnOnce() -> bool,
+    ) -> Result<UpdaterConfig, BrokerError> {
+        self.mutate_config(is_elevated, |config| config.channel = channel)
+    }
+
+    /// Pause auto-updates, optionally until a unix-seconds deadline (a "snooze" — SPEC §13.1); a
+    /// paused beacon's next `run`/`check --now` no-ops ([`PassReport::paused`]) instead of acting.
+    /// Requires elevation; see [`Self::set_channel`] for the `is_elevated` contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::set_channel`].
+    pub fn pause(
+        &self,
+        until: Option<u64>,
+        is_elevated: impl FnOnce() -> bool,
+    ) -> Result<UpdaterConfig, BrokerError> {
+        self.mutate_config(is_elevated, |config| {
+            config.paused = true;
+            config.paused_until = until;
+        })
+    }
+
+    /// Resume auto-updates (clears the pause, SPEC §13.1). Requires elevation; see
+    /// [`Self::set_channel`] for the `is_elevated` contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::set_channel`].
+    pub fn resume(&self, is_elevated: impl FnOnce() -> bool) -> Result<UpdaterConfig, BrokerError> {
+        self.mutate_config(is_elevated, |config| {
+            config.paused = false;
+            config.paused_until = None;
+        })
+    }
+
+    /// The shared skeleton every config mutation follows: require elevation, load, apply `edit`,
+    /// persist, and immediately refresh the unprivileged status mirror so a subsequent
+    /// unprivileged `status`/`channel get` reflects the change without waiting for the next
+    /// check/run (SPEC §13.1, §13.2).
+    fn mutate_config(
+        &self,
+        is_elevated: impl FnOnce() -> bool,
+        edit: impl FnOnce(&mut UpdaterConfig),
+    ) -> Result<UpdaterConfig, BrokerError> {
+        elevation::require(is_elevated)?;
+        let store = ConfigStore::at(&self.state_dir);
+        let mut config = store.load()?;
+        edit(&mut config);
+        store.save(&config)?;
+        self.refresh_status_after_config_change(&config);
+        Ok(config)
     }
 
     /// The full production pass, parameterized by the trust `root` and version `probe`s so the
@@ -290,6 +445,74 @@ impl Broker {
     #[must_use]
     pub fn apply_dir(&self) -> PathBuf {
         self.state_dir.join("apply")
+    }
+
+    /// Persist the status mirror produced by a DRY check.
+    fn refresh_status_after_check(
+        &self,
+        report: &WorkerReport,
+        config: &UpdaterConfig,
+        now: u64,
+        trust_state: dig_updater_trust::TrustState,
+    ) {
+        let ctx = StatusContext {
+            config,
+            now,
+            next_wake: self.estimate_next_wake(now),
+            trust_state,
+        };
+        self.write_status_best_effort(&StatusSnapshot::from_dry_check(report, &ctx));
+    }
+
+    /// Persist the status mirror produced by a FULL pass, re-reading the trust state so a
+    /// just-advanced set of marks (a successful install) is reflected immediately.
+    fn refresh_status_after_pass(&self, report: &PassReport, config: &UpdaterConfig, now: u64) {
+        let trust_state = TrustStateStore::at(&self.state_dir)
+            .load()
+            .map(|loaded| loaded.state)
+            .unwrap_or_default();
+        let ctx = StatusContext {
+            config,
+            now,
+            next_wake: self.estimate_next_wake(now),
+            trust_state,
+        };
+        self.write_status_best_effort(&StatusSnapshot::from_pass(report, &ctx));
+    }
+
+    /// Immediately refresh the config-mirrored fields (channel/paused) after a config mutation —
+    /// preserving everything else the last check/run reported, so `channel set`/`pause`/`resume`
+    /// don't clobber `last_check`/`components` history with a config-only change.
+    fn refresh_status_after_config_change(&self, config: &UpdaterConfig) {
+        let mut snapshot = self
+            .status()
+            .unwrap_or_else(|_| StatusSnapshot::never_checked());
+        snapshot.channel = config.channel;
+        snapshot.paused = config.is_paused_at(now_unix_secs());
+        snapshot.paused_until = config.paused_until;
+        self.write_status_best_effort(&snapshot);
+    }
+
+    /// Persist `snapshot` to the world-readable status mirror. Best-effort: failing to write it
+    /// must never fail an otherwise-successful check/run/config-change — only `state_dir` (the
+    /// trust state, the config) is security-load-bearing; `status_dir` is informational (SPEC
+    /// §13.2).
+    fn write_status_best_effort(&self, snapshot: &StatusSnapshot) {
+        if let Err(e) = StatusStore::at(&self.status_dir()).save(snapshot) {
+            eprintln!("dig-updater: warning: could not refresh status.json: {e}");
+        }
+    }
+
+    /// A best-effort ESTIMATE of the beacon's next scheduled wake: `now` plus one day if the daily
+    /// schedule artifact ([`scheduler`]) is registered, else `None`. This is `now + 24h`, not a
+    /// parse of the OS scheduler's own next-run time — good enough for an observability mirror,
+    /// not a promise of the exact wake instant (the real artifact also jitters, SPEC §8.4).
+    fn estimate_next_wake(&self, now: u64) -> Option<u64> {
+        const ONE_DAY_SECS: u64 = 24 * 60 * 60;
+        scheduler::status()
+            .ok()
+            .filter(|status| status.installed)
+            .map(|_| now + ONE_DAY_SECS)
     }
 }
 
@@ -455,5 +678,122 @@ mod tests {
             .run_once()
             .expect("a held lock is a benign no-op, not an error");
         assert_eq!(report, PassReport::already_running());
+    }
+
+    #[test]
+    #[ignore = "acquires the SAME production single-instance lock as \
+                `run_once_exits_immediately_when_the_lock_is_already_held` — Windows requires an \
+                elevated console just to open the `Global\\` mutex; run via `-- --ignored` in the \
+                elevated scheduler CI job"]
+    fn a_paused_beacon_no_ops_without_ever_spawning_the_worker() {
+        // Proves the REAL wiring (SPEC §13.1): `run_once` consults the persisted pause state
+        // BEFORE the network or the ACL self-check are touched, so a missing worker binary never
+        // even gets attempted while paused. The pause logic itself, and the elevation gate on
+        // `pause()`, are unit-tested below WITHOUT the lock (`pause_requires_elevation` etc.).
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(
+            home.path().to_path_buf(),
+            home.path().join("no-such-worker"),
+        );
+        broker
+            .pause(None, || true)
+            .expect("pause (elevated in this test)");
+
+        let report = broker
+            .run_once()
+            .expect("a paused beacon must no-op, not error, even with a missing worker binary");
+        assert!(!report.applied);
+        assert_eq!(report.reason.as_deref(), Some("paused"));
+    }
+
+    // -- config mutations: elevation-gated, and independent of the single-instance lock ---------
+    //
+    // Unlike `run_once`, `pause`/`resume`/`set_channel` never touch `lock::SingleInstanceLock`, so
+    // these are ordinary, portable tests — no `#[ignore]`, no elevated CI job needed. This is what
+    // proves "unprivileged pause/channel set fail cleanly (elevation required)".
+
+    #[test]
+    fn unelevated_pause_is_refused() {
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        let err = broker
+            .pause(None, || false)
+            .expect_err("pausing without elevation must be refused");
+        assert!(matches!(err, BrokerError::Io(_)));
+    }
+
+    #[test]
+    fn unelevated_resume_is_refused() {
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        let err = broker
+            .resume(|| false)
+            .expect_err("resuming without elevation must be refused");
+        assert!(matches!(err, BrokerError::Io(_)));
+    }
+
+    #[test]
+    fn unelevated_channel_set_is_refused() {
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        let err = broker
+            .set_channel(Channel::Alpha, || false)
+            .expect_err("setting the channel without elevation must be refused");
+        assert!(matches!(err, BrokerError::Io(_)));
+    }
+
+    #[test]
+    fn elevated_pause_persists_and_the_status_mirror_reflects_it_immediately() {
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+
+        // `u64::MAX` stands in for "far enough in the future to never lapse during this test" —
+        // an actual calendar timestamp would go stale as real time marches on.
+        let config = broker
+            .pause(Some(u64::MAX), || true)
+            .expect("an elevated pause succeeds");
+        assert!(config.paused);
+        assert_eq!(config.paused_until, Some(u64::MAX));
+
+        // The unprivileged status mirror reflects the pause WITHOUT waiting for a check/run.
+        let status = broker
+            .status()
+            .expect("status is always unprivileged-readable");
+        assert!(status.paused);
+        assert_eq!(status.paused_until, Some(u64::MAX));
+    }
+
+    #[test]
+    fn elevated_resume_clears_a_prior_pause() {
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        broker.pause(None, || true).expect("pause");
+
+        let config = broker.resume(|| true).expect("an elevated resume succeeds");
+        assert!(!config.paused);
+        assert_eq!(config.paused_until, None);
+        assert!(!broker.status().expect("status").paused);
+    }
+
+    #[test]
+    fn status_and_channel_reads_never_require_elevation() {
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        // A fresh install: never checked, default channel — answerable with NO privilege probe.
+        assert_eq!(broker.channel().expect("channel get"), Channel::Alpha);
+        assert_eq!(
+            broker.status().expect("status"),
+            StatusSnapshot::never_checked()
+        );
+    }
+
+    #[test]
+    fn set_channel_updates_both_the_config_and_the_status_mirror() {
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        broker
+            .set_channel(Channel::Alpha, || true)
+            .expect("an elevated channel set succeeds");
+        assert_eq!(broker.channel().expect("channel get"), Channel::Alpha);
     }
 }

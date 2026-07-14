@@ -96,6 +96,70 @@ fn icacls_program() -> Result<PathBuf, BrokerError> {
     .map_err(BrokerError::Io)
 }
 
+/// Restrict `path` so ONLY the broker can WRITE it, but ANYONE can READ it — the mirror-image
+/// grant of [`harden_state_dir`]. Used for the unprivileged status mirror (`status.json`, SPEC
+/// §13.2, [`crate::status`]) so the extension/hub/node and `dig-updater status` can read "is the
+/// beacon current/paused" without Administrator/root, while only the broker can ever change what
+/// it reports.
+///
+/// - **Unix:** mode `0755` for a directory (owner rwx, everyone else read+traverse) or `0644` for
+///   a file (owner read/write, everyone else read) — the exact convention this crate already uses
+///   for the scheduler's root-owned unit files (`scheduler::imp::write_unit`).
+/// - **Windows:** `icacls` grants Administrators + Local System + OWNER RIGHTS Full Control and
+///   `Everyone` Read+Execute, removing inheritance first — the same shape as [`harden_windows_path`]
+///   with one extra, broader-but-read-only grant. The OWNER RIGHTS ACE (`S-1-3-4`) matters here
+///   just as it does in [`harden_windows_path`]: without it, a non-Administrator identity that
+///   OWNS this directory (e.g. a dev/CI process, or the installer before the beacon service ever
+///   runs as SYSTEM) would lock itself out of writing its own `status.json` the moment this DACL
+///   is applied.
+///
+/// # Errors
+///
+/// [`BrokerError::Io`] if the permissions could not be applied.
+pub fn harden_public_status_path(path: &Path) -> Result<(), BrokerError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if path.is_dir() { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| BrokerError::Io(e.to_string()))
+    }
+    #[cfg(windows)]
+    {
+        harden_windows_public_status_path(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// See [`harden_public_status_path`] — the Windows `icacls` grant (Administrators + SYSTEM +
+/// owner rights full, `Everyone` read+execute).
+#[cfg(windows)]
+fn harden_windows_public_status_path(path: &Path) -> Result<(), BrokerError> {
+    use std::process::Command;
+    let inherit = if path.is_dir() { "(OI)(CI)" } else { "" };
+    let status = Command::new(icacls_program()?)
+        .arg(path)
+        .arg("/inheritance:r")
+        .args(["/grant:r", &format!("*S-1-5-32-544:{inherit}F")]) // Administrators, full
+        .args(["/grant:r", &format!("*S-1-5-18:{inherit}F")]) // Local System, full
+        .args(["/grant:r", &format!("*S-1-3-4:{inherit}F")]) // Owner rights — the creator keeps access
+        .args(["/grant:r", &format!("*S-1-1-0:{inherit}RX")]) // Everyone, read + execute
+        .output()
+        .map_err(|e| BrokerError::Io(format!("could not run icacls: {e}")))?;
+    if !status.status.success() {
+        return Err(BrokerError::Io(format!(
+            "icacls failed to harden {} world-readable: {}",
+            path.display(),
+            String::from_utf8_lossy(&status.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// What the broker may do if a guarded path is found writable by a non-privileged identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repair {
@@ -234,6 +298,26 @@ mod tests {
             let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700, "state dir must be owner-only");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_public_status_path_grants_world_read_on_dirs_and_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        harden_public_status_path(tmp.path()).expect("harden the status dir");
+        let file = tmp.path().join("status.json");
+        std::fs::write(&file, b"{}").unwrap();
+        harden_public_status_path(&file).expect("harden the status file");
+
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o755,
+            "the dir must be world-readable+traversable"
+        );
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(file_mode & 0o777, 0o644, "the file must be world-readable");
     }
 
     // -- the pure ACL decision matrix (every cell) --------------------------------

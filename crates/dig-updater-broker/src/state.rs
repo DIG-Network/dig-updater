@@ -2,9 +2,10 @@
 //!
 //! Two properties beyond plain read/write matter here:
 //!
-//! - **Atomic writes.** The state is written to a temp file in the same directory and then
-//!   renamed over the target, so a crash mid-write can never leave a truncated/half-written state
-//!   that would be read as a *lower* high-water-mark (which would silently re-enable a downgrade).
+//! - **Atomic writes.** [`crate::persist::write_json_atomic`] writes a temp file in the same
+//!   directory and renames it over the target, so a crash mid-write can never leave a
+//!   truncated/half-written state that would be read as a *lower* high-water-mark (which would
+//!   silently re-enable a downgrade).
 //! - **Forward-compatible.** A future beacon may add fields to the on-disk JSON. An older beacon
 //!   that loads and re-saves the state MUST preserve those unknown fields verbatim, so rolling
 //!   the fleet back to an older beacon never destroys state a newer one wrote (SPEC §9.5). We
@@ -20,6 +21,7 @@ use serde_json::{Map, Value};
 use dig_updater_trust::TrustState;
 
 use crate::error::BrokerError;
+use crate::persist::write_json_atomic;
 
 /// The on-disk file name for the persisted trust state.
 const STATE_FILE: &str = "trust-state.json";
@@ -96,8 +98,8 @@ impl TrustStateStore {
 
     /// Atomically persist `state`, preserving every unknown field carried in `loaded.raw`.
     ///
-    /// Writes a sibling temp file, flushes it, then renames it over the target — so a reader never
-    /// observes a partial write.
+    /// Writes a sibling temp file, flushes it, then renames it over the target ([`write_json_atomic`])
+    /// — so a reader never observes a partial write.
     ///
     /// # Errors
     ///
@@ -115,16 +117,7 @@ impl TrustStateStore {
         );
         let bytes = serde_json::to_vec_pretty(&Value::Object(object))
             .map_err(|e| BrokerError::Io(e.to_string()))?;
-
-        let dir = self
-            .path
-            .parent()
-            .ok_or_else(|| BrokerError::Io("state path has no parent directory".into()))?;
-        std::fs::create_dir_all(dir).map_err(|e| BrokerError::Io(e.to_string()))?;
-        let tmp = self.path.with_extension("json.tmp");
-        write_then_sync(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| BrokerError::Io(e.to_string()))?;
-        Ok(())
+        write_json_atomic(&self.path, &bytes)
     }
 }
 
@@ -146,18 +139,6 @@ fn read_u64(raw: &Map<String, Value>, key: &str) -> Result<u64, BrokerError> {
             BrokerError::StateCorrupt(format!("`{key}` is not an unsigned integer"))
         }),
     }
-}
-
-/// Write bytes to `path` and fsync before returning, so the rename that follows publishes a
-/// fully-flushed file.
-fn write_then_sync(path: &Path, bytes: &[u8]) -> Result<(), BrokerError> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path).map_err(|e| BrokerError::Io(e.to_string()))?;
-    file.write_all(bytes)
-        .map_err(|e| BrokerError::Io(e.to_string()))?;
-    file.sync_all()
-        .map_err(|e| BrokerError::Io(e.to_string()))?;
-    Ok(())
 }
 
 #[cfg(test)]

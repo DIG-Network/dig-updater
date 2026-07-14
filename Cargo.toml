@@ -13,13 +13,16 @@ resolver = "2"
 #                           the pinned root public key. Pure, no I/O — trivially testable.
 #   * dig-updater-broker  — the PRIVILEGED orchestration crate: drives one update pass, spawns
 #                           the worker, applies verified installs, health-gates and rolls back
-#                           (#504-E), holds the single-instance lock, and owns the per-OS
-#                           scheduler artifact + beacon self-update (#504-F).
+#                           (#504-E), holds the single-instance lock, owns the per-OS scheduler
+#                           artifact + beacon self-update (#504-F), and persists the Admin-writable
+#                           channel/pause config + the unprivileged status mirror (#504-G, SPEC §13).
 #   * dig-updater-worker  — the UNPRIVILEGED, sandboxed fetch/verify crate: downloads the feed +
 #                           artifacts and verifies them against the trust core, holding no
 #                           install privilege.
-#   * dig-updater-cli     — the `dig-updater` binary: `check --now`, `run` (a full pass),
-#                           `schedule install|uninstall|status`, `status --json`.
+#   * dig-updater-cli     — the `dig-updater` binary, the operator interface (#504-G): `check
+#                           [--now|--dry-run]`, `run` (a full pass), `channel get|set`,
+#                           `pause [--until <ts>] / resume`, `schedule install|uninstall|status`,
+#                           and `status --json` (unprivileged — SPEC §13).
 #   * dig-updater-feedsign — the CI-ONLY feed signer (crate `dig_updater_feedsign` + binary
 #                           `dig-updater-feedsign`): resolves the latest release per component,
 #                           assembles the signed manifest + root->targets delegation, and emits
@@ -41,7 +44,7 @@ members = [
 # The RELEASE version of the beacon. The tag-on-merge + version-increment CI reads this
 # `[workspace.package].version` from the ROOT manifest (§3.6); the members inherit it via
 # `version.workspace = true`, so a release fires off this single value.
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-updater"

@@ -588,9 +588,11 @@ beacon self-update, #504-A/-C/-D/-E/-F):
   `uninstall`/`status` register, remove, and report a Windows Scheduled Task / systemd timer+
   service pair / launchd LaunchDaemon that invokes `dig-updater run` daily, jittered, with native
   or baked-in boot-recovery. Registering requires the same privilege the artifact runs at.
-- **`dig-updater` (CLI)** — `check` (a dry verify pass), `run` (a full pass — what the scheduler
-  artifact invokes), `schedule install|uninstall|status`, and `status`, with `--json` and a
-  `--feed-base` transport override (the key is never overridable).
+- **`dig-updater` (CLI, #504-G)** — the operator interface, detailed normatively in §13: `check
+  [--now|--dry-run]` (a dry verify pass, or an on-demand full pass), `run` (a full pass — what the
+  scheduler artifact invokes), `channel get|set`, `pause [--until <ts>] / resume`, `schedule
+  install|uninstall|status`, and `status`, with `--json` and a `--feed-base` transport override
+  (the key is never overridable).
 - **`dig-updater-feedsign`** — the CI-only feed signer (§10): resolves the latest release per
   component, downloads + digests the per-OS/arch assets, assembles the manifest + delegation, and
   signs them through the trust core (`SignedManifest::sign`/`SignedDelegation::sign`). Its
@@ -600,11 +602,142 @@ beacon self-update, #504-A/-C/-D/-E/-F):
 
 The following are follow-up tickets under epic #504 and are OUT of scope here:
 
-- **#504-G/-I(b)/-H/-J/-K/-L** further CLI polish (channel/pause), the `updates.dig.net`
-  S3+CloudFront feed origin (the signer + nightly CI itself, #504-I(a), ships here — see §10),
-  beacon native packages + installer registration, `dig-node` updater RPC proxy, Updates UI, and
-  docs.
+- **#504-I(b)/-H/-J/-K/-L** the `updates.dig.net` S3+CloudFront feed origin (the signer + nightly
+  CI itself, #504-I(a), ships here — see §10), beacon native packages + installer registration,
+  the `dig-node` updater RPC proxy (built directly on §13's `status.json` contract), the Updates
+  UI, and docs.
 - **#534** the full Windows AppContainer worker sandbox (the alpha ships the restricted-token
   floor).
 
 A conformant beacon MUST implement §§1–9 before it installs anything on a user machine.
+
+---
+
+## 13. Operator configuration + status (the CLI contract, #504-G)
+
+This section is the NORMATIVE wire contract for the two JSON files the CLI (§12) reads and
+writes, and that follow-up consumers — the `dig-node` updater RPC proxy (#515) and the Updates UI
+(#516) — build DIRECTLY on. Both are schema-versioned (a `schema` integer field bumped whenever a
+field is added) so a consumer can tell which fields to expect.
+
+### 13.1 `config.json` — the Admin-writable channel + pause state
+
+Persisted at `<state_dir>/config.json` — the SAME Admin/SYSTEM-only directory as
+`trust-state.json` (§6, §9.3), so it inherits the identical directory-level lock-down. Mutating it
+is therefore a privileged operation, gated at the CLI layer by the same elevation check the
+scheduler artifact's own registration uses (§8.4): Windows `net session` (an elevated console),
+Unix effective uid `0`. Reading it is not itself privilege-gated by the beacon — in practice the
+Admin/SYSTEM-only directory means only a privileged reader can open it at all.
+
+```jsonc
+// config.json
+{
+  "schema":        1,        // u32, on-disk schema version
+  "channel":       "alpha",  // "alpha" | "stable" — the update channel this beacon tracks
+  "paused":        false,    // bool — auto-updates are suspended
+  "paused_until":  null      // u64 unix seconds, or null — an optional pause deadline (a "snooze")
+}
+```
+
+- `channel` — `"alpha"` is the only channel the feed serves today (§10.3); `"stable"` is a
+  reserved, not-yet-servable value. A conformant CLI MUST refuse `channel set stable` with a clear
+  reason rather than silently accepting a value that will never actually change what is fetched.
+- `paused` / `paused_until` — a pass is EFFECTIVELY paused at a given time `now` iff `paused` is
+  `true` AND (`paused_until` is absent OR `now < paused_until`). A pause with no `paused_until`
+  stays in effect until an explicit `resume`; a pause WITH a `paused_until` lapses on its own once
+  `now` reaches it — a caller need not `resume` a timed snooze for it to stop gating passes. This
+  is the exact predicate `is_paused_at` in the reference implementation.
+- A missing `config.json` is a fresh install: `channel = "alpha"`, `paused = false`,
+  `paused_until = null`. A PRESENT but malformed file MUST fail closed (rejected, not silently
+  reset to the fresh-install default) — an operator's channel/pause choice is not something a
+  parse error should silently discard.
+- **Enforcement point.** `Broker::run_once`/`run_once_with_feed` (a FULL pass — the daily schedule
+  OR an on-demand `check --now`) MUST consult the effective pause state, inside the single-instance
+  lock (§8.2) and BEFORE the network or the ACL self-check are touched, and MUST return a distinct,
+  benign `paused` outcome — structurally identical to `already_running` (§8.2) — rather than acting,
+  when paused. A DRY check (`check` / `check --dry-run`) is NOT gated by pause: inspecting what the
+  beacon WOULD do must stay available even while paused.
+
+### 13.2 `status.json` — the unprivileged, world-readable mirror
+
+Persisted at a directory DISTINCT from `state_dir` — a sibling with `-status` appended to the
+directory name (`/var/lib/dig-updater` → `/var/lib/dig-updater-status`;
+`%ProgramData%\DIG\updater` → `%ProgramData%\DIG\updater-status`), so it does NOT inherit
+`state_dir`'s Admin/SYSTEM-only ACL (which, on Windows, propagates to everything created inside
+it). It MUST be writable ONLY by the broker but READABLE by any local identity — the exact
+opposite grant of `state_dir` — so an unprivileged reader (`dig-updater status`, the `dig-node`
+updater RPC proxy, the Updates UI) can answer "is the beacon current/paused" without
+Administrator/root.
+
+```jsonc
+// status.json
+{
+  "schema":           1,                 // u32, on-disk schema version
+  "version":          "0.6.0",            // the beacon binary version that wrote this snapshot
+  "channel":          "alpha",
+  "paused":           false,              // the EFFECTIVE value (a lapsed timed pause reports
+                                           // false here even before an explicit `resume`)
+  "paused_until":     null,
+  "last_check":       1730990000,         // u64 unix seconds of the most recent check/run, or null
+  "last_check_kind":  "run",              // "dry" | "run", or null if never checked
+  "last_outcome":     "applied",          // "verified" | "rejected" | "applied" | "nothing_applied"
+  "last_reason":      null,               // a stable code when not a plain success, else null
+                                           // (e.g. a worker rejection code, or "already_running" /
+                                           // "paused" for a full pass that no-opped)
+  "last_detail":      null,               // human-readable detail for the last outcome
+  "components": [                         // the last-observed per-component decisions
+    {
+      "component": "dig-node",
+      "action":    "update",              // a dry check reports "would_fetch"; a full pass
+                                           // reports its plan action ("install"/"update"/"skip")
+      "result":    "installed",           // a dry check reports "staged"; a full pass reports
+                                           // "installed"/"skipped"/"deferred"/"rolled_back"
+      "detail":    "0.25.0 -> 0.26.0"
+    }
+  ],
+  "next_wake":  1731076400,               // a best-effort ESTIMATE (now + 24h) if the daily
+                                           // schedule is registered, else null — not a parse of
+                                           // the OS scheduler's own next-run time
+  "trust_state": {                        // an INFORMATIONAL mirror of the persisted trust marks
+    "root_version": 1, "sequence": 42, "generated": 1730990000, "rollback_floor_build": 20
+  }
+}
+```
+
+- **Not authoritative.** `trust_state` here is a read-only COPY for observability. The
+  ENFORCEMENT copy — the one §7/§9 checks a candidate manifest against — is exclusively the
+  Admin-only `trust-state.json` (§6). A reader that trusted `status.json`'s `trust_state` for a
+  SECURITY decision would be trusting an unauthenticated local file; that is acceptable for "should
+  I show a badge", never for "should I install this".
+- **Refreshed after every check/run/config change.** A conformant beacon writes a fresh
+  `status.json` after `check` (dry or `--now`), `run`, `channel set`, `pause`, and `resume` — a
+  config-only mutation refreshes just the `channel`/`paused`/`paused_until` fields, preserving the
+  last check/run's `last_check*`/`components` history rather than clobbering it. Writing this file
+  is BEST-EFFORT: a failure to persist it MUST NOT fail the check/run/config-change itself — only
+  `config.json`/`trust-state.json` are security-load-bearing; `status.json` is informational.
+- **Always answerable, never an error on absence.** A missing (or, for an unprivileged reader,
+  inaccessible) `status.json` MUST be reported as a well-formed "never checked" snapshot — schema
+  + version + the default channel/pause + every other field `null`/empty — NOT an error. Only a
+  file that IS readable but fails to parse is a genuine error.
+- **`channel get` reads this file**, not `config.json` — so it, like `status`, never requires
+  elevation; `channel set`/`pause`/`resume` write `config.json` (§13.1) and then immediately
+  refresh this mirror so a subsequent unprivileged read reflects the change without waiting for the
+  next check/run.
+
+### 13.3 CLI surface (normative summary)
+
+| Command | Reads | Writes | Elevation | Notes |
+|---|---|---|---|---|
+| `check` / `check --dry-run` | `trust-state.json` (freshness compare) | `status.json` (best-effort) | No | Never installs, never advances trust state, never pause-gated. |
+| `check --now` | — | everything a full pass writes | Whatever `run` requires | Identical to `run` — an on-demand trigger of the SAME `Broker::run_once_with_feed`. |
+| `run` | `config.json`, `trust-state.json` | `trust-state.json`, `status.json`, installed binaries | Whatever the per-OS install path requires | Pause-gated (§13.1); this is what the scheduler artifact invokes. |
+| `channel get` | `status.json` | — | No | |
+| `channel set <alpha>` | `config.json` | `config.json`, `status.json` | Yes | Rejects `stable` (§13.1) and any other token. |
+| `pause [--until <ts>]` | `config.json` | `config.json`, `status.json` | Yes | |
+| `resume` | `config.json` | `config.json`, `status.json` | Yes | |
+| `status` | `status.json` | — | No | Always answerable (§13.2). |
+| `schedule install\|uninstall\|status` | OS scheduler state | OS scheduler state | `install`/`uninstall`: yes | Unchanged from §8.4. |
+
+Every command MUST offer both a human-readable line and a `--json` machine-readable object (§6.2).
+The feed base is overridable per `--feed-base <url>`/`$DIG_UPDATER_FEED_BASE` on `check` and `run`
+alike (untrusted transport, §1); the pinned root key has no such override.

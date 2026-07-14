@@ -65,6 +65,22 @@ pub enum ComponentResult {
     RolledBack,
 }
 
+impl ComponentResult {
+    /// The stable, machine-classifiable token for this result (`installed` / `skipped` /
+    /// `deferred` / `rolled_back`) — the SAME snake_case this type's `Serialize` impl emits, so a
+    /// consumer that reads it off a rendered [`ComponentOutcome`] (e.g. the unprivileged
+    /// [`crate::status::StatusSnapshot`] mirror) never drifts from the JSON contract.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Skipped => "skipped",
+            Self::Deferred => "deferred",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+}
+
 /// The per-component result line of a [`PassReport`] — agent-consumable (§6.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ComponentOutcome {
@@ -125,6 +141,22 @@ impl PassReport {
             "already_running",
             "a prior pass still holds the single-instance lock; exited without acting",
         )
+    }
+
+    /// Auto-updates are currently paused ([`crate::config::UpdaterConfig::is_paused_at`]) — this
+    /// invocation exits immediately without touching the network or installing anything. An
+    /// ordinary, expected outcome (SPEC §13.1), exactly like [`Self::already_running`]: the
+    /// caller — the daily schedule OR a manual `check --now`/`run` — gets a distinct, honest
+    /// report rather than a silent no-op or an error.
+    #[must_use]
+    pub fn paused(paused_until: Option<u64>) -> Self {
+        let detail = match paused_until {
+            Some(until) => {
+                format!("auto-updates are paused until unix time {until}; exited without acting")
+            }
+            None => "auto-updates are paused; exited without acting".to_string(),
+        };
+        Self::nothing_to_do("paused", &detail)
     }
 }
 
@@ -390,4 +422,38 @@ pub fn spawn_version_probe() -> impl Fn(&Path) -> DetectedVersion {
 /// Map a trust rejection during the broker's independent re-verify to a distinct broker error.
 fn reverify_err(e: TrustError) -> BrokerError {
     BrokerError::ReverifyFailed(format!("{e} ({})", e.code()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_result_as_str_matches_its_serde_snake_case_rename() {
+        for (result, token) in [
+            (ComponentResult::Installed, "installed"),
+            (ComponentResult::Skipped, "skipped"),
+            (ComponentResult::Deferred, "deferred"),
+            (ComponentResult::RolledBack, "rolled_back"),
+        ] {
+            assert_eq!(result.as_str(), token);
+            let serialized = serde_json::to_string(&result).unwrap();
+            assert_eq!(serialized, format!("\"{token}\""));
+        }
+    }
+
+    #[test]
+    fn paused_is_a_benign_nothing_applied_carrying_the_snooze_deadline() {
+        let report = PassReport::paused(Some(1_700_000_000));
+        assert!(!report.applied);
+        assert_eq!(report.reason.as_deref(), Some("paused"));
+        assert!(report.detail.unwrap().contains("1700000000"));
+    }
+
+    #[test]
+    fn paused_indefinitely_omits_a_deadline_from_the_detail() {
+        let report = PassReport::paused(None);
+        assert_eq!(report.reason.as_deref(), Some("paused"));
+        assert!(!report.detail.unwrap().contains("unix time"));
+    }
 }

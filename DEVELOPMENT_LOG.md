@@ -166,6 +166,40 @@ change diary.
   for each test's full body — the same shape as `dig-relay`'s `ENV_LOCK` for its env-mutating
   tests, applied here to OS-mutating ones instead.
 
+## CLI: config + status (-G)
+
+- **A "grant read to Everyone" Windows DACL must ALSO keep the OWNER RIGHTS ACE, or the owner locks
+  itself out of what it just created.** `harden_state_dir`'s Admin+SYSTEM DACL already carries the
+  `S-1-3-4` (owner rights) ACE specifically so a non-Administrator owner (a dev/CI process, or the
+  installer before the beacon ever runs as SYSTEM) keeps write access to what it created. The new
+  world-readable `harden_public_status_path` initially omitted that same ACE (Administrators +
+  SYSTEM + Everyone-read only) — which meant the FIRST `icacls` call (run by the owning, unelevated
+  process) succeeded, but the very next `std::fs::write` into that now-locked-down directory failed
+  with `Access is denied. (os error 5)`, because the owner itself was no longer in the grant. Same
+  root cause as the original `harden_windows_path` design note, re-learned the hard way on a new
+  call site — a reminder to copy the FULL rationale, not just the shape, when writing a sibling
+  hardening function.
+- **A hardcoded "future" unix timestamp in a test is a time bomb.** A test asserting "this pause
+  deadline hasn't passed yet" using a literal like `1_700_000_000` (Nov 2023) silently starts
+  failing once the real wall clock passes that instant — it already had, on this dev machine's
+  clock. Use `u64::MAX` (or `now_unix_secs() + offset`) for "far enough in the future to never
+  lapse during this test" instead of a calendar-literal that will eventually become the past.
+- **`config.json` deliberately does NOT preserve unknown fields like `trust-state.json` does.**
+  `TrustStateStore` round-trips a raw `serde_json::Map` specifically so a fleet rollback to an
+  older beacon never destroys a newer field that feeds an anti-downgrade decision (SPEC §9.5). The
+  channel/pause config carries no such invariant — a plain typed struct with `#[serde(default)]`
+  per field is simpler and equally correct, and is the intentional asymmetry: not every on-disk
+  store in this crate needs the SAME persistence idiom, only the ones whose fields are
+  security-load-bearing.
+- **`status.json` must be a SIBLING directory of `state_dir`, never nested inside it.**
+  `harden_state_dir`'s Windows DACL uses `(OI)(CI)` (object-inherit/container-inherit), so anything
+  created INSIDE `state_dir` after it is hardened inherits the Admin/SYSTEM-only grant — a
+  `status.json` living at `<state_dir>/status.json` would silently stop being world-readable the
+  next time `state_dir` gets re-hardened. Deriving the status directory as `state_dir`'s OWN
+  parent + `-status` suffix (`paths::sibling_status_dir`) keeps it structurally outside that
+  inheritance and keeps a test's arbitrary tempdir-based `state_dir` and the real default
+  automatically in lockstep, with no second hard-coded path to drift.
+
 ## Release CI
 
 - **A GitHub Actions `run:` step defaults to PowerShell on the Windows runner — a bash `\`
