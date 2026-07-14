@@ -52,9 +52,9 @@ jobs:
     # `feed` release every shipped beacon trusts — that would bypass the §2.4 PR-review gate. The
     # cron + the production dispatch both run on main, so this guard costs nothing legitimate.
     if: github.ref == 'refs/heads/main'
-    # BEACON_SIGNING_KEY MUST be a main-scoped GitHub Environment secret with a required reviewer
-    # (env `feed-signing`, #540) — NEVER a plain repo secret. Referencing the environment here readies
-    # that binding (an as-yet-uncreated environment is inert; @mt-dev adds the protected secret to it).
+    # BEACON_SIGNING_KEY MUST be a main-scoped GitHub Environment secret (env `feed-signing`, #540)
+    # with a main-only deployment branch policy — NEVER a plain repo secret. Referencing the environment
+    # here readies that binding (an as-yet-uncreated environment is inert; @mt-dev adds the protected secret to it).
     environment: feed-signing
     runs-on: ubuntu-latest
     steps:
@@ -105,6 +105,7 @@ jobs:
           FEEDSIGN_GENERATED: ${{ steps.ts.outputs.generated }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
+          set -o pipefail
           ./target/release/dig-updater-feedsign \
             --config feed-config.json \
             --out feed-out \
@@ -226,8 +227,13 @@ jobs:
 
           curl -fsSL -o rekor-cli \
             "https://github.com/sigstore/rekor/releases/download/${REKOR_CLI_VERSION}/rekor-cli-linux-amd64" \
-            && chmod +x rekor-cli \
             || { rekor_warn "could not download rekor-cli ${REKOR_CLI_VERSION}"; exit 0; }
+
+          # Verify the SHA-256 digest before execution (supply-chain protection).
+          echo "74e4b3119723ab5bad31166e509be83f3a84549b1f24a0a9fe65b6de22668784  rekor-cli" | sha256sum -c - \
+            || { rekor_warn "rekor-cli SHA-256 mismatch; refusing to execute"; exit 0; }
+
+          chmod +x rekor-cli
 
           out="$(./rekor-cli upload --type hashedrekord \
                    --artifact feed-transparency/manifest.signing-bytes \
