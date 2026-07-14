@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.1] - 2026-07-14
+
+### Bug Fixes
+- **feed:** Decouple GH-release fallback publish from the S3-primary smoke (availability) (#11)
+
 ## [0.7.0] - 2026-07-14
 
 ### Features
