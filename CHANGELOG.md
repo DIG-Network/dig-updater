@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.8.0] - 2026-07-14
+
+### Bug Fixes
+- **beacon:** Self-heal schedule + native-package feed + real install root (#546, #580, #581) (#13)
+
 ## [0.7.2] - 2026-07-14
 
 ### Bug Fixes
