@@ -15,7 +15,7 @@ use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
 use dig_updater_feedsign::{
-    produce_feed, FeedConfig, FeedsignError, GithubRelease, GithubSource, ReleaseSource,
+    produce_feed, Channel, FeedConfig, FeedsignError, GithubRelease, GithubSource, ReleaseSource,
     SIGNATURE_FILE, SIGNING_BYTES_FILE, TARGETS_PUBKEY_FILE,
 };
 use dig_updater_trust::{
@@ -24,18 +24,20 @@ use dig_updater_trust::{
 
 const GENERATED: u64 = 1_000_000;
 
-/// An in-memory [`ReleaseSource`]: repo → release JSON, and asset URL → bytes. No network.
+/// An in-memory [`ReleaseSource`]: a per-channel `(repo, channel) → release JSON` table plus an
+/// asset URL → bytes table. No network — the whole assemble → sign → verify keystone runs
+/// hermetically against a throwaway key.
 struct FakeSource {
-    releases: HashMap<String, String>,
+    releases: HashMap<(String, Channel), String>,
     assets: HashMap<String, Vec<u8>>,
 }
 
 impl ReleaseSource for FakeSource {
-    fn latest_release(&self, repo: &str) -> Result<GithubRelease, FeedsignError> {
+    fn release(&self, repo: &str, channel: Channel) -> Result<GithubRelease, FeedsignError> {
         let json = self
             .releases
-            .get(repo)
-            .unwrap_or_else(|| panic!("no fake release for {repo}"));
+            .get(&(repo.to_string(), channel))
+            .unwrap_or_else(|| panic!("no fake {} release for {repo}", channel.as_str()));
         GithubRelease::from_json(repo, json)
     }
 
@@ -48,38 +50,72 @@ impl ReleaseSource for FakeSource {
     }
 }
 
-/// Two components, each with a linux + windows asset, mirroring the real release-asset shape.
+/// Two components, each with a linux + windows asset, mirroring the real release-asset shape — for
+/// BOTH channels. Stable resolves `releases/latest` (`vX.Y.Z` tag); nightly resolves the rolling
+/// `nightly` tag, whose version lives only in the asset names (`X.Y.Z-nightly.YYYYMMDD.<sha>`).
 fn fake_source() -> FakeSource {
     let mut releases = HashMap::new();
     let mut assets = HashMap::new();
 
+    // --- STABLE: releases/latest, version from the tag ---
     releases.insert(
-        "DIG-Network/dig-node".to_string(),
+        ("DIG-Network/dig-node".to_string(), Channel::Stable),
         r#"{"tag_name":"v0.29.0","assets":[
             {"name":"dig-node-0.29.0-linux-x64","browser_download_url":"https://dl.test/dig-node/linux"},
             {"name":"dig-node-0.29.0-windows-x64.exe","browser_download_url":"https://dl.test/dig-node/windows"},
             {"name":"dig-node-0.29.0-x86_64-unknown-linux-gnu.tar.gz","browser_download_url":"https://dl.test/dig-node/tarball"}
         ]}"#.to_string(),
     );
-    assets.insert(
-        "https://dl.test/dig-node/linux".to_string(),
-        b"dig-node-linux-binary".to_vec(),
-    );
-    assets.insert(
-        "https://dl.test/dig-node/windows".to_string(),
-        b"dig-node-windows-binary".to_vec(),
-    );
-
     releases.insert(
-        "DIG-Network/digstore".to_string(),
+        ("DIG-Network/digstore".to_string(), Channel::Stable),
         r#"{"tag_name":"v0.13.1","assets":[
             {"name":"digstore-0.13.1-linux-x64","browser_download_url":"https://dl.test/digstore/linux"}
         ]}"#.to_string(),
     );
-    assets.insert(
-        "https://dl.test/digstore/linux".to_string(),
-        b"digstore-linux-binary".to_vec(),
+
+    // --- NIGHTLY: releases/tags/nightly, version recovered from the asset names ---
+    releases.insert(
+        ("DIG-Network/dig-node".to_string(), Channel::Nightly),
+        r#"{"tag_name":"nightly","assets":[
+            {"name":"dig-node-0.30.0-nightly.20260714.abc1234-linux-x64","browser_download_url":"https://dl.test/dig-node/nightly-linux"},
+            {"name":"dig-node-0.30.0-nightly.20260714.abc1234-windows-x64.exe","browser_download_url":"https://dl.test/dig-node/nightly-windows"}
+        ]}"#.to_string(),
     );
+    releases.insert(
+        ("DIG-Network/digstore".to_string(), Channel::Nightly),
+        r#"{"tag_name":"nightly","assets":[
+            {"name":"digstore-0.14.0-nightly.20260714.abc1234-linux-x64","browser_download_url":"https://dl.test/digstore/nightly-linux"}
+        ]}"#.to_string(),
+    );
+
+    for (url, bytes) in [
+        (
+            "https://dl.test/dig-node/linux",
+            b"dig-node-linux-binary".as_slice(),
+        ),
+        (
+            "https://dl.test/dig-node/windows",
+            b"dig-node-windows-binary".as_slice(),
+        ),
+        (
+            "https://dl.test/digstore/linux",
+            b"digstore-linux-binary".as_slice(),
+        ),
+        (
+            "https://dl.test/dig-node/nightly-linux",
+            b"dig-node-nightly-linux".as_slice(),
+        ),
+        (
+            "https://dl.test/dig-node/nightly-windows",
+            b"dig-node-nightly-windows".as_slice(),
+        ),
+        (
+            "https://dl.test/digstore/nightly-linux",
+            b"digstore-nightly-linux".as_slice(),
+        ),
+    ] {
+        assets.insert(url.to_string(), bytes.to_vec());
+    }
 
     FakeSource { releases, assets }
 }
@@ -87,7 +123,6 @@ fn fake_source() -> FakeSource {
 fn config() -> FeedConfig {
     FeedConfig::from_json(
         r#"{
-            "rollback_floor_build": 0,
             "components": [
                 { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node" },
                 { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore" }
@@ -103,7 +138,8 @@ fn config() -> FeedConfig {
 fn produced_feed_verifies_end_to_end() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
     let source = fake_source();
-    let feed = produce_feed(&config(), &source, GENERATED, &signing_key).expect("feed produced");
+    let feed = produce_feed(&config(), &source, Channel::Stable, GENERATED, &signing_key)
+        .expect("feed produced");
 
     // Parse the produced envelopes exactly as the beacon does (over the received bytes).
     let delegation = SignedDelegation::from_json(&feed.delegation_json).expect("delegation parses");
@@ -137,7 +173,14 @@ fn produced_feed_verifies_end_to_end() {
 #[test]
 fn delegation_names_the_signing_key_as_targets() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
-    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let feed = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
     let delegation = SignedDelegation::from_json(&feed.delegation_json).unwrap();
 
     let expected_targets =
@@ -151,7 +194,14 @@ fn delegation_names_the_signing_key_as_targets() {
 #[test]
 fn manifest_reflects_resolved_builds_and_timestamp() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
-    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let feed = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
     let manifest = SignedManifest::from_json(&feed.manifest_json)
         .unwrap()
         .manifest;
@@ -171,13 +221,116 @@ fn manifest_reflects_resolved_builds_and_timestamp() {
     assert_eq!(digstore.artifacts.len(), 1);
 }
 
+/// The NIGHTLY channel resolves the rolling `nightly` release, records the FULL prerelease version
+/// string (so the beacon compares against the real installed nightly, #591 D5 point 5), and uses
+/// the UTC build DATE `YYYYMMDD` as the anti-downgrade build — and the whole chain still verifies.
+#[test]
+fn nightly_feed_resolves_the_rolling_release_and_dates_the_build() {
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+    let source = fake_source();
+    let feed = produce_feed(
+        &config(),
+        &source,
+        Channel::Nightly,
+        GENERATED,
+        &signing_key,
+    )
+    .expect("nightly feed produced");
+
+    // The full trust chain verifies exactly like the stable feed — one key signs both channels.
+    let delegation = SignedDelegation::from_json(&feed.delegation_json).unwrap();
+    let manifest = SignedManifest::from_json(&feed.manifest_json).unwrap();
+    verify_update_chain(
+        &signing_key.verifying_key(),
+        &TrustState::initial(),
+        &delegation,
+        &manifest,
+        GENERATED + 60,
+    )
+    .expect("the nightly trust chain must verify");
+
+    let dig_node = manifest
+        .manifest
+        .component("dig-node")
+        .expect("dig-node present");
+    assert_eq!(dig_node.version, "0.30.0-nightly.20260714.abc1234");
+    assert_eq!(dig_node.build, 20_260_714, "build is the UTC date YYYYMMDD");
+    assert_eq!(dig_node.artifacts.len(), 2);
+
+    let digstore = manifest
+        .manifest
+        .component("digstore")
+        .expect("digstore present");
+    assert_eq!(digstore.version, "0.14.0-nightly.20260714.abc1234");
+    assert_eq!(digstore.build, 20_260_714);
+}
+
+/// Per-channel INDEPENDENCE: signing the SAME source on the two channels yields two DIFFERENT feeds
+/// — different resolved versions and different build scales (packed semver vs YYYYMMDD) — so each
+/// channel is a distinct signed feed. Their freshness marks (`sequence`/`generated`) coincide only
+/// because the same `generated` timestamp is supplied to both in one run.
+#[test]
+fn the_two_channels_produce_independent_feeds() {
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+    let source = fake_source();
+
+    let stable =
+        produce_feed(&config(), &source, Channel::Stable, GENERATED, &signing_key).unwrap();
+    let nightly = produce_feed(
+        &config(),
+        &source,
+        Channel::Nightly,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
+
+    // Two genuinely different signed manifests, not a shared envelope.
+    assert_ne!(stable.manifest_json, nightly.manifest_json);
+
+    let stable_node = SignedManifest::from_json(&stable.manifest_json)
+        .unwrap()
+        .manifest
+        .component("dig-node")
+        .unwrap()
+        .clone();
+    let nightly_node = SignedManifest::from_json(&nightly.manifest_json)
+        .unwrap()
+        .manifest
+        .component("dig-node")
+        .unwrap()
+        .clone();
+
+    assert_eq!(stable_node.version, "0.29.0");
+    assert_eq!(stable_node.build, 29_000);
+    assert_eq!(nightly_node.version, "0.30.0-nightly.20260714.abc1234");
+    assert_eq!(nightly_node.build, 20_260_714);
+    // The two build scales never overlap: a stable build is thousands, a nightly build is tens of
+    // millions — so cross-channel comparison is meaningless by construction (#591 D5).
+    assert!(nightly_node.build > stable_node.build);
+}
+
 /// Byte-exact + deterministic: the same inputs produce identical feed bytes (the property that
 /// lets the feed be served byte-for-byte as signed — SPEC §10 no-transform requirement).
 #[test]
 fn feed_is_byte_identical_across_runs() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
-    let a = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
-    let b = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let a = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
+    let b = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
     assert_eq!(a.delegation_json, b.delegation_json);
     assert_eq!(a.manifest_json, b.manifest_json);
 }
@@ -187,7 +340,7 @@ fn feed_is_byte_identical_across_runs() {
 fn reported_digests_match_bytes() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
     let source = fake_source();
-    let feed = produce_feed(&config(), &source, GENERATED, &signing_key).unwrap();
+    let feed = produce_feed(&config(), &source, Channel::Stable, GENERATED, &signing_key).unwrap();
 
     assert_eq!(feed.digests.len(), 3); // 2 dig-node + 1 digstore
     for d in &feed.digests {
@@ -211,11 +364,11 @@ fn missing_component_assets_fail_closed() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
     let mut source = fake_source();
     source.releases.insert(
-        "DIG-Network/dig-node".to_string(),
+        ("DIG-Network/dig-node".to_string(), Channel::Stable),
         r#"{"tag_name":"v0.29.0","assets":[{"name":"unrelated.zip","browser_download_url":"https://dl.test/x"}]}"#.to_string(),
     );
     assert!(matches!(
-        produce_feed(&config(), &source, GENERATED, &signing_key),
+        produce_feed(&config(), &source, Channel::Stable, GENERATED, &signing_key),
         Err(FeedsignError::NoArtifacts { .. })
     ));
 }
@@ -225,7 +378,14 @@ fn missing_component_assets_fail_closed() {
 #[test]
 fn writes_both_feed_files_verbatim() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
-    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let feed = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
 
     let dir = tempfile::TempDir::new().unwrap();
     feed.write_to(dir.path()).unwrap();
@@ -240,7 +400,14 @@ fn writes_both_feed_files_verbatim() {
 #[test]
 fn summary_is_informative_and_secret_free() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
-    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let feed = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
 
     let summary = feed.summary();
     assert!(summary.contains(&format!("sequence={GENERATED}")));
@@ -260,7 +427,14 @@ fn transparency_record_signature_verifies_over_signed_bytes() {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
-    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let feed = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
     let record = feed
         .transparency()
         .expect("transparency derives from a produced feed");
@@ -294,7 +468,14 @@ fn transparency_pubkey_is_spki_ed25519_pem() {
     ];
 
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
-    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let feed = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
     let record = feed.transparency().unwrap();
 
     let pem = record.targets_pubkey_pem();
@@ -316,7 +497,14 @@ fn transparency_pubkey_is_spki_ed25519_pem() {
 #[test]
 fn write_transparency_emits_the_triple() {
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
-    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let feed = produce_feed(
+        &config(),
+        &fake_source(),
+        Channel::Stable,
+        GENERATED,
+        &signing_key,
+    )
+    .unwrap();
     let record = feed.transparency().unwrap();
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -355,7 +543,8 @@ fn live_github_resolution_smoke() {
     let source = GithubSource::github(token);
     let signing_key = SigningKey::from_bytes(&[5u8; 32]);
 
-    let feed = produce_feed(&config, &source, GENERATED, &signing_key).expect("live feed produced");
+    let feed = produce_feed(&config, &source, Channel::Stable, GENERATED, &signing_key)
+        .expect("live feed produced");
 
     let delegation = SignedDelegation::from_json(&feed.delegation_json).unwrap();
     let manifest = SignedManifest::from_json(&feed.manifest_json).unwrap();

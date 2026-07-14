@@ -1,35 +1,43 @@
-# The nightly SIGNED FEED (#504-I / #535). Every 6 hours (and on demand) this workflow:
+# The PER-CHANNEL signed FEED (#504-I / #535 / #603). Every 6 hours (and on demand) this workflow
+# signs, verifies, and publishes TWO fully independent signed feeds — one per update CHANNEL — so
+# the beacon can track either (SPEC §10.1, #591):
 #
-#   1. resolves the latest release of each configured component (feed-config.json),
-#   2. downloads each binary asset + computes its SHA-256,
+#   • stable   (updates.dig.net/v1/stable/)  — each component resolved from `releases/latest`.
+#   • nightly  (updates.dig.net/v1/nightly/) — each component resolved from the rolling `nightly`
+#                                              release (#590), build-dated YYYYMMDD.
+#
+# Each channel is its OWN signed feed with its OWN freshness (`generated`/`expires`) + anti-rollback
+# (`sequence`/floor) marks, signed under the SAME pinned root/targets key. A `channel` job MATRIX
+# runs the identical pipeline once per channel (`fail-fast: false`, so the nightly leg failing —
+# expected until every component has a rolling `nightly`, the #592 fan-out window — can NEVER skip
+# the stable leg). For each channel the leg:
+#
+#   1. resolves each configured component's release for that channel (feed-config.json),
+#   2. downloads each asset + computes its SHA-256,
 #   3. assembles + SIGNS the manifest + root->targets delegation with the trust core,
-#   4. PROVES the signed feed verifies end-to-end — the freshly-built #509-D beacon, with the REAL
-#      pinned root key, verifies the produced feed from a clean build (the keystone trust proof),
-#   5. only then PUBLISHES the byte-exact feed to BOTH bases the beacon ships pointing at:
-#        (a) the PRIMARY origin updates.dig.net (S3, #535) — a HARD step: a failure reddens the run,
-#        (b) the FALLBACK rolling `feed` GitHub release (FALLBACK_FEED_BASE),
-#   6. smoke-tests the live primary — curl updates.dig.net/v1/alpha/manifest.json and byte-compare it
+#   4. PROVES the signed feed verifies end-to-end — the freshly-built beacon, with the REAL pinned
+#      root key, verifies the produced feed from a clean build (the PER-CHANNEL keystone), and
+#   5. only then PUBLISHES the byte-exact feed to both of the beacon's bases for that channel:
+#        (a) the PRIMARY origin updates.dig.net/v1/<channel>/ (S3, #535) — a HARD step,
+#        (b) the FALLBACK rolling GitHub release `feed-<channel>`,
+#   6. smoke-tests the live primary — curl updates.dig.net/v1/<channel>/manifest.json + byte-compare
 #      to the exact signed manifest (proof the CDN serves it un-transformed, SPEC §10.4), and
 #   7. records the signed manifest in a PUBLIC transparency log (Rekor, #533) — FAIL-SOFT, log-only.
 #
+# LEGACY /v1/alpha (back-compat): existing beacons still fetch PRIMARY_FEED_BASE `/v1/alpha` + the
+# rolling `feed` release until the channel-aware ladder ships (#604). To NOT break them, the STABLE
+# leg ALSO mirrors its byte-identical feed to `/v1/alpha` + the rolling `feed` release — so a
+# not-yet-upgraded beacon keeps receiving exactly the content it already gets (stable = today's alpha
+# selection). The design maps alpha->nightly, but the ACTUAL alpha->nightly migration is #604's job
+# (with per-channel trust state); #603 only keeps /v1/alpha alive, unchanged, alongside the two new
+# feeds. `/v1/alpha` + `feed` retire once every beacon has upgraded past #604.
+#
 # Cadence vs freshness: a 6-hour cron against a 12-hour manifest expiry (SPEC §7) leaves 6 hours of
-# slack, so a single skipped/failed run never lets clients see an expired feed. Both publishes are
-# gated on the keystone verify passing, so a feed that does not verify is never served.
+# slack, so a single skipped/failed run never lets clients see an expired feed. Every publish is
+# gated on that channel's keystone verify, so a feed that does not verify is never served.
 #
 # Key hygiene: BEACON_SIGNING_KEY flows secret -> env -> the feedsign process only. It is never
 # echoed; the job summary prints only the sequence, timestamp, and public per-artifact digests.
-#
-# updates.dig.net is now the PRIMARY (S3+CloudFront, #535): the S3 upload uses short-lived OIDC
-# credentials (no static AWS keys) assuming the least-privilege `AWS_DEPLOY_ROLE_ARN`. CloudFront is
-# CachingDisabled so no invalidation is needed. Since both bases are UNTRUSTED transport (SPEC §1) and
-# the beacon prefers the freshest by monotonic sequence, keeping the GitHub fallback in lock-step
-# costs nothing and hedges an S3/CDN outage.
-#
-# The two publishes are DECOUPLED (#545): the GitHub-release fallback is gated on the keystone verify
-# alone (`always() && steps.keystone.outcome == 'success'`), NOT on the primary S3 publish or its live
-# smoke succeeding — so a primary-edge hiccup that reddens the HARD S3 steps can never skip the very
-# fallback that outage calls for. Both remain strictly downstream of the keystone: neither base is ever
-# served a feed that did not verify end-to-end.
 name: Feed
 
 on:
@@ -52,17 +60,25 @@ env:
 
 jobs:
   sign-verify-publish:
-    name: Sign, verify end-to-end, publish
+    name: ${{ matrix.channel }} — sign, verify, publish
     # H1 (#540): the signing capability is bound to REVIEWED main code. A workflow_dispatch (or any
     # on:push) from an unreviewed branch must never sign with the real pinned key + publish to the
-    # `feed` release every shipped beacon trusts — that would bypass the §2.4 PR-review gate. The
-    # cron + the production dispatch both run on main, so this guard costs nothing legitimate.
+    # bases every shipped beacon trusts — that would bypass the §2.4 PR-review gate. The cron + the
+    # production dispatch both run on main, so this guard costs nothing legitimate.
     if: github.ref == 'refs/heads/main'
     # BEACON_SIGNING_KEY MUST be a main-scoped GitHub Environment secret (env `feed-signing`, #540)
     # with a main-only deployment branch policy — NEVER a plain repo secret. Referencing the environment
     # here readies that binding (an as-yet-uncreated environment is inert; @mt-dev adds the protected secret to it).
     environment: feed-signing
     runs-on: ubuntu-latest
+    strategy:
+      # Each channel is a fully independent feed: a failure signing/publishing ONE channel must
+      # never cancel or skip the other. The nightly leg is EXPECTED to be red until every component
+      # has a rolling `nightly` release (#592 fan-out window); the stable leg + /v1/alpha keep
+      # publishing regardless.
+      fail-fast: false
+      matrix:
+        channel: [stable, nightly]
     steps:
       - name: Require BEACON_SIGNING_KEY (else no-op)
         id: secret
@@ -70,7 +86,7 @@ jobs:
           BEACON_SIGNING_KEY: ${{ secrets.BEACON_SIGNING_KEY }}
         run: |
           if [ -z "$BEACON_SIGNING_KEY" ]; then
-            echo "::warning::BEACON_SIGNING_KEY is not set on this repo — the signed feed is a NO-OP until the signing secret is added (see SPEC.md §4.2/§10)."
+            echo "::warning::BEACON_SIGNING_KEY is not set on this repo — the ${{ matrix.channel }} signed feed is a NO-OP until the signing secret is added (see SPEC.md §4.2/§10)."
             echo "present=false" >> "$GITHUB_OUTPUT"
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
@@ -101,7 +117,8 @@ jobs:
         id: ts
         run: echo "generated=$(date +%s)" >> "$GITHUB_OUTPUT"
 
-      # Assemble + sign the feed. The generated timestamp is supplied in (determinism, SPEC §10).
+      # Assemble + sign THIS channel's feed. `--channel` selects the release source + build scale
+      # (SPEC §10.1); the generated timestamp is supplied in (determinism, SPEC §10).
       # `--transparency-out` also emits the Rekor triple (signed bytes + detached signature + the
       # targets pubkey PEM) — derived from the signed feed, so it can only reflect what is published.
       - name: Sign the feed
@@ -114,25 +131,25 @@ jobs:
           set -o pipefail
           ./target/release/dig-updater-feedsign \
             --config feed-config.json \
+            --channel "${{ matrix.channel }}" \
             --out feed-out \
             --transparency-out feed-transparency \
             | tee feed-summary.txt
 
-      # THE KEYSTONE: the freshly-built beacon, pinning the REAL root key, verifies the just-signed
-      # feed served from a local origin. `check` fetches delegation.json + manifest.json locally,
-      # then downloads each artifact from its real (untrusted) URL and digest-verifies it — the full
-      # trust chain, end-to-end. This is the first true proof the signer + verifier agree in
-      # production. It runs BEFORE publish, so an unverifiable feed is never served.
+      # THE PER-CHANNEL KEYSTONE: the freshly-built beacon, pinning the REAL root key, verifies THIS
+      # channel's just-signed feed served from a local origin. `check` fetches delegation.json +
+      # manifest.json locally, then downloads each artifact from its real (untrusted) URL and
+      # digest-verifies it — the full trust chain, end-to-end. It runs BEFORE this channel's publish,
+      # so an unverifiable feed is never served.
       - name: Verify the signed feed end-to-end (pinned key)
         if: steps.secret.outputs.present == 'true'
         id: keystone
         # This step runs UNELEVATED, so point the dry check's state dir at a writable workspace
         # path (honored by `Broker::for_dry_check`, #540). Without it the worker cannot create its
         # staging dir under the Admin-only default (`/var/lib/dig-updater`), a valid feed comes back
-        # as a `staging_io_error` rejection, and the keystone fails. The code is fail-soft either
-        # way; this keeps the run clean (no permission warning) and independent of the runner user.
+        # as a `staging_io_error` rejection, and the keystone fails.
         env:
-          DIG_UPDATER_STATE_DIR: ${{ runner.temp }}/dig-updater-state
+          DIG_UPDATER_STATE_DIR: ${{ runner.temp }}/dig-updater-state-${{ matrix.channel }}
         run: |
           set -euo pipefail
           python3 -m http.server 8099 --bind 127.0.0.1 --directory feed-out &
@@ -146,10 +163,10 @@ jobs:
           REPORT="$(./target/release/dig-updater check --feed-base http://127.0.0.1:8099 --json)"
           echo "beacon verdict: $REPORT"
           echo "$REPORT" | jq -e '.status == "verified"' >/dev/null \
-            || { echo "::error::the pinned-key beacon did NOT verify the signed feed"; exit 1; }
-          echo "End-to-end trust chain verified: signer output accepted by the pinned-key beacon."
+            || { echo "::error::the pinned-key beacon did NOT verify the ${{ matrix.channel }} signed feed"; exit 1; }
+          echo "End-to-end trust chain verified for ${{ matrix.channel }}: signer output accepted by the pinned-key beacon."
 
-      # --- PUBLISH (only reached once the keystone verify above has passed) ---
+      # --- PUBLISH (only reached once THIS channel's keystone verify above has passed) ---
 
       # Short-lived OIDC credentials for the least-privilege S3 publish role (#535). No static AWS
       # keys ever exist in CI; the role trust is scoped to this repo's `feed-signing` environment.
@@ -160,13 +177,75 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: us-east-1
 
-      # PRIMARY publish to updates.dig.net (S3). The key prefix is EXACTLY the beacon's PRIMARY feed
-      # base path (`.../v1/alpha/`, PRIMARY_FEED_BASE) so the two objects resolve at
-      # updates.dig.net/v1/alpha/{delegation,manifest}.json. `--content-type application/json` with no
-      # content-encoding keeps the bytes un-transformed (SPEC §10.4); CloudFront is CachingDisabled so
-      # no invalidation is required. HARD step: a failed upload reddens the run.
+      # PRIMARY publish to updates.dig.net/v1/<channel>/ (S3), EXACTLY the beacon's per-channel feed
+      # base. `--content-type application/json` with no content-encoding keeps the bytes
+      # un-transformed (SPEC §10.4); CloudFront is CachingDisabled so no invalidation is required.
+      # HARD step: a failed upload reddens this leg.
       - name: Publish to updates.dig.net (S3 primary)
         if: steps.secret.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          dest="s3://${{ vars.UPDATES_FEED_BUCKET }}/v1/${{ matrix.channel }}"
+          aws s3 cp feed-out/delegation.json "$dest/delegation.json" \
+            --content-type application/json --no-progress
+          aws s3 cp feed-out/manifest.json "$dest/manifest.json" \
+            --content-type application/json --no-progress
+
+      # Live smoke: the beacon's per-channel PRIMARY URL must serve the byte-exact signed manifest —
+      # the end-to-end proof the primary base is live and un-transformed. A short retry loop absorbs
+      # CloudFront propagation of the fresh object. HARD step (the primary must actually work).
+      - name: Smoke-test the live primary (byte-exact)
+        if: steps.secret.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          url="https://updates.dig.net/v1/${{ matrix.channel }}/manifest.json"
+          for attempt in $(seq 1 30); do
+            if curl -fsS "$url" -o live-manifest.json && cmp -s live-manifest.json feed-out/manifest.json; then
+              echo "updates.dig.net serves the byte-exact ${{ matrix.channel }} manifest (attempt $attempt)."
+              exit 0
+            fi
+            echo "primary not yet byte-exact (attempt $attempt); retrying…"
+            sleep 5
+          done
+          echo "::error::updates.dig.net did not serve the byte-exact ${{ matrix.channel }} manifest"
+          exit 1
+
+      # FALLBACK publish to the rolling `feed-<channel>` release. A prerelease + not "latest", so it
+      # never shadows a component's real version release when the feed resolves that component.
+      #
+      # INTENTIONALLY INDEPENDENT of the S3 primary publish + its live smoke (#545): the two bases
+      # (updates.dig.net S3/CDN and this GitHub release) refresh independently, and the beacon picks
+      # the freshest by monotonic sequence. The gate is `always() && steps.keystone.outcome ==
+      # 'success'` — NOT the implicit `success()` — so a primary-edge hiccup that reddens the HARD S3
+      # publish or byte-exact smoke can NO LONGER skip this fallback, which is the exact outage it
+      # exists to hedge. It stays STRICTLY downstream of the keystone: it fires only when the
+      # pinned-key end-to-end verify passed, so an unverified feed is never published, and a
+      # no-signing-secret run (keystone skipped -> outcome != 'success') is a no-op.
+      - name: Publish to the rolling feed-<channel> release
+        if: always() && steps.keystone.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FEED_RELEASE: feed-${{ matrix.channel }}
+        run: |
+          set -euo pipefail
+          gh release view "$FEED_RELEASE" --repo "${{ github.repository }}" >/dev/null 2>&1 \
+            || gh release create "$FEED_RELEASE" \
+                 --repo "${{ github.repository }}" \
+                 --target main \
+                 --title "DIG beacon signed feed (${{ matrix.channel }})" \
+                 --notes "The ${{ matrix.channel }} signed update feed (delegation.json + manifest.json), re-signed every 6h. Served byte-for-byte as signed — do NOT edit assets by hand." \
+                 --prerelease \
+                 --latest=false
+          gh release upload "$FEED_RELEASE" feed-out/delegation.json feed-out/manifest.json \
+            --repo "${{ github.repository }}" --clobber
+
+      # LEGACY /v1/alpha mirror (STABLE leg only). Existing beacons still fetch `/v1/alpha` + the
+      # rolling `feed` release; the stable feed is byte-identical to today's alpha selection, so
+      # mirroring it there keeps a not-yet-upgraded beacon receiving exactly what it already gets. The
+      # actual alpha->nightly migration is #604 (with per-channel trust state); this only preserves
+      # the live /v1/alpha feed. Downstream of the stable keystone (never serves an unverified feed).
+      - name: Publish the stable feed to legacy /v1/alpha (back-compat)
+        if: steps.secret.outputs.present == 'true' && matrix.channel == 'stable'
         run: |
           set -euo pipefail
           dest="s3://${{ vars.UPDATES_FEED_BUCKET }}/v1/alpha"
@@ -175,39 +254,8 @@ jobs:
           aws s3 cp feed-out/manifest.json "$dest/manifest.json" \
             --content-type application/json --no-progress
 
-      # Live smoke: the beacon's PRIMARY URL must serve the byte-exact signed manifest. This is the
-      # end-to-end proof the primary base is live and un-transformed. A short retry loop absorbs
-      # CloudFront propagation of the fresh object. HARD step (the primary must actually work).
-      - name: Smoke-test the live primary (byte-exact)
-        if: steps.secret.outputs.present == 'true'
-        run: |
-          set -euo pipefail
-          url="https://updates.dig.net/v1/alpha/manifest.json"
-          for attempt in $(seq 1 30); do
-            if curl -fsS "$url" -o live-manifest.json && cmp -s live-manifest.json feed-out/manifest.json; then
-              echo "updates.dig.net serves the byte-exact signed manifest (attempt $attempt)."
-              exit 0
-            fi
-            echo "primary not yet byte-exact (attempt $attempt); retrying…"
-            sleep 5
-          done
-          echo "::error::updates.dig.net did not serve the byte-exact signed manifest"
-          exit 1
-
-      # FALLBACK publish to the rolling `feed` release. It is a prerelease + not "latest"
-      # so it never shadows a component's real version release when the feed resolves that component.
-      #
-      # INTENTIONALLY INDEPENDENT of the S3 primary publish + its live smoke above (#545): the two
-      # bases (updates.dig.net S3/CDN and this GitHub release) refresh independently, and the beacon
-      # picks the freshest by monotonic sequence. The gate is `always() && steps.keystone.outcome ==
-      # 'success'` — NOT the implicit `success()` — so a primary-edge hiccup that reddens the HARD S3
-      # publish or byte-exact smoke can NO LONGER skip this fallback, which is the exact outage it
-      # exists to hedge. It stays STRICTLY downstream of the keystone: `steps.keystone.outcome ==
-      # 'success'` fires only when the pinned-key end-to-end verify passed, so an unverified feed is
-      # never published, and a no-signing-secret run (keystone skipped → outcome != 'success') is a
-      # no-op. `always()` decouples ONLY from the primary edge, never from the trust gate.
-      - name: Publish to the rolling `feed` release
-        if: always() && steps.keystone.outcome == 'success'
+      - name: Publish the stable feed to the legacy rolling `feed` release (back-compat)
+        if: always() && matrix.channel == 'stable' && steps.keystone.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -223,10 +271,26 @@ jobs:
           gh release upload feed feed-out/delegation.json feed-out/manifest.json \
             --repo "${{ github.repository }}" --clobber
 
-      # Record the signed manifest in the PUBLIC Sigstore transparency log (#533). This is
-      # LOG-ONLY in alpha and FAIL-SOFT: a Rekor outage must NEVER block the 6-hour heartbeat, so
-      # every failure path degrades to a warning and the step still succeeds. The beacon does not
-      # yet require an inclusion proof — that verify is a beta client obligation (#533, deferred).
+      - name: Smoke-test the legacy /v1/alpha primary (byte-exact, back-compat)
+        if: steps.secret.outputs.present == 'true' && matrix.channel == 'stable'
+        run: |
+          set -euo pipefail
+          url="https://updates.dig.net/v1/alpha/manifest.json"
+          for attempt in $(seq 1 30); do
+            if curl -fsS "$url" -o live-alpha-manifest.json && cmp -s live-alpha-manifest.json feed-out/manifest.json; then
+              echo "updates.dig.net serves the byte-exact legacy /v1/alpha manifest (attempt $attempt)."
+              exit 0
+            fi
+            echo "legacy /v1/alpha not yet byte-exact (attempt $attempt); retrying…"
+            sleep 5
+          done
+          echo "::error::updates.dig.net did not serve the byte-exact legacy /v1/alpha manifest"
+          exit 1
+
+      # Record the signed manifest in the PUBLIC Sigstore transparency log (#533). This is LOG-ONLY
+      # in alpha and FAIL-SOFT: a Rekor outage must NEVER block the 6-hour heartbeat, so every
+      # failure path degrades to a warning and the step still succeeds. The beacon does not yet
+      # require an inclusion proof — that verify is a beta client obligation (#533, deferred).
       #
       # NOTE (#533 beta): the beacon key is Ed25519 (PureEdDSA), which signs the whole message.
       # `hashedrekord` attests only a hash, so a server-side re-verify of a PureEdDSA signature
@@ -240,7 +304,7 @@ jobs:
           REKOR_CLI_VERSION: v1.3.6
         run: |
           # No `set -e`: this step must always exit 0 (fail-soft).
-          rekor_warn() { echo "::warning::rekor log skipped: $1"; }
+          rekor_warn() { echo "::warning::rekor log skipped (${{ matrix.channel }}): $1"; }
 
           curl -fsSL -o rekor-cli \
             "https://github.com/sigstore/rekor/releases/download/${REKOR_CLI_VERSION}/rekor-cli-linux-amd64" \
@@ -269,14 +333,14 @@ jobs:
 
           printf '{"logIndex":%s,"server":"https://rekor.sigstore.dev","type":"hashedrekord"}\n' \
             "$index" > feed-out/rekor-entry.json
-          echo "### Transparency log (Rekor)" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Transparency log (Rekor) — ${{ matrix.channel }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Public entry index: **${index}** on \`rekor.sigstore.dev\`." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Job summary
         if: always() && steps.secret.outputs.present == 'true'
         run: |
           {
-            echo '### DIG beacon signed feed'
+            echo '### DIG beacon signed feed — ${{ matrix.channel }}'
             echo '```'
             cat feed-summary.txt 2>/dev/null || echo 'feed was not signed'
             echo '```'

@@ -10,6 +10,12 @@
 //! This preserves ordering (a higher version always yields a higher build) as long as `minor` and
 //! `patch` stay below 1000 — true for every DIG component and enforced here so a future
 //! four-digit component version fails loudly rather than silently colliding.
+//!
+//! NIGHTLY builds use a DIFFERENT, non-overlapping build scale: the UTC build date `YYYYMMDD`
+//! ([`parse_nightly_build`]), strictly increasing day-over-day — exactly the "never install an
+//! older nightly" semantic (#591 D5). The two scales are NEVER compared across channels: each
+//! channel keeps its own monotonic trust state, so a stable `build` (thousands) and a nightly
+//! `build` (tens of millions) never meet.
 
 use crate::error::FeedsignError;
 
@@ -77,6 +83,34 @@ pub fn parse_version(raw: &str) -> Result<Version, FeedsignError> {
     })
 }
 
+/// The nightly build number: the UTC build DATE `YYYYMMDD`, parsed from a nightly prerelease
+/// version string `X.Y.Z-nightly.YYYYMMDD.<sha>` (#590/#591 D5).
+///
+/// The nightly release builder synthesizes exactly this shape (`nightly-release.yml`), so the date
+/// segment is the second dot-field of the `-nightly.` prerelease. It is a monotonic build stamp on
+/// its OWN scale — never compared against the stable packed-semver scale ([`Version::build_number`]).
+///
+/// # Errors
+///
+/// [`FeedsignError::Version`] if `version` has no `-nightly.` segment, or the date segment is not
+/// exactly eight decimal digits (a malformed nightly stamp fails the run closed rather than
+/// producing a feed with a meaningless build number).
+pub fn parse_nightly_build(version: &str) -> Result<u64, FeedsignError> {
+    let after = version.split("-nightly.").nth(1).ok_or_else(|| {
+        FeedsignError::Version(format!(
+            "{version}: not a nightly version (expected `X.Y.Z-nightly.YYYYMMDD.<sha>`)"
+        ))
+    })?;
+    let date = after.split('.').next().unwrap_or_default();
+    if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(FeedsignError::Version(format!(
+            "{version}: nightly date segment must be 8 digits (YYYYMMDD), got {date:?}"
+        )));
+    }
+    date.parse::<u64>()
+        .map_err(|e| FeedsignError::Version(format!("{version}: nightly date: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +175,41 @@ mod tests {
         // Would collide with a carry into the next field, breaking monotonicity — fail loudly.
         assert!(parse_version("1.1000.0").is_err());
         assert!(parse_version("1.0.1000").is_err());
+    }
+
+    #[test]
+    fn nightly_build_is_the_utc_date() {
+        assert_eq!(
+            parse_nightly_build("0.9.0-nightly.20260714.abc1234").unwrap(),
+            20_260_714
+        );
+        // A shortsha of any length + a bare version with no leading `v` both parse the same date.
+        assert_eq!(
+            parse_nightly_build("1.2.3-nightly.20251231.deadbeef").unwrap(),
+            20_251_231
+        );
+    }
+
+    #[test]
+    fn nightly_build_is_monotonic_day_over_day() {
+        let older = parse_nightly_build("0.9.0-nightly.20260713.aaa").unwrap();
+        let newer = parse_nightly_build("0.9.0-nightly.20260714.bbb").unwrap();
+        assert!(older < newer, "a later date must sort higher");
+    }
+
+    #[test]
+    fn nightly_build_rejects_a_non_nightly_version() {
+        // A plain stable version has no `-nightly.` segment — it must never be mis-parsed as a
+        // nightly build (the two scales are distinct, #591 D5).
+        assert!(parse_nightly_build("0.9.0").is_err());
+        assert!(parse_nightly_build("0.9.0-rc.1").is_err());
+    }
+
+    #[test]
+    fn nightly_build_rejects_a_malformed_date() {
+        assert!(parse_nightly_build("0.9.0-nightly.2026071.abc").is_err()); // 7 digits
+        assert!(parse_nightly_build("0.9.0-nightly.202607144.abc").is_err()); // 9 digits
+        assert!(parse_nightly_build("0.9.0-nightly.20x6q714.abc").is_err()); // non-digits
+        assert!(parse_nightly_build("0.9.0-nightly.").is_err()); // empty date
     }
 }

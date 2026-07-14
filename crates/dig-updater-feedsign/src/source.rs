@@ -7,17 +7,20 @@
 
 use std::io::Read;
 
+use crate::channel::Channel;
 use crate::error::FeedsignError;
 use crate::resolve::GithubRelease;
 
 /// A source of component release metadata + asset bytes.
 pub trait ReleaseSource {
-    /// The latest published release of `repo` (GitHub `owner/repo`).
+    /// The release of `repo` (GitHub `owner/repo`) that supplies this `channel`'s build:
+    /// `releases/latest` for [`Channel::Stable`], the rolling `releases/tags/nightly` for
+    /// [`Channel::Nightly`] ([`Channel::release_path`]).
     ///
     /// # Errors
     ///
     /// A transport error or an unparseable response.
-    fn latest_release(&self, repo: &str) -> Result<GithubRelease, FeedsignError>;
+    fn release(&self, repo: &str, channel: Channel) -> Result<GithubRelease, FeedsignError>;
 
     /// Download the bytes of a release asset from its URL.
     ///
@@ -70,8 +73,13 @@ impl GithubSource {
 }
 
 impl ReleaseSource for GithubSource {
-    fn latest_release(&self, repo: &str) -> Result<GithubRelease, FeedsignError> {
-        let url = format!("{}/repos/{}/releases/latest", self.api_base, repo);
+    fn release(&self, repo: &str, channel: Channel) -> Result<GithubRelease, FeedsignError> {
+        let url = format!(
+            "{}/repos/{}/{}",
+            self.api_base,
+            repo,
+            channel.release_path()
+        );
         let body = self
             .prepare(ureq::get(&url))
             .call()
@@ -175,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn fetches_and_parses_latest_release() {
+    fn stable_fetches_the_latest_release() {
         let srv = TestServer::bind();
         let release_json = r#"{"tag_name":"v0.29.0","assets":[{"name":"dig-node-0.29.0-linux-x64","browser_download_url":"https://example.test/a"}]}"#;
         let routes = HashMap::from([(
@@ -185,8 +193,31 @@ mod tests {
         let _guard = srv.serve(routes);
 
         let source = GithubSource::with_api_base(&srv.base, None);
-        let release = source.latest_release("DIG-Network/dig-node").unwrap();
+        let release = source
+            .release("DIG-Network/dig-node", Channel::Stable)
+            .unwrap();
         assert_eq!(release.tag_name, "v0.29.0");
+        assert_eq!(release.assets.len(), 1);
+    }
+
+    #[test]
+    fn nightly_fetches_the_rolling_nightly_tag_release() {
+        // The nightly channel resolves the ROLLING `nightly` release (`releases/tags/nightly`),
+        // NOT `releases/latest` — a request to the latest endpoint must 404 in this test, proving
+        // the channel selects the right GitHub path.
+        let srv = TestServer::bind();
+        let release_json = r#"{"tag_name":"nightly","assets":[{"name":"dig-node-0.30.0-nightly.20260714.abc1234-linux-x64","browser_download_url":"https://example.test/n"}]}"#;
+        let routes = HashMap::from([(
+            "/repos/DIG-Network/dig-node/releases/tags/nightly".to_string(),
+            release_json.as_bytes().to_vec(),
+        )]);
+        let _guard = srv.serve(routes);
+
+        let source = GithubSource::with_api_base(&srv.base, None);
+        let release = source
+            .release("DIG-Network/dig-node", Channel::Nightly)
+            .unwrap();
+        assert_eq!(release.tag_name, "nightly");
         assert_eq!(release.assets.len(), 1);
     }
 
@@ -207,7 +238,13 @@ mod tests {
         let _guard = srv.serve(HashMap::new()); // everything 404s
         let source = GithubSource::with_api_base(&srv.base, None);
         assert!(matches!(
-            source.latest_release("DIG-Network/nope"),
+            source.release("DIG-Network/nope", Channel::Stable),
+            Err(FeedsignError::Fetch { .. })
+        ));
+        // A component with no rolling `nightly` release (the fan-out window, #592) also fails
+        // closed rather than silently producing an incomplete nightly feed.
+        assert!(matches!(
+            source.release("DIG-Network/nope", Channel::Nightly),
             Err(FeedsignError::Fetch { .. })
         ));
     }

@@ -8,6 +8,7 @@
 
 use serde::Deserialize;
 
+use crate::channel::Channel;
 use crate::error::FeedsignError;
 
 /// The manifest schema version this signer emits. Additive-only (SPEC §5.2).
@@ -30,18 +31,35 @@ pub struct FeedConfig {
     /// The delegation `root_version` to emit (alpha: a single generation, `1`).
     #[serde(default = "default_root_version")]
     pub root_version: u32,
-    /// The anti-downgrade floor: no component build below this may install (SPEC §7.5). Alpha
-    /// default `0` (nothing is floored out yet); raised deliberately to retire a vulnerable build.
-    #[serde(default)]
-    pub rollback_floor_build: u64,
     /// Seconds the signed manifest stays valid after `generated` (SPEC §7 heartbeat).
     #[serde(default = "default_manifest_ttl")]
     pub manifest_ttl_secs: u64,
     /// Seconds the signed delegation stays valid after `generated`.
     #[serde(default = "default_delegation_ttl")]
     pub delegation_ttl_secs: u64,
-    /// The components the feed tracks, in the order they appear in the manifest.
+    /// The components the feed tracks, in the order they appear in the manifest. The set is SHARED
+    /// across channels — both feeds track the same components, differing only in which release each
+    /// resolves (SPEC §10.1) — so the list is not duplicated per channel.
     pub components: Vec<ComponentConfig>,
+    /// The per-channel anti-rollback floors (SPEC §7.5/§7.6). Each channel's floor is on its OWN
+    /// build scale — stable's packed semver, nightly's `YYYYMMDD` — and is NEVER compared across
+    /// channels, so they live in separate fields rather than one shared value (#591 D5).
+    #[serde(default)]
+    pub channels: ChannelFloors,
+}
+
+/// The anti-downgrade floor of each channel: no component `build` below its channel's floor may
+/// install (SPEC §7.6). Both default to `0` (nothing floored yet); a floor is raised deliberately
+/// to retire a vulnerable build — a stable floor to a packed-semver build, a nightly floor to a
+/// `YYYYMMDD` cutoff date (#591 D5 point 4).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChannelFloors {
+    /// The STABLE channel's floor, on the packed-semver build scale.
+    #[serde(default)]
+    pub stable: u64,
+    /// The NIGHTLY channel's floor, on the `YYYYMMDD` build-date scale.
+    #[serde(default)]
+    pub nightly: u64,
 }
 
 /// Which KIND of release asset a component ships — and therefore which per-platform asset the feed
@@ -116,31 +134,56 @@ impl FeedConfig {
         }
         Ok(config)
     }
+
+    /// The anti-rollback floor for `channel` (SPEC §7.6).
+    #[must_use]
+    pub fn floor_for(&self, channel: Channel) -> u64 {
+        match channel {
+            Channel::Stable => self.channels.stable,
+            Channel::Nightly => self.channels.nightly,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::channel::Channel;
+
     #[test]
     fn parses_full_config() {
         let json = r#"{
             "schema": 1,
             "root_version": 1,
-            "rollback_floor_build": 5,
             "manifest_ttl_secs": 3600,
             "delegation_ttl_secs": 86400,
+            "channels": { "stable": 5, "nightly": 20260714 },
             "components": [
                 { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node" }
             ]
         }"#;
         let c = FeedConfig::from_json(json).unwrap();
         assert_eq!(c.schema, 1);
-        assert_eq!(c.rollback_floor_build, 5);
         assert_eq!(c.manifest_ttl_secs, 3600);
         assert_eq!(c.delegation_ttl_secs, 86400);
         assert_eq!(c.components.len(), 1);
         assert_eq!(c.components[0].repo, "DIG-Network/dig-node");
+    }
+
+    #[test]
+    fn per_channel_floors_are_independent() {
+        // The two floors are on different build scales and are looked up per channel — a stable
+        // packed-semver floor and a nightly YYYYMMDD floor never interfere (#591 D5).
+        let json = r#"{
+            "channels": { "stable": 31001, "nightly": 20260714 },
+            "components": [
+                { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node" }
+            ]
+        }"#;
+        let c = FeedConfig::from_json(json).unwrap();
+        assert_eq!(c.floor_for(Channel::Stable), 31_001);
+        assert_eq!(c.floor_for(Channel::Nightly), 20_260_714);
     }
 
     #[test]
@@ -153,7 +196,9 @@ mod tests {
         let c = FeedConfig::from_json(json).unwrap();
         assert_eq!(c.schema, 1);
         assert_eq!(c.root_version, 1);
-        assert_eq!(c.rollback_floor_build, 0);
+        // Both channel floors default to 0 (nothing floored yet).
+        assert_eq!(c.floor_for(Channel::Stable), 0);
+        assert_eq!(c.floor_for(Channel::Nightly), 0);
         assert_eq!(c.manifest_ttl_secs, 12 * 60 * 60);
         assert_eq!(c.delegation_ttl_secs, 30 * 24 * 60 * 60);
     }

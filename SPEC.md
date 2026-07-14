@@ -465,37 +465,72 @@ The signed feed is two UTF-8 JSON documents — `delegation.json` (§5.1) and `m
 `{base}/manifest.json` from each base in its ladder (untrusted transport, §1); the first base that
 serves BOTH wins.
 
-### 10.1 Feed URLs
+### 10.1 Feed URLs — per channel
 
-| Tier | Base URL | delegation | manifest |
-|------|----------|------------|----------|
-| Primary (production) | `https://updates.dig.net/v1/alpha` | `…/v1/alpha/delegation.json` | `…/v1/alpha/manifest.json` |
-| Fallback (alpha, baked-in) | `https://github.com/DIG-Network/dig-updater/releases/download/feed` | `…/feed/delegation.json` | `…/feed/manifest.json` |
+The feed is published as TWO fully independent signed feeds, one per update **channel** — `stable`
+and `nightly`. Each channel is a distinct `{base}/{delegation,manifest}.json` pair carrying its OWN
+freshness (`generated`/`expires`) and anti-rollback (`sequence`/floor) marks, signed under the SAME
+pinned root/targets key (§4.3). Separate paths give each channel its own monotonic trust context
+with zero coupling: a client tracking one channel is never affected by the other's marks.
 
-Each run publishes to **both** bases (§10.7). `updates.dig.net` (its own S3+CloudFront, #535) is the
-PRIMARY the beacon tries first; the rolling GitHub `feed` release is the always-available fallback.
-Because both bases are untrusted transport (§1) and the beacon prefers the freshest manifest by
-monotonic `sequence`, keeping them in lock-step is a resilience hedge, not a trust dependency — a
-client that reaches either base installs the identical verified bytes.
+| Channel | Tier | Base URL |
+|---------|------|----------|
+| stable | Primary | `https://updates.dig.net/v1/stable` |
+| stable | Fallback | `https://github.com/DIG-Network/dig-updater/releases/download/feed-stable` |
+| nightly | Primary | `https://updates.dig.net/v1/nightly` |
+| nightly | Fallback | `https://github.com/DIG-Network/dig-updater/releases/download/feed-nightly` |
+
+Each channel publishes to **both** of its bases each run (§10.7): `updates.dig.net` (its own
+S3+CloudFront, #535) is the PRIMARY, and the rolling GitHub `feed-<channel>` release is the
+always-available fallback. Because both bases are untrusted transport (§1) and the beacon prefers
+the freshest manifest by monotonic `sequence`, keeping them in lock-step is a resilience hedge, not
+a trust dependency — a client that reaches either base installs the identical verified bytes.
+
+**Legacy `/v1/alpha` (back-compat).** The pre-channel beacon fetched a single feed at
+`https://updates.dig.net/v1/alpha` + the rolling `feed` release. Until the beacon's channel-aware
+fetch ladder ships (#604), those bases MUST keep serving: the `stable` feed is mirrored to
+`/v1/alpha` + the rolling `feed` release byte-for-byte, so a not-yet-upgraded beacon keeps receiving
+exactly the content it already got (its selection is unchanged — `releases/latest`). The
+legacy alpha ≡ nightly mapping and the migration of installed alpha beacons onto `/v1/nightly` are
+the beacon's responsibility (#604, with per-channel trust state); the feed side only keeps
+`/v1/alpha` alive, unchanged, alongside the two channel feeds. `/v1/alpha` + `feed` retire once
+every beacon has upgraded past #604.
 
 ### 10.2 Cadence + freshness
 
-CI re-signs the feed **every 6 hours** (`cron: 0 */6 * * *`, plus on demand). Each run stamps a
-fresh `generated` == `sequence` == the run's unix time, a manifest `expires` = `generated + 12h`
-(§7), and a delegation `expires` = `generated + 30d`. The 6-hour cadence against the 12-hour
-manifest expiry leaves 6 hours of slack, so a single skipped/failed run never leaves clients without
-an unexpired manifest. Because `generated`/`sequence` is the wall-clock time, it is monotonic across
-runs and IS the anti-freeze/anti-rollback high-water-mark directly. The `generated` timestamp is
-supplied INTO the signer by the workflow (not read from the signer's clock), so a run is
-deterministic and reproducible.
+CI re-signs BOTH channel feeds **every 6 hours** (`cron: 0 */6 * * *`, plus on demand), each channel
+independently (a `channel` job matrix, `fail-fast: false`). Each channel's run stamps a fresh
+`generated` == `sequence` == the run's unix time, a manifest `expires` = `generated + 12h` (§7), and
+a delegation `expires` = `generated + 30d`. The 6-hour cadence against the 12-hour manifest expiry
+leaves 6 hours of slack, so a single skipped/failed run never leaves clients without an unexpired
+manifest. Because `generated`/`sequence` is the wall-clock time, it is monotonic across runs and IS
+the anti-freeze/anti-rollback high-water-mark directly. The `generated` timestamp is supplied INTO
+the signer by the workflow (not read from the signer's clock), so a run is deterministic and
+reproducible. The two channels are independent: signing/publishing one never gates the other, so
+the nightly leg failing (e.g. a component without a rolling `nightly` release yet) can never stall
+the stable feed.
 
-### 10.3 What the manifest states
+### 10.3 What the manifest states — per-channel selection
 
-For every configured component the signer resolves the **latest GitHub release**, selects the
-per-OS/arch assets, downloads each, and records its SHA-256 + size. The asset it selects depends on
-the component's **asset kind** — the signer MUST select the SAME shape the broker will install
-(§9.5), or the broker stages a mislabelled file (a raw executable renamed `dig-node.msi`) and its OS
-installer rejects it (`msiexec` exit 1620):
+For every configured component the signer resolves that channel's GitHub release, selects the
+per-OS/arch assets, downloads each, and records its SHA-256 + size. Which release, which version,
+and which `build` scale depend on the **channel**:
+
+- **stable** — the newest NON-prerelease release (`releases/latest`). The version is the release
+  tag with any leading `v` stripped (`v0.29.0` → `0.29.0`), and the `build` is the packed monotonic
+  number `major·10⁶ + minor·10³ + patch`, so a higher release always sorts higher (§5.3);
+  `minor`/`patch` MUST stay below 1000 to preserve that ordering.
+- **nightly** — the rolling `nightly` release (`releases/tags/nightly`, #590). Its tag carries no
+  version, so the version (`X.Y.Z-nightly.YYYYMMDD.<sha>`) is RECOVERED from the asset file names,
+  and the FULL prerelease string is recorded as the manifest `version` (so the beacon compares
+  against the real installed nightly, not a stripped semver). The `build` is the UTC build date
+  `YYYYMMDD` — strictly increasing day-over-day, exactly the "never install an older nightly"
+  semantic. The stable packed-semver scale and the nightly date scale are DISTINCT and NEVER
+  compared across channels, because each channel keeps its own monotonic trust state (§7.5, #604).
+
+The asset selected within a release depends on the component's **asset kind** — the signer MUST
+select the SAME shape the broker will install (§9.5), or the broker stages a mislabelled file (a raw
+executable renamed `dig-node.msi`) and its OS installer rejects it (`msiexec` exit 1620):
 
 - **raw binary** (digstore, dig-dns, dig-updater — the default) — `{prefix}-{version}-{os}-{arch}`,
   with `.exe` on Windows (e.g. `digstore-0.13.1-windows-x64.exe`, `dig-node-0.31.1-linux-x64`);
@@ -504,13 +539,15 @@ installer rejects it (`msiexec` exit 1620):
   no arch token — both macOS arches resolve to it); Linux `{prefix}_{version}_amd64.deb` (the Debian
   convention — underscores, `amd64`, no `linux` token, e.g. `dig-node_0.31.1_amd64.deb`).
 
-Sibling `.tar.gz`/companion assets are excluded by requiring an EXACT asset-name match. The component
-`build` is the packed monotonic number `major·10⁶ + minor·10³ + patch`, so a higher release always
-sorts higher (§5.3); `minor`/`patch` MUST stay below 1000 to preserve that ordering. The alpha
-component set is **dig-node (native package), digstore, dig-updater, dig-dns (raw binaries)**; each
-component's `asset_kind` and `rollback_floor_build` come from the committed `feed-config.json` (alpha
-default kind `raw_binary`, floor `0`). The component set, per-component asset kind, floor, and
-freshness windows all live in that one reviewable file — never hard-coded in the signer.
+Both channels track the SAME component set with the SAME asset kinds — only the release each
+resolves differs. Sibling `.tar.gz`/companion assets are excluded by requiring an EXACT
+asset-name match. The alpha component set is **dig-node (native package), digstore, dig-updater,
+dig-dns (raw binaries)**; each component's `asset_kind` comes from the committed `feed-config.json`
+(default kind `raw_binary`). The anti-rollback floor is **per channel** (`channels.stable`,
+`channels.nightly` — each on its own build scale, both defaulting to `0` = nothing floored;
+raised deliberately to retire a vulnerable build). The component set, per-component asset kind, the
+per-channel floors, and the freshness windows all live in that one reviewable file — never hard-coded
+in the signer.
 
 ### 10.4 Byte-identical serving — NO transform (normative)
 
@@ -547,29 +584,31 @@ public launch by threshold signing + offline root (tracking follow-up).
 
 Every run PROVES itself before it publishes: CI has the freshly-built beacon — pinning the REAL root
 key — verify the just-signed feed end-to-end (delegation + manifest signatures, freshness, and each
-artifact digest) from a clean build. Publish to EITHER base happens ONLY if that verification passes,
-so a feed that does not verify is never served.
+artifact digest) from a clean build. This keystone runs PER CHANNEL, and publish of a channel to
+EITHER of its bases happens ONLY if THAT channel's verification passes, so a feed that does not
+verify is never served.
 
 ### 10.7 Primary publish + live smoke (updates.dig.net)
 
-After the keystone verify, CI publishes the byte-exact `delegation.json` + `manifest.json` to the
-PRIMARY origin `updates.dig.net` (an S3 bucket fronted by CloudFront, #535) at the key prefix
-`v1/alpha/` — EXACTLY the beacon's `PRIMARY_FEED_BASE` path, so the objects resolve at
-`https://updates.dig.net/v1/alpha/{delegation,manifest}.json`. CI authenticates to S3 with
+After a channel's keystone verify, CI publishes its byte-exact `delegation.json` + `manifest.json`
+to the PRIMARY origin `updates.dig.net` (an S3 bucket fronted by CloudFront, #535) at the key prefix
+`v1/<channel>/` — EXACTLY the beacon's per-channel feed base — so the objects resolve at
+`https://updates.dig.net/v1/<channel>/{delegation,manifest}.json`. CI authenticates to S3 with
 short-lived **OIDC** credentials assuming a least-privilege role (`s3:PutObject` on the feed bucket
 only); no static AWS keys exist in CI. Objects are written with `Content-Type: application/json` and
 no content-encoding so they are served un-transformed (§10.4); CloudFront runs CachingDisabled, so a
 fresh feed is served immediately with no invalidation. The S3 publish is a HARD step — a failure
-reddens the run. CI then SMOKE-TESTS the live primary: it fetches
-`https://updates.dig.net/v1/alpha/manifest.json` and byte-compares it to the exact signed manifest,
-retrying briefly for propagation; a mismatch fails the run.
+reddens that channel's leg. CI then SMOKE-TESTS the live primary: it fetches
+`https://updates.dig.net/v1/<channel>/manifest.json` and byte-compares it to the exact signed
+manifest, retrying briefly for propagation; a mismatch fails the leg. The `stable` leg additionally
+mirrors + byte-exact-smokes the legacy `/v1/alpha` base (§10.1 back-compat).
 
-The GitHub `feed` release (§10.1) is published in the same run as the fallback base, but its publish
-is INDEPENDENT of the primary publish + smoke: it is gated on the keystone verify (§10.6) ALONE, not
-on `updates.dig.net` succeeding. A primary-edge outage — the exact failure the fallback exists to
-hedge — therefore MUST NOT skip the fallback publish. Both bases remain strictly downstream of the
-keystone (an unverified feed is never served to either), and the two refresh independently since the
-beacon selects the freshest manifest by monotonic sequence (§7).
+The GitHub `feed-<channel>` release (§10.1) is published in the same leg as the fallback base, but
+its publish is INDEPENDENT of the primary publish + smoke: it is gated on the keystone verify
+(§10.6) ALONE, not on `updates.dig.net` succeeding. A primary-edge outage — the exact failure the
+fallback exists to hedge — therefore MUST NOT skip the fallback publish. Both bases remain strictly
+downstream of the keystone (an unverified feed is never served to either), and the two refresh
+independently since the beacon selects the freshest manifest by monotonic sequence (§7).
 
 ### 10.8 Transparency log (alpha: log-only, fail-soft)
 
