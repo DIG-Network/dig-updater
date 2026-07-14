@@ -24,7 +24,8 @@ const PLATFORMS: &[(&str, &str)] = &[
     ("windows", "x64"),
 ];
 
-/// The exact release-asset file name a component of `kind` publishes for `(os, arch)` at `version`.
+/// The fixed `(head, tail)` that a component of `kind` wraps its version in, for `(os, arch)`: an
+/// asset's name is always `{head}{version}{tail}`.
 ///
 /// The DIG release repos name assets by two conventions, and the feed MUST select the one the
 /// broker will actually install (#580):
@@ -38,8 +39,26 @@ const PLATFORMS: &[(&str, &str)] = &[
 ///   - Linux `.deb`: `{prefix}_{version}_amd64.deb` — the Debian convention (underscores, `amd64`,
 ///     no `linux` token), e.g. `dig-node_0.31.1_amd64.deb`.
 ///
-/// Any `(os, arch)` outside the fixed [`PLATFORMS`] set falls back to the raw-binary name; the set
+/// Factoring the name into a `head` before the version and a `tail` after it lets BOTH directions
+/// reuse one source of truth: [`expected_asset_name`] builds the name (stable, whose version comes
+/// from the release tag), and [`resolve_version_from_assets`] RECOVERS the version (nightly, whose
+/// version is not in the `nightly` tag but is embedded in the asset file names, #590).
+///
+/// Any `(os, arch)` outside the fixed [`PLATFORMS`] set falls back to the raw-binary shape; the set
 /// is a compile-time constant, so that arm is unreachable in practice and exists only for totality.
+fn asset_name_parts(prefix: &str, os: &str, arch: &str, kind: AssetKind) -> (String, String) {
+    match (kind, os) {
+        (AssetKind::NativePackage, "windows") => {
+            (format!("{prefix}-"), format!("-{os}-{arch}.msi"))
+        }
+        (AssetKind::NativePackage, "macos") => (format!("{prefix}-"), "-macos.pkg".to_string()),
+        (AssetKind::NativePackage, "linux") => (format!("{prefix}_"), "_amd64.deb".to_string()),
+        (_, "windows") => (format!("{prefix}-"), format!("-{os}-{arch}.exe")),
+        _ => (format!("{prefix}-"), format!("-{os}-{arch}")),
+    }
+}
+
+/// The exact release-asset file name a component of `kind` publishes for `(os, arch)` at `version`.
 fn expected_asset_name(
     prefix: &str,
     version: &str,
@@ -47,13 +66,8 @@ fn expected_asset_name(
     arch: &str,
     kind: AssetKind,
 ) -> String {
-    match (kind, os) {
-        (AssetKind::NativePackage, "windows") => format!("{prefix}-{version}-{os}-{arch}.msi"),
-        (AssetKind::NativePackage, "macos") => format!("{prefix}-{version}-macos.pkg"),
-        (AssetKind::NativePackage, "linux") => format!("{prefix}_{version}_amd64.deb"),
-        (_, "windows") => format!("{prefix}-{version}-{os}-{arch}.exe"),
-        _ => format!("{prefix}-{version}-{os}-{arch}"),
-    }
+    let (head, tail) = asset_name_parts(prefix, os, arch, kind);
+    format!("{head}{version}{tail}")
 }
 
 /// A GitHub release, minimally deserialized: just its tag and assets.
@@ -109,8 +123,14 @@ pub struct ResolvedArtifact {
     pub url: String,
 }
 
-/// Select the per-platform artifacts for `component` from `release`, matching each platform's
-/// asset by its exact `{prefix}-{version}-{token}` name.
+/// Select the per-platform artifacts for `component` from `release` at the given `version`,
+/// matching each platform's asset by its exact `{prefix}-{version}-{token}` name.
+///
+/// The `version` is supplied rather than read from the release because it differs per channel
+/// (SPEC §10.1): stable passes the release tag's version (`release.asset_version()`), while nightly
+/// passes the version recovered from the asset names ([`resolve_version_from_assets`]) since the
+/// rolling `nightly` tag carries no version. Selection itself is identical for both — an EXACT
+/// name match on that version — so sibling `.tar.gz`/companion assets stay excluded.
 ///
 /// Returns every platform found (a component that dropped, say, `arm64` yields fewer). Missing a
 /// specific platform is tolerated; resolving ZERO artifacts is an error (a misconfigured prefix or
@@ -122,8 +142,8 @@ pub struct ResolvedArtifact {
 pub fn select_artifacts(
     release: &GithubRelease,
     component: &ComponentConfig,
+    version: &str,
 ) -> Result<Vec<ResolvedArtifact>, FeedsignError> {
-    let version = release.asset_version();
     let mut artifacts = Vec::new();
     for (os, arch) in PLATFORMS {
         let expected = expected_asset_name(
@@ -144,10 +164,48 @@ pub fn select_artifacts(
     if artifacts.is_empty() {
         return Err(FeedsignError::NoArtifacts {
             component: component.name.clone(),
-            expected: format!("{}-{}-<platform>", component.asset_prefix, version),
+            expected: format!("{}-{version}-<platform>", component.asset_prefix),
         });
     }
     Ok(artifacts)
+}
+
+/// Recover the version string shared by a `component`'s assets in a rolling `nightly` release.
+///
+/// A stable release names its version in the tag (`v0.29.0`), but the rolling nightly's tag is the
+/// literal `nightly` — the version (`X.Y.Z-nightly.YYYYMMDD.<sha>`) lives only in the asset FILE
+/// NAMES, which the nightly builder shapes as `{head}{version}{tail}` (#590). This strips the
+/// component's `{head}` and each platform's `{tail}` off the first matching asset; whatever remains
+/// between them is the version. Every asset in one release carries the SAME version, so the first
+/// match is authoritative — and matching on the component's own [`AssetKind`] keeps a native-package
+/// component reading its `.msi`/`.pkg`/`.deb` names rather than a stray raw binary.
+///
+/// # Errors
+///
+/// [`FeedsignError::NoArtifacts`] if no asset matches any platform's `{head}…{tail}` shape (a
+/// component with no nightly assets — the feed fails closed rather than guessing a version).
+pub fn resolve_version_from_assets(
+    release: &GithubRelease,
+    component: &ComponentConfig,
+) -> Result<String, FeedsignError> {
+    for (os, arch) in PLATFORMS {
+        let (head, tail) =
+            asset_name_parts(&component.asset_prefix, os, arch, component.asset_kind);
+        for asset in &release.assets {
+            if let Some(version) = asset
+                .name
+                .strip_prefix(&head)
+                .and_then(|rest| rest.strip_suffix(&tail))
+                .filter(|version| !version.is_empty())
+            {
+                return Ok(version.to_string());
+            }
+        }
+    }
+    Err(FeedsignError::NoArtifacts {
+        component: component.name.clone(),
+        expected: format!("{}-<version>-<platform>", component.asset_prefix),
+    })
 }
 
 #[cfg(test)]
@@ -168,6 +226,16 @@ mod tests {
         ComponentConfig {
             asset_kind: AssetKind::NativePackage,
             ..component()
+        }
+    }
+
+    /// A raw-binary component with `name`/`repo`/`asset_prefix` all set to `name`.
+    fn component_named(name: &str) -> ComponentConfig {
+        ComponentConfig {
+            name: name.into(),
+            repo: format!("DIG-Network/{name}"),
+            asset_prefix: name.into(),
+            asset_kind: AssetKind::RawBinary,
         }
     }
 
@@ -252,7 +320,7 @@ mod tests {
                 asset("dig-node-0.29.0-windows-x64.exe"),
             ],
         };
-        let arts = select_artifacts(&release, &component()).unwrap();
+        let arts = select_artifacts(&release, &component(), "0.29.0").unwrap();
         assert_eq!(arts.len(), 4);
         assert_eq!(arts[0].os, "linux");
         assert_eq!(arts[0].arch, "x64");
@@ -281,7 +349,7 @@ mod tests {
             asset_prefix: "digstore".into(),
             asset_kind: AssetKind::RawBinary,
         };
-        let arts = select_artifacts(&release, &cfg).unwrap();
+        let arts = select_artifacts(&release, &cfg, "0.13.1").unwrap();
         assert_eq!(arts.len(), 1);
         assert_eq!(
             arts[0].url,
@@ -310,7 +378,12 @@ mod tests {
 
     #[test]
     fn native_package_windows_selects_the_msi_not_the_raw_exe() {
-        let arts = select_artifacts(&dig_node_full_release(), &native_package_component()).unwrap();
+        let arts = select_artifacts(
+            &dig_node_full_release(),
+            &native_package_component(),
+            "0.31.1",
+        )
+        .unwrap();
         let windows = arts
             .iter()
             .find(|a| a.os == "windows")
@@ -324,7 +397,12 @@ mod tests {
 
     #[test]
     fn native_package_linux_selects_the_underscore_shaped_deb() {
-        let arts = select_artifacts(&dig_node_full_release(), &native_package_component()).unwrap();
+        let arts = select_artifacts(
+            &dig_node_full_release(),
+            &native_package_component(),
+            "0.31.1",
+        )
+        .unwrap();
         let linux = arts
             .iter()
             .find(|a| a.os == "linux")
@@ -340,7 +418,12 @@ mod tests {
     fn native_package_both_macos_arches_select_the_single_universal_pkg() {
         // dig-node ships ONE universal `-macos.pkg` (no arch token) covering both arm64 and x64, so
         // both platform entries resolve to the same package URL.
-        let arts = select_artifacts(&dig_node_full_release(), &native_package_component()).unwrap();
+        let arts = select_artifacts(
+            &dig_node_full_release(),
+            &native_package_component(),
+            "0.31.1",
+        )
+        .unwrap();
         let macos: Vec<_> = arts.iter().filter(|a| a.os == "macos").collect();
         assert_eq!(macos.len(), 2, "both macOS arches resolve");
         for a in macos {
@@ -357,7 +440,7 @@ mod tests {
     fn a_raw_binary_component_still_selects_the_exe_from_the_same_release() {
         // The default kind is unchanged: digstore/dig-dns/dig-updater keep resolving the raw
         // per-OS binaries, never the packages.
-        let arts = select_artifacts(&dig_node_full_release(), &component()).unwrap();
+        let arts = select_artifacts(&dig_node_full_release(), &component(), "0.31.1").unwrap();
         let windows = arts
             .iter()
             .find(|a| a.os == "windows")
@@ -384,7 +467,7 @@ mod tests {
                 asset("dig-node-0.29.0-windows-x64.exe"),
             ],
         };
-        let arts = select_artifacts(&release, &component()).unwrap();
+        let arts = select_artifacts(&release, &component(), "0.29.0").unwrap();
         assert_eq!(arts.len(), 2);
     }
 
@@ -395,7 +478,58 @@ mod tests {
             assets: vec![asset("some-unrelated-file.zip")],
         };
         assert!(matches!(
-            select_artifacts(&release, &component()),
+            select_artifacts(&release, &component(), "0.29.0"),
+            Err(FeedsignError::NoArtifacts { .. })
+        ));
+    }
+
+    /// Nightly resolution: the rolling `nightly` release's tag carries NO version, so the version
+    /// (`X.Y.Z-nightly.YYYYMMDD.<sha>`) is recovered from the raw-binary asset names.
+    #[test]
+    fn resolves_the_nightly_version_from_raw_binary_asset_names() {
+        let release = GithubRelease {
+            tag_name: "nightly".into(),
+            assets: vec![
+                asset("dig-updater-0.9.0-nightly.20260714.abc1234-linux-x64"),
+                asset("dig-updater-0.9.0-nightly.20260714.abc1234-windows-x64.exe"),
+            ],
+        };
+        let version = resolve_version_from_assets(&release, &component_named("dig-updater"))
+            .expect("recovers the nightly version");
+        assert_eq!(version, "0.9.0-nightly.20260714.abc1234");
+
+        // …and that recovered version drives an exact selection, same as stable.
+        let arts = select_artifacts(&release, &component_named("dig-updater"), &version).unwrap();
+        assert_eq!(arts.len(), 2);
+    }
+
+    /// A native-package component recovers its nightly version from the `.msi`/`.pkg`/`.deb` names
+    /// — including the Debian `_amd64.deb` shape whose head/tail differ from the raw binary.
+    #[test]
+    fn resolves_the_nightly_version_from_native_package_asset_names() {
+        let release = GithubRelease {
+            tag_name: "nightly".into(),
+            assets: vec![
+                asset("dig-node_0.32.0-nightly.20260714.deadbee_amd64.deb"),
+                asset("dig-node-0.32.0-nightly.20260714.deadbee-macos.pkg"),
+                asset("dig-node-0.32.0-nightly.20260714.deadbee-windows-x64.msi"),
+            ],
+        };
+        let version = resolve_version_from_assets(&release, &native_package_component())
+            .expect("recovers the nightly version from package names");
+        assert_eq!(version, "0.32.0-nightly.20260714.deadbee");
+    }
+
+    /// A rolling `nightly` release with no matching component assets fails closed — the feed never
+    /// guesses a version (matters during the #592 fan-out, when a component may lack a nightly yet).
+    #[test]
+    fn nightly_version_resolution_fails_closed_without_matching_assets() {
+        let release = GithubRelease {
+            tag_name: "nightly".into(),
+            assets: vec![asset("some-other-tool-1.0.0-linux-x64")],
+        };
+        assert!(matches!(
+            resolve_version_from_assets(&release, &component()),
             Err(FeedsignError::NoArtifacts { .. })
         ));
     }

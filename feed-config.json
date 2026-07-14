@@ -1,9 +1,12 @@
 {
   "schema": 1,
   "root_version": 1,
-  "rollback_floor_build": 0,
   "manifest_ttl_secs": 43200,
   "delegation_ttl_secs": 2592000,
+  "channels": {
+    "stable": 0,
+    "nightly": 0
+  },
   "components": [
     { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node", "asset_kind": "native_package" },
     { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore" },

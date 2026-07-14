@@ -9,10 +9,15 @@
 //! |--------------------|----------------|-------------------------|--------------------|
 //! | config file        | `--config`          | `FEEDSIGN_CONFIG`           | `feed-config.json` |
 //! | output directory   | `--out`             | `FEEDSIGN_OUT`              | `feed-out`         |
+//! | channel            | `--channel`         | `FEEDSIGN_CHANNEL`          | `stable`           |
 //! | transparency dir   | `--transparency-out`| `FEEDSIGN_TRANSPARENCY_OUT` | (optional)         |
 //! | generated unix ts  | `--generated`       | `FEEDSIGN_GENERATED`        | (required)         |
 //! | signing key (PEM/…)| —                   | `BEACON_SIGNING_KEY`        | (required)         |
 //! | GitHub token       | —                   | `GITHUB_TOKEN`              | (optional)         |
+//!
+//! `--channel stable|nightly` selects which of the two independent feeds to produce (SPEC §10.1);
+//! the workflow runs the signer once per channel. It defaults to `stable` (the legacy behavior —
+//! `releases/latest`) so an invocation with no channel keeps working.
 //!
 //! When `--transparency-out` is set, the signer also writes the transparency-log triple (signed
 //! bytes + detached signature + targets public-key PEM) there, for the workflow to upload to a
@@ -29,7 +34,7 @@
 use std::process::ExitCode;
 
 use dig_updater_feedsign::{
-    assert_pinned_root, produce_feed, signing_key_from_secret, FeedConfig, FeedsignError,
+    assert_pinned_root, produce_feed, signing_key_from_secret, Channel, FeedConfig, FeedsignError,
     GithubSource,
 };
 
@@ -53,6 +58,10 @@ fn run() -> Result<String, FeedsignError> {
     let config_path = input(&args, "--config", "FEEDSIGN_CONFIG")
         .unwrap_or_else(|| "feed-config.json".to_string());
     let out_dir = input(&args, "--out", "FEEDSIGN_OUT").unwrap_or_else(|| "feed-out".to_string());
+    let channel = match input(&args, "--channel", "FEEDSIGN_CHANNEL") {
+        Some(token) => Channel::from_token(&token)?,
+        None => Channel::Stable,
+    };
     let generated = input(&args, "--generated", "FEEDSIGN_GENERATED")
         .ok_or_else(|| {
             FeedsignError::MissingInput(
@@ -80,7 +89,7 @@ fn run() -> Result<String, FeedsignError> {
     let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
     let source = GithubSource::github(token);
 
-    let feed = produce_feed(&config, &source, generated, &signing_key)?;
+    let feed = produce_feed(&config, &source, channel, generated, &signing_key)?;
     feed.write_to(std::path::Path::new(&out_dir))?;
 
     // Optionally emit the transparency-log triple for a public log (Rekor, #533). Derived from the
