@@ -23,6 +23,24 @@ for OTHER components — see `runbooks/` and `SPEC.md` §10 for the feed.
   repo under Settings → Secrets → Actions.
 - No other secret is needed for releasing (the feed's `BEACON_SIGNING_KEY` is unrelated).
 
+## If nightlies silently stop — check for the 60-day cron auto-disable
+
+GitHub disables a `schedule:` trigger after **60 days of no repo activity** on a public repo, with
+**no automatic re-enable** — and since this cron is the *only* automatic release trigger (there is
+no more push-to-main tagger), a quiet repo can go dark with no error anywhere. If nightlies (or a
+long-overdue stable release) stop appearing:
+
+```bash
+gh api repos/DIG-Network/dig-updater/actions/workflows/nightly-release.yml --jq .state
+# "disabled_inactivity" means GitHub turned it off — re-enable it:
+gh workflow enable nightly-release.yml --repo DIG-Network/dig-updater
+```
+
+Any repo activity (a merged PR, a manual dispatch) resets the 60-day counter, so this normally only
+bites a repo that goes fully quiet for two months. (Fleet-wide re-enable checking across every
+releasing submodule is a standing loop-housekeeping concern, not something this repo checks for
+its siblings.)
+
 ## Cut a STABLE release (the normal path)
 
 1. In your feature PR, bump `[workspace.package].version` in the root `Cargo.toml` per SemVer and run
@@ -44,6 +62,13 @@ Same logic as the cron, on demand.
 Actions → **Nightly + stable release** → **Run workflow** → `channel: stable`, **`force: true`** →
 Run. `force` bypasses the skip-if-tagged guard and moves the existing `vX.Y.Z` tag onto a fresh
 changelog commit (`main` is never force-pushed), re-firing `release.yml`.
+
+`force` is guarded, not a blanket override: it REFUSES (non-zero exit, clear error) when the tag
+already has a PUBLISHED release AND currently points at a different commit than this run would
+build — that combination would silently overwrite a shipped release's binaries with different
+code under the same version. It only proceeds for a same-commit retry (the failed-build case
+above) or a tag with no published release yet. If you actually need to ship new code, bump
+`Cargo.toml` and let a normal (non-force) run cut the next version instead.
 
 ## Cut a NIGHTLY on demand
 

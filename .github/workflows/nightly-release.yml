@@ -28,6 +28,13 @@
 # downstream workflows (GitHub anti-recursion) and GITHUB_TOKEN cannot push past branch protection,
 # so releases use the RELEASE_TOKEN org PAT. If RELEASE_TOKEN is absent, every channel NO-OPS with
 # a clear warning instead of half-releasing — add the org secret to enable releases.
+#
+# 60-day auto-disable (GitHub platform behavior, not this workflow's): GitHub disables a
+# `schedule:` trigger after 60 days with NO repo activity on a public repo, with no auto-re-enable
+# — and since #590 removed the push-to-main trigger, this cron is the ONLY automatic release
+# path. If nightlies silently stop, check `gh api repos/<owner>/<repo>/actions/workflows/
+# nightly-release.yml --jq .state` and re-enable with `gh workflow enable nightly-release.yml`
+# (see runbooks/release.md + SPEC.md §14.1).
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 name: Nightly + stable release
 
@@ -99,6 +106,7 @@ jobs:
         shell: bash
         env:
           FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           set -euo pipefail
           crg() {
@@ -113,6 +121,26 @@ jobs:
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
              || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
             if [ "$FORCE" = "true" ]; then
+              # Supply-chain guard: a PUBLISHED release is a shipped artifact — force-moving its
+              # tag onto a different commit would silently overwrite that version's binaries with
+              # code nobody reviewed under it. Only allow the re-cut when it is SAFE: the tag
+              # already points at the commit we're about to build (a legitimate "the build
+              # failed, re-fire release.yml" retry), or the tag has no published release yet (a
+              # repair of a bare/failed tag). Resolve the tag's commit locally first, falling back
+              # to the remote (mirrors the existence check above, which is dual local/remote too).
+              TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" 2>/dev/null || true)"
+              if [ -z "$TAG_COMMIT" ]; then
+                TAG_COMMIT="$(git ls-remote origin "refs/tags/$TAG^{}" 2>/dev/null | cut -f1)"
+              fi
+              if [ -z "$TAG_COMMIT" ]; then
+                TAG_COMMIT="$(git ls-remote origin "refs/tags/$TAG" 2>/dev/null | cut -f1)"
+              fi
+              HEAD_COMMIT="$(git rev-parse HEAD)"
+              IS_PUBLISHED_RELEASE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft == false' 2>/dev/null || echo "false")"
+              if [ "$IS_PUBLISHED_RELEASE" = "true" ] && [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+                echo "::error::refusing to force-move $TAG — a PUBLISHED release already exists for it and the tag points at a different commit ($TAG_COMMIT) than this run's target ($HEAD_COMMIT). force is only for re-cutting the SAME commit (a failed-build retry) or repairing a tag with no published release. Bump the version instead of overwriting a shipped release."
+                exit 1
+              fi
               echo "Tag $TAG already exists but force=true — re-cutting (the tag will be moved)."
               echo "force=true" >>"$GITHUB_OUTPUT"
             else
@@ -274,6 +302,14 @@ jobs:
           # its assets with THIS run's binaries (filenames carry the date+sha, so a stale asset
           # would otherwise linger — clear then upload). Applied to both the immutable dated tag
           # and the rolling `nightly` pointer.
+          #
+          # Delete-then-upload (not `gh release upload --clobber`) is intentional, not an
+          # oversight: each night's filenames embed that day's date+shortsha, so `--clobber`
+          # (which only overwrites SAME-named assets) would never remove the PREVIOUS night's
+          # differently-named leftovers from the rolling `nightly` release — a stale-then-fresh
+          # asset pair would accumulate forever. This does leave a brief assetless window on the
+          # release mid-step; acceptable for this nightly PRE-release channel (stable releases
+          # never take this path).
           refresh_release() {
             local tag="$1"
             gh release view "$tag" --repo "$REPO" >/dev/null 2>&1 \
@@ -295,12 +331,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # `gh release list` runs as its own un-swallowed statement — a real listing failure
+          # (auth/API/network) reds this step per `set -e`, rather than being masked into a silent
+          # empty-prune. Only the DOWNSTREAM grep's exit 1 (its normal "no dated nightlies matched"
+          # on a quiet/new repo) is tolerated — a listing failure surfaces, a genuine empty match
+          # does not.
+          ALL_TAGS="$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')"
           # Dated nightly tags ONLY: `nightly-YYYYMMDD` sorts chronologically as text, so `sort -r`
           # is newest-first. The rolling `nightly` and every `v*` stable tag are excluded by the
           # pattern and are never touched.
           mapfile -t dated < <(
-            gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName' \
-              | grep -E '^nightly-[0-9]{8}$' | sort -r || true
+            printf '%s\n' "$ALL_TAGS" | grep -E '^nightly-[0-9]{8}$' | sort -r || [ $? -eq 1 ]
           )
           # Everything past the newest KEEP_NIGHTLIES is pruned — release AND git tag together.
           for tag in "${dated[@]:$KEEP_NIGHTLIES}"; do

@@ -125,6 +125,38 @@ fn stable_job_keeps_the_skip_if_already_tagged_guard() {
 }
 
 #[test]
+fn force_recut_refuses_to_move_a_published_release_onto_a_different_commit() {
+    let wf = nightly_release();
+    // Supply-chain guard (#590 review): `force=true` may re-cut the SAME commit (a failed-build
+    // retry) or repair a tag with no published release, but must NEVER silently move an existing
+    // PUBLISHED release's tag onto a DIFFERENT commit — that would overwrite shipped binaries
+    // with unreviewed code under the same version number. The force branch must (a) resolve the
+    // existing tag's commit, (b) compare it against the commit this run would build, (c) check
+    // whether a published (non-draft) GitHub release already sits at that tag, and (d) refuse
+    // with a non-zero exit when both are true.
+    assert!(
+        wf.contains("TAG_COMMIT") && wf.contains("HEAD_COMMIT"),
+        "the force branch must resolve both the existing tag's commit and this run's target \
+         commit so it can compare them before moving the tag"
+    );
+    assert!(
+        wf.contains("gh release view \"$TAG\"") && wf.contains("isDraft"),
+        "the force branch must check whether a PUBLISHED (non-draft) release already exists at \
+         the tag via `gh release view ... --json isDraft`"
+    );
+    assert!(
+        wf.contains("IS_PUBLISHED_RELEASE") && wf.contains("TAG_COMMIT\" != \"$HEAD_COMMIT\""),
+        "the force branch must refuse specifically when the release is published AND the tag's \
+         commit differs from the target commit — same-commit re-cuts and no-release repairs \
+         must remain allowed"
+    );
+    assert!(
+        wf.contains("::error::refusing to force-move"),
+        "the refusal must surface as a `::error::` annotation naming the guard, not a silent skip"
+    );
+}
+
+#[test]
 fn nightly_job_publishes_a_dated_and_a_rolling_prerelease() {
     let wf = nightly_release();
     assert!(

@@ -907,6 +907,13 @@ The orchestrator triggers ONLY on:
 It MUST NOT trigger on `push` to `main`. A schedule run exercises BOTH channels; a dispatch runs the
 selected channel(s).
 
+**60-day auto-disable caveat.** GitHub auto-disables a `schedule:` trigger after 60 days with no
+repo activity on a public repo, with no auto-re-enable — and since this cron is the ONLY automatic
+release trigger, a quiet repo can silently stop releasing with no error surfaced anywhere. Detect
+it with `gh api repos/<owner>/<repo>/actions/workflows/nightly-release.yml --jq .state` (a value of
+`disabled_inactivity` means it was auto-disabled) and recover with `gh workflow enable
+nightly-release.yml` (see `runbooks/release.md`). Any repo activity resets the 60-day counter.
+
 ### 14.2 Stable channel
 
 Cuts a semver `vX.Y.Z` **stable** release when — and only when — the version in the root
@@ -922,6 +929,16 @@ that moves `latest`.
 `force: true` on a manual dispatch bypasses the skip-if-tagged guard and re-cuts the current version
 (moving the existing tag onto a fresh changelog commit — `main` is never force-pushed). This is the
 manual "re-release this version" escape hatch (e.g. after a failed build).
+
+**Force is guarded against mutating a published release (supply-chain invariant).** A force re-cut
+MUST be refused — with a non-zero exit and a clear error — when BOTH: (a) a PUBLISHED (non-draft)
+GitHub Release already exists at the version's `vX.Y.Z` tag, AND (b) that tag currently points at a
+commit DIFFERENT from the commit this run would build. Moving a published release's tag to
+different code would silently replace its shipped binaries with unreviewed code under the same
+version number. Force MAY proceed when either condition is false: a same-commit re-cut (the tag
+already points at the commit being built — a legitimate "the build failed, re-fire `release.yml`"
+retry) or a tag with no published release yet (repairing a bare/failed tag). A version that
+genuinely needs new code released MUST bump `Cargo.toml`, not force-move an existing tag.
 
 ### 14.3 Nightly channel
 
