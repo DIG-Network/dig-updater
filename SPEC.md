@@ -441,10 +441,11 @@ serves BOTH wins.
 | Primary (production) | `https://updates.dig.net/v1/alpha` | `…/v1/alpha/delegation.json` | `…/v1/alpha/manifest.json` |
 | Fallback (alpha, baked-in) | `https://github.com/DIG-Network/dig-updater/releases/download/feed` | `…/feed/delegation.json` | `…/feed/manifest.json` |
 
-The alpha channel ships on the FALLBACK — a rolling GitHub release tagged `feed` — so it works with
-NO AWS dependency. `updates.dig.net` (its own S3+CloudFront, ticket #504-I(b)) becomes primary by a
-deploy-time flip once its OIDC role lands; that is a transport change, not a code change, because
-both bases are untrusted (§1).
+Each run publishes to **both** bases (§10.7). `updates.dig.net` (its own S3+CloudFront, #535) is the
+PRIMARY the beacon tries first; the rolling GitHub `feed` release is the always-available fallback.
+Because both bases are untrusted transport (§1) and the beacon prefers the freshest manifest by
+monotonic `sequence`, keeping them in lock-step is a resilience hedge, not a trust dependency — a
+client that reaches either base installs the identical verified bytes.
 
 ### 10.2 Cadence + freshness
 
@@ -504,11 +505,40 @@ public launch by threshold signing + offline root (tracking follow-up).
 
 Every run PROVES itself before it publishes: CI has the freshly-built beacon — pinning the REAL root
 key — verify the just-signed feed end-to-end (delegation + manifest signatures, freshness, and each
-artifact digest) from a clean build. Publish to the `feed` release happens ONLY if that verification
-passes, so a feed that does not verify is never served. The `dig-release-resolver` crate (a cleaner
-replacement for the inline GitHub-release resolution), the beacon's own native packages, the
-installer's registration of the beacon service, and the `dig-node` updater RPC proxy are follow-up
-tickets (§12).
+artifact digest) from a clean build. Publish to EITHER base happens ONLY if that verification passes,
+so a feed that does not verify is never served.
+
+### 10.7 Primary publish + live smoke (updates.dig.net)
+
+After the keystone verify, CI publishes the byte-exact `delegation.json` + `manifest.json` to the
+PRIMARY origin `updates.dig.net` (an S3 bucket fronted by CloudFront, #535) at the key prefix
+`v1/alpha/` — EXACTLY the beacon's `PRIMARY_FEED_BASE` path, so the objects resolve at
+`https://updates.dig.net/v1/alpha/{delegation,manifest}.json`. CI authenticates to S3 with
+short-lived **OIDC** credentials assuming a least-privilege role (`s3:PutObject` on the feed bucket
+only); no static AWS keys exist in CI. Objects are written with `Content-Type: application/json` and
+no content-encoding so they are served un-transformed (§10.4); CloudFront runs CachingDisabled, so a
+fresh feed is served immediately with no invalidation. The S3 publish is a HARD step — a failure
+reddens the run. CI then SMOKE-TESTS the live primary: it fetches
+`https://updates.dig.net/v1/alpha/manifest.json` and byte-compares it to the exact signed manifest,
+retrying briefly for propagation; a mismatch fails the run. The GitHub `feed` release (§10.1) is
+published in the same run as the fallback base.
+
+### 10.8 Transparency log (alpha: log-only, fail-soft)
+
+Each run records the signed **manifest** in a PUBLIC append-only transparency log
+(`rekor.sigstore.dev`, #533), so any observer can independently prove a given manifest was publicly
+logged — turning a silent targets-key compromise into a publicly-visible one. The signer emits the
+log inputs alongside the feed (`--transparency-out`): the manifest's canonical signed bytes (§5.4,
+reused verbatim — not re-serialized), the detached 64-byte Ed25519 signature over them, and the
+targets public key as an Ed25519 SubjectPublicKeyInfo PEM. In alpha this is **log-only and
+FAIL-SOFT**: a log outage degrades to a warning and NEVER blocks the 6-hour heartbeat (§7), and the
+recorded entry index is written beside the feed (`rekor-entry.json`) and into the job summary. The
+beacon does NOT yet require an inclusion proof — that verification is a **beta** client obligation
+(#533, deferred).
+
+The `dig-release-resolver` crate (a cleaner replacement for the inline GitHub-release resolution),
+the beacon's own native packages, the installer's registration of the beacon service, and the
+`dig-node` updater RPC proxy are follow-up tickets (§12).
 
 ---
 
@@ -541,7 +571,10 @@ alpha ships on the pinned-key + monotonic-freshness floor without them:
 
 - 2-of-N root threshold with ≥1 offline root key, KMS/HSM-backed signing, and rotation of the
   alpha pinned key.
-- A transparency log (e.g. Rekor/tough) recording signed manifests for external auditability.
+- **Beacon-side transparency verification.** Alpha already records every signed manifest in the
+  public `rekor.sigstore.dev` log (§10.8, log-only + fail-soft); beta adds the beacon-side
+  inclusion-proof check (fetch the log entry + verify the manifest is included) as a required gate,
+  and picks the durable entry type for the Ed25519 key (full-artifact `rekord` or Ed25519ph).
 - A full Windows AppContainer sandbox for the fetch/verify worker (alpha: restricted-token /
   low-integrity).
 

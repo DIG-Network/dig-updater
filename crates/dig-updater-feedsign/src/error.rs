@@ -57,6 +57,11 @@ pub enum FeedsignError {
     #[error("io: {0}")]
     Io(String),
 
+    /// A just-produced feed could not be reduced to its transparency-log inputs (§10, #533). This
+    /// cannot happen for a feed this signer produced — it fails closed rather than panicking.
+    #[error("transparency: {0}")]
+    Transparency(String),
+
     /// A required input (the generated timestamp, output dir, or signing secret) was absent.
     #[error("missing input: {0}")]
     MissingInput(String),
