@@ -249,9 +249,10 @@ fn resolve_feed(feed_base: Option<String>) -> Vec<FeedSource> {
 /// or advances trust state; also never gates on a pause ([`Broker::run_once_with_feed`] does —
 /// inspecting what the beacon WOULD do stays available while paused).
 fn run_dry_check(feed_base: Option<String>, json: bool) -> ExitCode {
-    // `for_dry_check` (not `new`) so `DIG_UPDATER_STATE_DIR` can point an UNELEVATED check at a
-    // writable state dir — the dry verify never installs, so this can't defeat anti-rollback, and
-    // it lets the signed-feed keystone verify without Admin rights (#540).
+    // `for_dry_check` (not `new`) so an UNELEVATED check relocates off the Admin/SYSTEM-owned
+    // default on its own (#582), or honors an explicit `DIG_UPDATER_STATE_DIR` override — the dry
+    // verify never installs, so this can't defeat anti-rollback, and it's what lets the
+    // signed-feed keystone verify without Admin rights (#540).
     let broker = match Broker::for_dry_check() {
         Ok(b) => b,
         Err(e) => return fail(&e, json),
@@ -259,6 +260,9 @@ fn run_dry_check(feed_base: Option<String>, json: bool) -> ExitCode {
     match broker.dry_check(resolve_feed(feed_base)) {
         Ok(report) => {
             println!("{}", render_report(&report, json));
+            if should_print_staging_directive(&report, json) {
+                eprintln!("{STAGING_IO_ERROR_DIRECTIVE}");
+            }
             match report {
                 WorkerReport::Verified(_) => ExitCode::SUCCESS,
                 WorkerReport::Rejected { .. } => ExitCode::from(2),
@@ -266,6 +270,24 @@ fn run_dry_check(feed_base: Option<String>, json: bool) -> ExitCode {
         }
         Err(e) => fail(&e, json),
     }
+}
+
+/// The actionable remedy printed alongside a `staging_io_error` dry-check rejection (#582): the
+/// raw failure alone ("rejected (staging_io_error): ... os error 183") doesn't tell an operator
+/// WHAT to do about it — the auto-relocation ([`Broker::for_dry_check`]) already handles the
+/// common case, so reaching this message means even the per-user fallback location wasn't usable
+/// (e.g. an explicit `DIG_UPDATER_STATE_DIR` pointed somewhere unwritable).
+const STAGING_IO_ERROR_DIRECTIVE: &str = "dig-updater: the dry check could not stage the feed's \
+    artifacts for verification. Try: running from an elevated (Administrator/root) console, \
+    setting DIG_UPDATER_STATE_DIR to a directory you can write to, or running `dig-updater \
+    status` to see the last-known state without staging anything.";
+
+/// Whether [`STAGING_IO_ERROR_DIRECTIVE`] belongs alongside this report: only for the human
+/// (non-JSON) render, and only for the specific rejection it explains. A JSON consumer already has
+/// the structured `"reason": "staging_io_error"` code to branch on (§6.2) and should never have to
+/// filter prose out of its parsed output.
+fn should_print_staging_directive(report: &WorkerReport, json: bool) -> bool {
+    !json && matches!(report, WorkerReport::Rejected { reason, .. } if reason == "staging_io_error")
 }
 
 /// Run one FULL update pass — [`Broker::run_once_with_feed`] — and print the report. This is the
@@ -855,6 +877,31 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["status"], "verified");
         assert_eq!(parsed["sequence"], 42);
+    }
+
+    #[test]
+    fn staging_directive_accompanies_only_a_human_staging_io_error_rejection() {
+        // #582: a bare `staging_io_error` gets the actionable remedy — but only for a human
+        // reader; a JSON consumer already has the structured reason code to branch on.
+        let staging_rejected = WorkerReport::Rejected {
+            reason: "staging_io_error".into(),
+            detail: "os error 183".into(),
+        };
+        assert!(should_print_staging_directive(&staging_rejected, false));
+        assert!(
+            !should_print_staging_directive(&staging_rejected, true),
+            "JSON output must stay parseable prose-free"
+        );
+    }
+
+    #[test]
+    fn staging_directive_never_accompanies_an_unrelated_rejection_or_a_verified_report() {
+        let other_rejection = WorkerReport::Rejected {
+            reason: "manifest_expired".into(),
+            detail: "expired at 1, now 2".into(),
+        };
+        assert!(!should_print_staging_directive(&other_rejection, false));
+        assert!(!should_print_staging_directive(&verified_report(), false));
     }
 
     #[test]

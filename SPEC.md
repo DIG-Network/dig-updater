@@ -785,7 +785,7 @@ Administrator/root.
                                            // reports its plan action ("install"/"update"/"skip")
       "result":    "installed",           // a dry check reports "staged"; a full pass reports
                                            // "installed"/"skipped"/"deferred"/"rolled_back"
-      "detail":    "0.25.0 -> 0.26.0"
+      "detail":    "dig-node now reports dig-node 0.26.0"
     }
   ],
   "next_wake":  1731076400,               // a best-effort ESTIMATE (now + 24h) if the daily
@@ -808,6 +808,16 @@ Administrator/root.
   last check/run's `last_check*`/`components` history rather than clobbering it. Writing this file
   is BEST-EFFORT: a failure to persist it MUST NOT fail the check/run/config-change itself — only
   `config.json`/`trust-state.json` are security-load-bearing; `status.json` is informational.
+- **An `installed` component's `detail` states VERIFIED reality, never a plan-time prediction.**
+  For a full pass, the health gate (§9.5) re-probes the version actually running at the
+  component's destination immediately after installing it; the persisted `detail` for a
+  `"result": "installed"` entry MUST be built from that re-probed version (e.g. `"dig-node now
+  reports dig-node 0.26.0"`), NOT from the pre-install plan's predicted transition (which the
+  conformant CLI still shows separately, before the install runs, via `action`). A beacon that
+  persists the plan's prediction verbatim as the post-install detail is non-conformant: an
+  operator reading `status.json` after the fact would be reading what the pass INTENDED, not what
+  it verified actually happened. `last_check`/`last_check_kind` timestamp every snapshot, so a
+  reader can always tell a persisted detail is only as current as that timestamp.
 - **Always answerable, never an error on absence.** A missing (or, for an unprivileged reader,
   inaccessible) `status.json` MUST be reported as a well-formed "never checked" snapshot — schema
   + version + the default channel/pause + every other field `null`/empty — NOT an error. Only a
@@ -836,16 +846,37 @@ The feed base is overridable per `--feed-base <url>`/`$DIG_UPDATER_FEED_BASE` on
 alike (untrusted transport, §1); the pinned root key has no such override.
 
 **Dry-check state directory (`$DIG_UPDATER_STATE_DIR`).** A DRY `check` MUST run without write access
-to the Admin/SYSTEM-only default state directory. When `$DIG_UPDATER_STATE_DIR` is set to a non-empty
-path, the dry check uses it as its state directory (and derives the `-status` sibling from it, §13.2);
-when unset or empty it falls back to the hardened OS default. This override applies ONLY to the dry
-check — the full pass / install path (`run`, `check --now`) ALWAYS uses the hardened default and is
-never relocatable, so the anti-rollback trust state can never be pointed at a directory an
-unprivileged process can roll back (§6, §9.3). Because a dry verify must download and digest-verify
-each artifact into a staging directory, an UNWRITABLE state dir makes the worker unable to stage and a
-valid, correctly-signed feed is reported as a `staging_io_error` rejection rather than verified; the
-override is how an unprivileged operator or CI (e.g. the signed-feed end-to-end keystone) runs `check`
-successfully.
+to the Admin/SYSTEM-only default state directory. Resolution order:
+
+1. `$DIG_UPDATER_STATE_DIR`, when set to a non-empty path — an explicit choice always wins (e.g. the
+   signed-feed end-to-end keystone, #540).
+2. Otherwise, the hardened OS default — but ONLY when this process can actually use it (elevated
+   AND the directory is genuinely writable). An "elevated" console MAY still be denied by an unusual
+   ACL, so elevation alone is not sufficient; a conformant beacon PROBES writability rather than
+   trusting elevation as a proxy for it.
+3. Otherwise, a per-user writable location (`%LOCALAPPDATA%\DIG\updater` on Windows;
+   `$XDG_CACHE_HOME/dig-updater`, falling back to `$HOME/.cache/dig-updater`, then the OS temp dir,
+   on Unix).
+
+This override/fallback applies ONLY to the dry check — the full pass / install path (`run`,
+`check --now`) ALWAYS uses the hardened default and is never relocatable, so the anti-rollback trust
+state can never be pointed at a directory an unprivileged process can roll back (§6, §9.3).
+
+Because a dry verify must download and digest-verify each artifact into a staging directory, an
+UNWRITABLE state dir makes the worker unable to stage. This is why step 3 exists (#582): without it,
+an everyday unprivileged `dig-updater check` would hit the pre-existing Admin/SYSTEM-owned default,
+and — because `CreateDirectory`/`mkdir` reports "already exists" for a directory that is genuinely
+already there just as readily as for a real collision, while the metadata read `create_dir_all` would
+otherwise use to tell the two apart is ITSELF access-denied against that directory — the raw, cryptic
+OS error code would propagate verbatim instead of a clean relocation. A conformant worker also
+tolerates that "already exists" outcome explicitly rather than trusting the metadata-read recovery,
+and proves usability with a real write, so a directory that exists but is genuinely unwritable is
+reported as an honest "not writable" detail rather than a bare OS error code. If even the resolved
+staging location is unusable (e.g. an explicit `$DIG_UPDATER_STATE_DIR` pointed somewhere unwritable),
+the dry check still reports a `staging_io_error` rejection — a conformant CLI's HUMAN-readable
+(non-JSON) rendering MUST accompany that specific rejection with an actionable remedy (run elevated;
+set `$DIG_UPDATER_STATE_DIR` to a writable directory; or use `status`, which never stages anything) —
+the `--json` rendering stays exactly the structured worker report (§9), unchanged.
 
 **Fail-soft status refresh.** The verify VERDICT a `check` reports (`.status`) is authoritative and
 independent of whether `status.json` (§13.2) could be written. A failure to refresh the status mirror

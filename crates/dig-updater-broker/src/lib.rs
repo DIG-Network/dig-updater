@@ -116,14 +116,18 @@ impl Broker {
     }
 
     /// A broker for a DRY check ([`Self::dry_check`]) — like [`Self::new`], but its state dir comes
-    /// from [`paths::dry_check_state_dir`], so [`paths::STATE_DIR_ENV`] can point an UNELEVATED
-    /// `dig-updater check` at a writable directory. A dry check never installs and never advances
-    /// the trust state, so relocating its state dir is safe; the install/full-pass path
-    /// ([`Self::new`]) stays pinned to the hardened default, keeping anti-rollback non-overridable.
+    /// from [`paths::dry_check_state_dir`]: an explicit [`paths::STATE_DIR_ENV`] override wins;
+    /// otherwise the hardened default is used when THIS process can actually use it, else a
+    /// per-user writable location. A dry check never installs and never advances the trust state,
+    /// so relocating its state dir is safe; the install/full-pass path ([`Self::new`]) stays pinned
+    /// to the hardened default, keeping anti-rollback non-overridable.
     ///
-    /// This is what lets the signed feed's end-to-end keystone verify UNELEVATED (#540): without a
-    /// writable state dir the worker cannot create its staging directory, and a valid, correctly
-    /// signed feed comes back as a `staging_io_error` rejection rather than a verified verdict.
+    /// This is what lets the signed feed's end-to-end keystone verify UNELEVATED (#540) — an
+    /// explicit env override — and, more broadly, what lets an everyday unprivileged
+    /// `dig-updater check` succeed without ever touching the Admin/SYSTEM-owned default (#582):
+    /// without a writable state dir the worker cannot create its staging directory, and a valid,
+    /// correctly signed feed would otherwise come back as a `staging_io_error` rejection — or a
+    /// bare `os error 183` — rather than a verified verdict.
     ///
     /// # Errors
     ///
@@ -610,11 +614,14 @@ mod tests {
         assert_eq!(broker.state_dir(), override_dir.path());
         std::env::remove_var(paths::STATE_DIR_ENV);
 
-        // With the override cleared, it falls back to the hardened OS default — the install path is
-        // never relocatable.
+        // With the override cleared, it resolves EXACTLY like `paths::dry_check_state_dir` does —
+        // the hardened default when this process can actually use it, else a per-user fallback
+        // (#582, so an everyday unprivileged `check` never even attempts the Admin/SYSTEM-owned
+        // default). That branching is unit-tested in isolation in `paths::tests`; this only proves
+        // `for_dry_check` wires through to the real resolver end-to-end.
         assert_eq!(
             Broker::for_dry_check().expect("resolves").state_dir(),
-            paths::default_state_dir()
+            paths::dry_check_state_dir()
         );
     }
 
