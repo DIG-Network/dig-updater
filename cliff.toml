@@ -1,7 +1,7 @@
 # git-cliff changelog config — builds CHANGELOG.md from Conventional Commits.
-# Uniform across every DIG repo. Consumed by .github/workflows/release.yml, which
-# regenerates the changelog on merge and commits it BEFORE tagging (so the changelog is
-# included in the vX.Y.Z tag). See the ecosystem release contract (§3.6).
+# Uniform across every DIG repo. Consumed by nightly-release.yml's stable channel (the
+# nightly cron + manual dispatch), which regenerates the changelog + commits + tags.
+# See the ecosystem release contract (§3.6).
 [changelog]
 header = """
 # Changelog
