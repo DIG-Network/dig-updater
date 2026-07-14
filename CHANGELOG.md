@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.0] - 2026-07-14
+
+### Features
+- Dig-updater CLI — check --now, channel, pause, status --json (#512) (#7)
+
 ## [0.5.1] - 2026-07-13
 
 ### Bug Fixes
