@@ -114,6 +114,26 @@ impl Broker {
         })
     }
 
+    /// A broker for a DRY check ([`Self::dry_check`]) — like [`Self::new`], but its state dir comes
+    /// from [`paths::dry_check_state_dir`], so [`paths::STATE_DIR_ENV`] can point an UNELEVATED
+    /// `dig-updater check` at a writable directory. A dry check never installs and never advances
+    /// the trust state, so relocating its state dir is safe; the install/full-pass path
+    /// ([`Self::new`]) stays pinned to the hardened default, keeping anti-rollback non-overridable.
+    ///
+    /// This is what lets the signed feed's end-to-end keystone verify UNELEVATED (#540): without a
+    /// writable state dir the worker cannot create its staging directory, and a valid, correctly
+    /// signed feed comes back as a `staging_io_error` rejection rather than a verified verdict.
+    ///
+    /// # Errors
+    ///
+    /// [`BrokerError::Io`] if the worker binary path cannot be resolved.
+    pub fn for_dry_check() -> Result<Self, BrokerError> {
+        Ok(Self {
+            state_dir: paths::dry_check_state_dir(),
+            worker_path: paths::sibling_worker_binary()?,
+        })
+    }
+
     /// A broker with explicit paths — used by tests and custom deployments.
     #[must_use]
     pub fn with_paths(state_dir: PathBuf, worker_path: PathBuf) -> Self {
@@ -539,6 +559,25 @@ mod tests {
             PathBuf::from("/var/lib/dig-updater/staging")
         );
         assert_eq!(broker.lkg_dir(), PathBuf::from("/var/lib/dig-updater/lkg"));
+    }
+
+    #[test]
+    fn for_dry_check_honors_the_state_dir_env_override() {
+        // #540: the fix that lets an UNELEVATED `check` (e.g. the signed-feed keystone) run against
+        // a writable state dir instead of the Admin-only default. No other test reads this env, so
+        // setting it here does not race the parallel suite.
+        let override_dir = tempfile::tempdir().expect("override dir");
+        std::env::set_var(paths::STATE_DIR_ENV, override_dir.path());
+        let broker = Broker::for_dry_check().expect("resolves the sibling worker binary");
+        assert_eq!(broker.state_dir(), override_dir.path());
+        std::env::remove_var(paths::STATE_DIR_ENV);
+
+        // With the override cleared, it falls back to the hardened OS default — the install path is
+        // never relocatable.
+        assert_eq!(
+            Broker::for_dry_check().expect("resolves").state_dir(),
+            paths::default_state_dir()
+        );
     }
 
     #[test]

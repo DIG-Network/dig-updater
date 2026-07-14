@@ -1,9 +1,19 @@
 //! Filesystem locations the broker uses: the Admin/SYSTEM-only state directory, its WORLD-READABLE
 //! status sibling, and the sibling `dig-updater-worker` binary.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::error::BrokerError;
+
+/// The environment variable that relocates the state directory FOR A DRY CHECK ONLY
+/// ([`dry_check_state_dir`]). It exists so an unprivileged operator — or CI, such as the signed
+/// feed's end-to-end keystone (#540) — can run `dig-updater check` without write access to the
+/// Admin/SYSTEM-only default state dir. It deliberately does NOT relocate the install/full-pass
+/// state dir ([`default_state_dir`]): the anti-rollback trust state MUST stay in the hardened
+/// default so an unprivileged process can never point the beacon at a state it can roll back
+/// (SPEC §6, §9.3).
+pub const STATE_DIR_ENV: &str = "DIG_UPDATER_STATE_DIR";
 
 /// The default state directory for the beacon.
 ///
@@ -13,7 +23,8 @@ use crate::error::BrokerError;
 ///
 /// This is where the persisted [`TrustState`](dig_updater_trust::TrustState) and
 /// [`UpdaterConfig`](crate::config::UpdaterConfig) live, so an unprivileged process cannot roll
-/// either back (SPEC §6, §9.3, §13.1).
+/// either back (SPEC §6, §9.3, §13.1). The full-pass/install path ALWAYS uses this — it is never
+/// overridable, so relocating it can never defeat anti-rollback.
 #[must_use]
 pub fn default_state_dir() -> PathBuf {
     #[cfg(windows)]
@@ -25,6 +36,25 @@ pub fn default_state_dir() -> PathBuf {
     #[cfg(unix)]
     {
         PathBuf::from("/var/lib/dig-updater")
+    }
+}
+
+/// The state directory a DRY check uses: [`STATE_DIR_ENV`] when set to a non-empty path, else
+/// [`default_state_dir`]. A dry check neither installs nor advances the trust state (it only reads
+/// state for freshness context and writes the informational status mirror), so relocating it to a
+/// writable directory is safe — unlike the install path, which is never overridable.
+#[must_use]
+pub fn dry_check_state_dir() -> PathBuf {
+    resolve_dry_check_state_dir(std::env::var_os(STATE_DIR_ENV))
+}
+
+/// Pure resolver behind [`dry_check_state_dir`]: a non-empty override wins; an unset or empty
+/// value falls back to the hardened OS default. Split out so the precedence is unit-testable
+/// without mutating the process environment.
+fn resolve_dry_check_state_dir(override_dir: Option<OsString>) -> PathBuf {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => default_state_dir(),
     }
 }
 
@@ -115,6 +145,31 @@ mod tests {
         assert_eq!(
             default_status_dir(),
             sibling_status_dir(&default_state_dir())
+        );
+    }
+
+    #[test]
+    fn dry_check_state_dir_prefers_a_non_empty_env_override() {
+        // #540: the signed-feed keystone runs `check` UNELEVATED, so it must be able to point the
+        // dry check at a writable dir instead of the Admin-only default.
+        let override_dir = OsString::from(if cfg!(windows) {
+            r"C:\tmp\dig-updater-ci"
+        } else {
+            "/tmp/dig-updater-ci"
+        });
+        assert_eq!(
+            resolve_dry_check_state_dir(Some(override_dir.clone())),
+            PathBuf::from(override_dir)
+        );
+    }
+
+    #[test]
+    fn dry_check_state_dir_falls_back_to_the_default_when_unset_or_empty() {
+        // Unset and empty both mean "no override" — never a surprise empty-path state dir.
+        assert_eq!(resolve_dry_check_state_dir(None), default_state_dir());
+        assert_eq!(
+            resolve_dry_check_state_dir(Some(OsString::new())),
+            default_state_dir()
         );
     }
 

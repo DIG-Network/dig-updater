@@ -137,3 +137,26 @@ fn dry_check_loads_state_spawns_worker_and_never_writes_state() {
         "dry_check must not write the trust state"
     );
 }
+
+#[test]
+fn dry_check_still_returns_its_verdict_when_the_status_mirror_cannot_be_written() {
+    // #540 regression guard: refreshing status.json (SPEC §13.2) is a best-effort SIDE EFFECT.
+    // A failure to write it — as happens when `check` runs unelevated against an Admin-only status
+    // dir — must warn and continue, NEVER change the verdict or the exit path. Here the status dir
+    // path is occupied by a regular file, so `create_dir_all` on it fails exactly like a denied
+    // write would, while the (writable) state dir still lets the worker run to completion.
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let broker = Broker::with_paths(state_dir.path().to_path_buf(), worker_binary());
+    std::fs::write(broker.status_dir(), b"not a directory").expect("occupy the status dir path");
+
+    let server = Server::start(test_feed());
+    let report = broker
+        .dry_check(vec![FeedSource::new(&server.base)])
+        .expect("an unwritable status mirror must not fail the dry check");
+
+    // The verdict is still produced (Rejected here only because the worker pins the production
+    // key against a test-signed feed) — the status-write failure did not suppress it.
+    assert!(matches!(report, WorkerReport::Rejected { .. }));
+    // The best-effort write left no status.json behind (the path is a file, not a dir).
+    assert!(!broker.status_dir().join("status.json").exists());
+}

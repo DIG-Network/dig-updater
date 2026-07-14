@@ -200,6 +200,28 @@ change diary.
   inheritance and keeps a test's arbitrary tempdir-based `state_dir` and the real default
   automatically in lockstep, with no second hard-coded path to drift.
 
+## Dry check must run unelevated (-I keystone, #540)
+
+- **A dry `check` STAGES to disk, so an unwritable state dir turns a VALID feed into a
+  `staging_io_error` rejection — not a status-write problem.** The signed-feed keystone (`feed.yml`)
+  runs `dig-updater check` UNELEVATED on the CI runner. The worker downloads + digest-verifies each
+  artifact by streaming it into `create_dir_all(<state_dir>/staging)`; under the Admin-only default
+  (`/var/lib/dig-updater`) that create is denied (EACCES), and because staging is load-bearing for
+  the digest check, a correctly-signed feed that verified cleanly comes back as a `Rejected`
+  (`staging_io_error`) → `check` exits 2 → the keystone's `.status=="verified"` never emits. The
+  `could not refresh status.json` line in the same log is a CO-SYMPTOM of the same unwritable dir,
+  and that path was ALREADY fail-soft (a warning, never the exit code). Fix: `Broker::for_dry_check`
+  resolves its state dir from `$DIG_UPDATER_STATE_DIR` (dry-check ONLY — the install/full-pass path
+  stays pinned to the hardened default so anti-rollback is never relocatable), and `feed.yml` points
+  the keystone step at a writable `${{ runner.temp }}` dir. Regression evidence:
+  `valid_feed_with_an_uncreatable_staging_dir_reports_staging_io_not_a_verification_failure`
+  (worker e2e — the exact conflation) + `for_dry_check_honors_the_state_dir_env_override`.
+- **A test feed can never exercise the staging step through the broker/CLI.** The shipped worker
+  pins the production key, so any locally-signed feed is rejected at `verify_update_chain` (step 5)
+  BEFORE `create_dir_all(staging)` (step 6). The staging path is therefore only reachable in a
+  worker-level test that injects a matching test root key (`worker::run(req, test_root)`) — which is
+  why the #540 reproduction lives in `dig-updater-worker/tests/e2e.rs`, not the broker's.
+
 ## Release CI
 
 - **A GitHub Actions `run:` step defaults to PowerShell on the Windows runner — a bash `\`

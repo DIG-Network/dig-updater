@@ -222,6 +222,47 @@ fn full_dry_verify_pass_accepts_and_stages() {
     assert_eq!(hex::encode(Sha256::digest(&on_disk)), staged.sha256);
 }
 
+/// Root-cause evidence for #540: a feed that verifies cleanly is STILL reported as a
+/// `staging_io_error` rejection when the staging directory cannot be created — because staging
+/// the artifact bytes is load-bearing for the digest check. This is exactly what defeated the
+/// `feed.yml` keystone: run UNELEVATED, the worker's staging dir defaulted under the Admin-only
+/// state dir (`/var/lib/dig-updater/staging`), `create_dir_all` was denied, and a valid,
+/// correctly-signed feed came back non-verified → `dig-updater check` exited 2. The fix is NOT in
+/// the worker (a dry verify genuinely needs a writable scratch dir to hash into) but in giving the
+/// dry check a WRITABLE staging location (see `Broker::for_dry_check` + `DIG_UPDATER_STATE_DIR`).
+#[test]
+fn valid_feed_with_an_uncreatable_staging_dir_reports_staging_io_not_a_verification_failure() {
+    let srv = TestServer::bind();
+    let artifact = b"the-real-dig-node-artifact-bytes";
+    let manifest = base_manifest(&srv.base, artifact, artifact.len() as u64);
+    let routes = feed_routes(&root(), &targets(), 1, FAR_FUTURE, &manifest, artifact);
+
+    // Make the staging path un-creatable in a permission-free, cross-platform way: its parent is a
+    // regular FILE, so `create_dir_all` fails just as an EACCES under `/var/lib` would on CI.
+    let tmp = TempDir::new().expect("scratch dir");
+    let blocking_file = tmp.path().join("parent-is-a-file");
+    std::fs::write(&blocking_file, b"x").expect("write blocking file");
+    let staging = blocking_file.join("staging");
+
+    let _guard = srv.serve(routes);
+    let req = request(
+        std::slice::from_ref(&srv.base),
+        TrustState::initial(),
+        600_000,
+        &staging,
+    );
+    let result = run(&req, &root().verifying_key());
+
+    // The trust chain verified — the ONLY failure is that the artifact could not be staged. The
+    // worker classifies this distinctly (`staging_io_error`), never as a security rejection.
+    let err = result.expect_err("an uncreatable staging dir must fail the pass");
+    assert_eq!(
+        err.code(),
+        "staging_io_error",
+        "a write/permission failure must NOT be reported as a verification rejection"
+    );
+}
+
 #[test]
 fn feed_ladder_falls_back_to_second_source() {
     let srv = TestServer::bind();
