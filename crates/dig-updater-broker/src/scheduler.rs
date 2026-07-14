@@ -82,6 +82,7 @@ mod imp {
     use crate::elevation::require_elevated;
     use crate::error::BrokerError;
     use crate::install::trusted_absolute;
+    use crate::proc::HideConsole;
     use crate::secure::harden_state_dir;
 
     /// The absolute, trusted path to `schtasks.exe` — never a bare name resolved through `PATH`.
@@ -126,6 +127,7 @@ mod imp {
             .args(["/Create", "/TN", WINDOWS_TASK_PATH, "/XML"])
             .arg(&tmp)
             .arg("/F")
+            .hide_console()
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run schtasks: {e}")))?;
         let _ = std::fs::remove_file(&tmp);
@@ -149,6 +151,7 @@ mod imp {
         require_elevated()?;
         let output = Command::new(schtasks()?)
             .args(["/Delete", "/TN", WINDOWS_TASK_PATH, "/F"])
+            .hide_console()
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run schtasks: {e}")))?;
         if output.status.success() {
@@ -167,6 +170,7 @@ mod imp {
     pub(super) fn status() -> Result<ScheduleStatus, BrokerError> {
         let output = Command::new(schtasks()?)
             .args(["/Query", "/TN", WINDOWS_TASK_PATH])
+            .hide_console()
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run schtasks: {e}")))?;
         Ok(if output.status.success() {
@@ -236,6 +240,7 @@ mod imp {
     use crate::elevation::require_elevated;
     use crate::error::BrokerError;
     use crate::install::first_trusted;
+    use crate::proc::HideConsole;
 
     const UNIT_DIR: &str = "/etc/systemd/system";
 
@@ -266,6 +271,7 @@ mod imp {
     fn run(systemctl: &Path, args: &[&str]) -> Result<std::process::Output, BrokerError> {
         Command::new(systemctl)
             .args(args)
+            .hide_console()
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run systemctl: {e}")))
     }
@@ -355,6 +361,7 @@ mod imp {
     use crate::elevation::require_elevated;
     use crate::error::BrokerError;
     use crate::install::first_trusted;
+    use crate::proc::HideConsole;
 
     fn plist_path() -> PathBuf {
         PathBuf::from("/Library/LaunchDaemons").join(format!("{LAUNCHD_LABEL}.plist"))
@@ -388,6 +395,7 @@ mod imp {
         let output = Command::new(launchctl()?)
             .args(["bootstrap", "system"])
             .arg(&path)
+            .hide_console()
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run launchctl: {e}")))?;
         if !output.status.success() {
@@ -414,6 +422,7 @@ mod imp {
                 .args(["bootout", &format!("system/{LAUNCHD_LABEL}")])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .hide_console()
                 .status();
         }
         let _ = std::fs::remove_file(plist_path());
@@ -424,6 +433,7 @@ mod imp {
             .args(["print", &format!("system/{LAUNCHD_LABEL}")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .hide_console()
             .status()
             .map(|s| s.success())
             .unwrap_or(false);

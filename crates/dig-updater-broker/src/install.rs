@@ -32,6 +32,7 @@ use dig_updater_trust::verify_sha256;
 use crate::error::BrokerError;
 use crate::hashing::open_no_symlink;
 use crate::plan::{InstallMethod, PlannedComponent};
+use crate::proc::HideConsole;
 
 /// The extension of the broker-private raw-binary copy that is renamed over `dest`. It lives in the
 /// (root-owned) destination directory so the final install is an atomic same-filesystem rename.
@@ -398,7 +399,7 @@ fn run_installer(argv: &[String]) -> InstallOutcome {
             detail: "empty install command".to_string(),
         };
     };
-    match Command::new(program).args(args).status() {
+    match Command::new(program).args(args).hide_console().status() {
         Ok(status) if status.success() => InstallOutcome::Installed,
         Ok(status) => InstallOutcome::Failed {
             detail: format!("{program} exited with {status}"),

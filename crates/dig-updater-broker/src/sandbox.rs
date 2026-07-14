@@ -88,6 +88,7 @@ mod imp {
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use crate::proc::HideConsole;
 
     /// True when the broker runs as root (uid 0) and therefore MUST drop privilege before running
     /// network-facing code.
@@ -130,7 +131,8 @@ mod imp {
         let mut cmd = Command::new(worker);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            .hide_console();
 
         if sandbox == Sandbox::Restricted && is_root() {
             let (uid, gid) = nobody_ids();
@@ -179,6 +181,7 @@ mod imp {
     use super::*;
     use std::io;
     use std::process::{Command, Stdio};
+    use crate::proc::HideConsole;
 
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
@@ -205,7 +208,8 @@ mod imp {
                 let mut cmd = Command::new(worker);
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit());
+                    .stderr(Stdio::inherit())
+                    .hide_console();
                 communicate(cmd, input)
             }
             // The production posture: run under a restricted token.
