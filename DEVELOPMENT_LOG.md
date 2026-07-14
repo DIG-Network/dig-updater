@@ -256,7 +256,41 @@ change diary.
   PowerShell handles. Rule: any `run:` step that relies on bash syntax (`\` continuation, `$VAR`,
   `[ ]` tests) on a multi-OS matrix MUST declare `shell: bash` (Git Bash ships on every hosted
   runner). Regression guard: `tests/release_workflow_shell.rs` asserts every `\`-continuation step
-  in `release.yml` declares `shell: bash`.
+  in the cross-OS build workflow declares `shell: bash`.
+
+- **Nightlies system (#590): the cron detecting "the version's tag doesn't exist yet" IS the
+  version-changed check — no diffing needed.** Converting the on-merge tagger to a nightly cron kept
+  ALL the stable logic verbatim; only the trigger changed (`push: branches: main` →
+  `schedule: '0 0 * * *'` + `workflow_dispatch`). Because the stable job already skipped when the
+  `vX.Y.Z` tag existed, running it nightly instead of per-merge needs zero new "did the version
+  change?" logic: an unchanged version = the tag exists = a no-op; a bumped version = a new tag =
+  cut. The old `!startsWith(head_commit.message, 'chore(release):')` loop-guard becomes INERT on
+  schedule/dispatch (there is no `head_commit`), but is harmless and kept as defense if a push
+  trigger is ever re-introduced.
+- **Nightly version is synthesized at BUILD time, never committed:**
+  `X.Y.Z-nightly.YYYYMMDD.<shortsha>` (semver prerelease → sorts below `X.Y.Z`, so a nightly can
+  never outrank the stable release of the same version). Dated tag `nightly-YYYYMMDD` for history +
+  a force-moved rolling `nightly` tag for a stable "latest nightly" URL. Always `--prerelease
+  --latest=false` — only a stable release moves `latest`.
+- **Rolling-release asset hygiene:** because nightly filenames carry the date+sha, `gh release
+  upload --clobber` alone would let yesterday's assets linger on the rolling `nightly` release
+  forever (different names never collide). The publish step deletes ALL existing assets
+  (`gh release delete-asset`) before uploading this run's — for both the dated and the rolling tag.
+- **`nightly*` tags must NOT match the stable build's `v*` trigger.** `release.yml` is
+  `on: push: tags: v*`; `nightly-YYYYMMDD` and `nightly` don't match, so the nightly channel builds
+  + publishes directly and never accidentally fires the stable-release build.
+- **Reusable build (`build-binaries.yml`, `on: workflow_call`) is the DRY win of the reference:**
+  both `release.yml` (stable) and the nightly channel call it, so the two paths can't diverge on how
+  a binary is produced. Artifacts uploaded inside a called reusable workflow ARE downloadable by the
+  caller's later jobs (same run id). The #504 Windows-shell guard follows the build step to
+  wherever it lives — now `build-binaries.yml`, the ONLY workflow with Windows-runner jobs (the
+  scan is scoped to it; ubuntu-only steps in other workflows already default to bash and are
+  intentionally out of scope, else the guard false-positives).
+- **Fan-out caveats flagged for the templates:** npm stacks replace the OS matrix with an npm
+  publish under a `nightly` dist-tag (never `latest`); static-site services have no binary artifact
+  (a nightly = an optional deploy to a nightly origin); Rust crates publish to crates.io on the
+  stable tag (a crates.io "nightly" isn't meaningful — nightly is GitHub-prerelease-only there).
+  The stable-channel cron conversion + the RELEASE_TOKEN/idempotency posture are the portable core.
 
 ## "Beacon never updates" — the three LIVE P1 root causes (#546/#580/#581, v0.8.0)
 
