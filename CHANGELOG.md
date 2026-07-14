@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.2] - 2026-07-14
+
+### Bug Fixes
+- **broker:** Suppress child-process console windows (CREATE_NO_WINDOW) (#577) (#12)
+
 ## [0.7.1] - 2026-07-14
 
 ### Bug Fixes
