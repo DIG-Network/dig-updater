@@ -60,6 +60,7 @@ pub fn harden_state_dir(path: &Path) -> Result<(), BrokerError> {
 /// artifact) and kept for a directory (the state/staging/last-known-good/apply dirs).
 #[cfg(windows)]
 fn harden_windows_path(path: &Path) -> Result<(), BrokerError> {
+    use crate::proc::HideConsole;
     use std::process::Command;
     let inherit = if path.is_dir() { "(OI)(CI)" } else { "" };
     let status = Command::new(icacls_program()?)
@@ -68,6 +69,7 @@ fn harden_windows_path(path: &Path) -> Result<(), BrokerError> {
         .args(["/grant:r", &format!("*S-1-5-32-544:{inherit}F")]) // Administrators, full
         .args(["/grant:r", &format!("*S-1-5-18:{inherit}F")]) // Local System, full
         .args(["/grant:r", &format!("*S-1-3-4:{inherit}F")]) // Owner rights — the creator keeps access
+        .hide_console()
         .output()
         .map_err(|e| BrokerError::Io(format!("could not run icacls: {e}")))?;
     if !status.status.success() {
@@ -139,6 +141,7 @@ pub fn harden_public_status_path(path: &Path) -> Result<(), BrokerError> {
 /// owner rights full, `Everyone` read+execute).
 #[cfg(windows)]
 fn harden_windows_public_status_path(path: &Path) -> Result<(), BrokerError> {
+    use crate::proc::HideConsole;
     use std::process::Command;
     let inherit = if path.is_dir() { "(OI)(CI)" } else { "" };
     let status = Command::new(icacls_program()?)
@@ -148,6 +151,7 @@ fn harden_windows_public_status_path(path: &Path) -> Result<(), BrokerError> {
         .args(["/grant:r", &format!("*S-1-5-18:{inherit}F")]) // Local System, full
         .args(["/grant:r", &format!("*S-1-3-4:{inherit}F")]) // Owner rights — the creator keeps access
         .args(["/grant:r", &format!("*S-1-1-0:{inherit}RX")]) // Everyone, read + execute
+        .hide_console()
         .output()
         .map_err(|e| BrokerError::Io(format!("could not run icacls: {e}")))?;
     if !status.status.success() {

@@ -57,6 +57,7 @@ mod pass;
 pub mod paths;
 mod persist;
 pub mod plan;
+pub mod proc;
 pub mod rollback;
 pub mod sandbox;
 pub mod scheduler;

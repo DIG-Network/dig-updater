@@ -45,6 +45,7 @@ pub fn require(is_elevated: impl FnOnce() -> bool) -> Result<(), BrokerError> {
 #[cfg(windows)]
 #[must_use]
 pub fn is_elevated() -> bool {
+    use crate::proc::HideConsole;
     use std::process::{Command, Stdio};
 
     // `net session` succeeds only from an elevated console — the same probe dig-relay's and
@@ -65,6 +66,7 @@ pub fn is_elevated() -> bool {
         .arg("session")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .hide_console()
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

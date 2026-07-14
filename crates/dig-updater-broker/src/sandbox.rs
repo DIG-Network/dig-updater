@@ -85,6 +85,7 @@ pub fn prepare_worker_writable_dir(dir: &Path, sandbox: Sandbox) -> Result<(), B
 #[cfg(unix)]
 mod imp {
     use super::*;
+    use crate::proc::HideConsole;
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -130,7 +131,8 @@ mod imp {
         let mut cmd = Command::new(worker);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            .hide_console();
 
         if sandbox == Sandbox::Restricted && is_root() {
             let (uid, gid) = nobody_ids();
@@ -177,6 +179,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use crate::proc::HideConsole;
     use std::io;
     use std::process::{Command, Stdio};
 
@@ -205,7 +208,8 @@ mod imp {
                 let mut cmd = Command::new(worker);
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit());
+                    .stderr(Stdio::inherit())
+                    .hide_console();
                 communicate(cmd, input)
             }
             // The production posture: run under a restricted token.
