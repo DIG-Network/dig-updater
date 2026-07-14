@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.0] - 2026-07-14
+
+### Features
+- S3-primary feed publish to updates.dig.net + Rekor transparency (U4, #535/#533) (#10)
+
 ## [0.6.2] - 2026-07-14
 
 ### Bug Fixes
