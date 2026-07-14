@@ -1,10 +1,10 @@
 //! The pinned beacon **root** public key.
 //!
 //! The root key's **public** half is compiled into every beacon binary here; its
-//! **private** half exists only as the `BEACON_SIGNING_KEY` GitHub Actions secret on
-//! `DIG-Network/dig-updater`, used by CI to sign the update feed. The private key is
-//! NEVER committed to this repo and NEVER printed. The PEM form of this same key is
-//! committed at `keys/beacon-root.pub` for out-of-band inspection.
+//! **private** half exists only as the `feed-signing` GitHub Environment secret on
+//! `DIG-Network/dig-updater`, scoped to the `main` branch, and is used by CI to sign the
+//! update feed. The private key is NEVER committed to this repo and NEVER printed. The PEM
+//! form of this same key is committed at `keys/beacon-root.pub` for out-of-band inspection.
 //!
 //! Pinning the key in the binary is what makes the signature — not the transport — the
 //! gate: an attacker who controls the CDN, DNS, or TLS still cannot produce a manifest
@@ -13,10 +13,10 @@
 //! ## Alpha-floor custody
 //!
 //! For the alpha channel this is a **single** Ed25519 root key whose private half lives
-//! in a CI secret (per the #504 alpha-floor clearance). Before public launch this is
-//! hardened to a 2-of-N threshold with at least one offline root and a KMS/HSM-backed
-//! signer, and this pinned key is rotated. That hardening is a tracked follow-up, not part
-//! of the alpha; see SPEC.md § "Signing hierarchy".
+//! in an environment-scoped GitHub Actions secret (per the #504 alpha-floor clearance).
+//! Before public launch this is hardened to a 2-of-N threshold with at least one offline
+//! root and a KMS/HSM-backed signer, and this pinned key is rotated. That hardening is a
+//! tracked follow-up, not part of the alpha; see SPEC.md § "Signing hierarchy".
 
 use base64::Engine as _;
 use ed25519_dalek::VerifyingKey;
@@ -26,8 +26,8 @@ use ed25519_dalek::VerifyingKey;
 ///
 /// This is the raw key, NOT the SubjectPublicKeyInfo DER — the PEM at `keys/beacon-root.pub`
 /// wraps these same 32 bytes in the 12-byte Ed25519 SPKI header. The private half is the
-/// `BEACON_SIGNING_KEY` CI secret; it is never in this repo.
-pub const BEACON_ROOT_PUBKEY_B64: &str = "ZcjI14QiJ1Qety2clrKoDEkJyehiSBRoiYylEfiW3JI=";
+/// `feed-signing` GitHub Environment secret; it is never in this repo.
+pub const BEACON_ROOT_PUBKEY_B64: &str = "FIwQOAGI3D0pwEP2oAkvlOqEoM6LoxRliLUxQPjpeJ0=";
 
 /// Decode [`BEACON_ROOT_PUBKEY_B64`] into an Ed25519 [`VerifyingKey`].
 ///
@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn pinned_key_matches_committed_pem() {
         // The single base64 line inside keys/beacon-root.pub (the SPKI DER).
-        const PEM_DER_B64: &str = "MCowBQYDK2VwAyEAZcjI14QiJ1Qety2clrKoDEkJyehiSBRoiYylEfiW3JI=";
+        const PEM_DER_B64: &str = "MCowBQYDK2VwAyEAFIwQOAGI3D0pwEP2oAkvlOqEoM6LoxRliLUxQPjpeJ0=";
         // Standard Ed25519 SubjectPublicKeyInfo prefix (RFC 8410).
         const ED25519_SPKI_PREFIX: [u8; 12] = [
             0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,

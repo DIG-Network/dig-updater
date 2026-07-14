@@ -97,12 +97,12 @@ conformant build MUST verify they agree:
 The current alpha root key is:
 
 ```
-BEACON_ROOT_PUBKEY_B64 = "ZcjI14QiJ1Qety2clrKoDEkJyehiSBRoiYylEfiW3JI="
-raw (hex)              = 65c8c8d7842227541eb72d9c96b2a80c4909c9e862481468898ca511f896dc92
+BEACON_ROOT_PUBKEY_B64 = "FIwQOAGI3D0pwEP2oAkvlOqEoM6LoxRliLUxQPjpeJ0="
+raw (hex)              = 148c10380188dc3d29c043f6a0092f94ea84a0ce8ba3146588b53140f8e9789d
 ```
 
-The **private** half is the `BEACON_SIGNING_KEY` GitHub Actions secret on
-`DIG-Network/dig-updater`. It MUST NEVER be committed to the repository and MUST NEVER be
+The **private** half is the `feed-signing` GitHub Environment secret on `DIG-Network/dig-updater`,
+scoped to the `main` branch. It MUST NEVER be committed to the repository and MUST NEVER be
 printed in logs. CI uses it to sign the feed (§10).
 
 ### 4.3 Alpha floor vs production
@@ -484,11 +484,21 @@ Signing runs ONLY in CI (`.github/workflows/feed.yml`), in the `dig-updater-feed
 CI-only workspace member NEVER packaged into a shipped beacon binary. It signs through the SAME
 trust core the beacon verifies with (`SignedManifest::sign` / `SignedDelegation::sign` over
 `signing_bytes`, §5.4), so the signer and the verifier cannot drift. The private key exists only as
-the `BEACON_SIGNING_KEY` secret (§4.2); it flows secret → env → the signer process and is NEVER
-exported or logged (the job summary prints only the sequence, timestamp, and public digests). Before
-signing, the signer confirms the key derives the pinned root public key (§4.2) and refuses to sign
-otherwise (fail closed). The alpha floor signs the delegation AND the manifest with the one key
-(root == targets, §4.3).
+the `feed-signing` GitHub Environment secret (§4.2), scoped to the `main` branch; it flows secret →
+env → the signer process and is NEVER exported or logged (the job summary prints only the sequence,
+timestamp, and public digests). Before signing, the signer confirms the key derives the pinned root
+public key (§4.2) and refuses to sign otherwise (fail closed). The alpha floor signs the delegation
+AND the manifest with the one key (root == targets, §4.3).
+
+**Environment protection (main-only deployment branch policy):** The `feed-signing` secret MUST be
+restricted to GitHub environment protection rules that gate signing to the `main` branch ONLY. No
+per-run required reviewer is imposed (doing so would block the 6-hour cron re-sign pending human
+approval, but a delay >12h would allow the manifest to expire — §7 anti-freeze — structurally
+breaking the auto-update heartbeat). Residual risk of unreviewed-branch signing is closed by the
+`if: github.ref == 'refs/heads/main'` guard in the workflow, combined with main's branch protection
+rules (§10.6 self-proving publish ensures feed verification before serving). The unreviewed-code
+merged to main is an alpha-accepted CI-custody residual (§11.2 hardening path); it is closed at
+public launch by threshold signing + offline root (tracking follow-up).
 
 ### 10.6 Self-proving publish
 
