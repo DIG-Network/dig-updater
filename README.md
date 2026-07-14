@@ -80,8 +80,9 @@ The dedicated `scheduler-elevated` CI job runs both on all three OSes on every P
 
 - `keys/beacon-root.pub` — the root public key (PEM). The matching base64 is compiled into
   `dig-updater-trust` as `BEACON_ROOT_PUBKEY_B64`; a unit test asserts the two agree.
-- The **private** half is the `BEACON_SIGNING_KEY` GitHub Actions secret on this repo, used by
-  CI to sign the feed. It is never committed and never printed.
+- The **private** half is the `BEACON_SIGNING_KEY` secret of the **`feed-signing` GitHub
+  Environment** (deployment branch policy: `main` only), used by CI to sign the feed on `main`
+  only. It is never committed and never printed.
 
 ## Status
 
