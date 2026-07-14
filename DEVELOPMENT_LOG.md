@@ -257,3 +257,47 @@ change diary.
   `[ ]` tests) on a multi-OS matrix MUST declare `shell: bash` (Git Bash ships on every hosted
   runner). Regression guard: `tests/release_workflow_shell.rs` asserts every `\`-continuation step
   in `release.yml` declares `shell: bash`.
+
+## "Beacon never updates" — the three LIVE P1 root causes (#546/#580/#581, v0.8.0)
+
+A user's installed beacon had NEVER self-updated. Three independent, all-load-bearing causes — fix
+one and it still fails on the next:
+
+- **The daily schedule was registered ONCE and never re-asserted → permanent death (#546).** The
+  installer runs `dig-updater schedule install` exactly once; no pass re-registered it, so the
+  moment the `\DIG\dig-updater` SYSTEM task went missing, NOTHING could ever wake a pass again.
+  Fix: every full pass now `scheduler::ensure()`s its own schedule FIRST (before even the pause
+  gate), re-registering a *provably absent* artifact. Self-heal is only meaningful because a pass
+  triggered for ANY reason (a manual elevated run, the installer, a sibling tool) now resurrects the
+  wake — a beacon that is already dead-and-never-invoked still needs one external kick.
+- **`net session` is a false-negative elevation probe.** The old Windows elevation check shelled out
+  to `net session`, which fails when the **Server (`LanmanServer`) service is stopped** — reporting
+  "not elevated" from a genuinely-elevated console and blocking the scheduler's own registration.
+  Replaced with the process token's real elevation state (`GetTokenInformation`/`TokenElevation`) —
+  no external-service dependency. (Same trap would bite any DIG CLI that copied the `net session`
+  idiom.)
+- **`schtasks /Query` conflates ABSENT with ACCESS-DENIED.** Every non-zero exit was mapped to
+  `installed:false`, so an ACL-locked-but-present task looked missing — which both lied to `schedule
+  status` and would have driven the self-heal to needlessly recreate it. Presence is now TRISTATE
+  (Registered / provably-Absent via `0x8004131F`/file-not-found / Unknown via `0x80070005`/"access is
+  denied"); the self-heal re-registers ONLY provably-Absent. Default for an unrecognized (e.g.
+  localized) failure stays Absent, so the common not-found case still self-heals.
+- **feedsign signed the raw `.exe` but the broker installs dig-node via MSI → `msiexec` 1620 (#580).**
+  The signer's platform table mapped Windows → `windows-x64.exe` for EVERY component, so dig-node's
+  feed pointed at the raw PE; the broker staged those bytes as `dig-node.msi` and `msiexec /i`
+  rejected the renamed PE (ERROR_INSTALL_PACKAGE_INVALID, 1620) and rolled back. dig-node's releases
+  DO ship `-windows-x64.msi` / `-macos.pkg` / `_<ver>_amd64.deb` alongside the raw binaries — the
+  feed just never selected them. Fix: a per-component `asset_kind` (raw_binary vs native_package) in
+  `feed-config.json` drives the asset name; dig-node → the package, everything else stays raw. NOTE:
+  the deb is the Debian convention `{prefix}_{ver}_amd64.deb` (underscores, no `linux` token) and the
+  macOS pkg is ONE universal `{prefix}-{ver}-macos.pkg` (no arch) — both arches resolve to it. This
+  fix needs a **feed RE-SIGN** to take effect (the on-disk signed manifest still points at the raw
+  exe until `feed.yml` re-runs).
+- **The install catalog hardcoded `C:\Program Files\DIG`, but the installer uses
+  `%LOCALAPPDATA%\Programs\DigStore\bin` → updates landed in a phantom dir (#581).** The beacon
+  "successfully" updated + health-verified a binary in a directory the user's binaries were NOT in,
+  so the running binary never changed. Fix: the catalog derives its install root from the beacon's
+  OWN `current_exe().parent()` — the universal installer drops every DIG binary (incl. `dig-updater`)
+  in one bin dir, so components install as SIBLINGS of the running beacon, auto-matching wherever the
+  installer put things with zero cross-repo path config. Falls back to the per-OS default only if
+  `current_exe()` can't be resolved. This is the installer↔beacon install-root contract (SYSTEM.md).

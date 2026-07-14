@@ -375,6 +375,24 @@ this beacon depends on (§9.3) — Unix unit/plist files follow the platform con
 root-owned, mode `0644` (world-readable, root-writable only, matching how `systemctl status`/
 `launchctl print` are expected to work for any user).
 
+**Self-heal (MANDATORY).** The artifact is registered by the installer, but a schedule that is
+registered exactly ONCE and never re-asserted dies permanently the moment it goes missing — after
+which no scheduled pass can ever fire again. Therefore **every full pass, before it does anything
+else (before even the pause gate, so a paused beacon keeps its wake alive), MUST ensure its own
+schedule is registered**: it queries the artifact's presence and, when the artifact is *provably
+absent*, re-registers it. This is best-effort and non-fatal — a pass that cannot register (an
+unprivileged invocation) or cannot determine presence continues. Registration is idempotent.
+
+**Presence is TRISTATE, not a boolean.** Querying the artifact MUST distinguish three outcomes:
+*registered*, *provably absent* (the OS reported "no such task" — Windows `ERROR_FILE_NOT_FOUND` /
+`0x8004131F`, absent unit/plist files), and *undeterminable* (the query failed for another reason,
+e.g. access-denied — Windows `0x80070005` — when an unprivileged caller inspects the SYSTEM task).
+A status query MUST NOT report *undeterminable* as *absent*: the self-heal MUST re-register ONLY a
+*provably absent* artifact (never an *undeterminable* one, or it could clobber a present-but-
+unreadable task), and `schedule status` MUST NOT tell a user "NOT REGISTERED" when it merely could
+not read the task. Removing the artifact (`schedule uninstall`) MUST also remove the now-empty
+containing folder (Windows `\DIG`) so an empty folder cannot masquerade as a partial install.
+
 ---
 
 ## 9. Verification algorithm (normative)
@@ -425,6 +443,19 @@ MUST be backward-compatible: a build's on-disk state MUST remain readable by the
 prior build, so a rollback never bricks on unreadable state and never destroys data
 (no destructive down-migration).
 
+**Install root — the SAME location the user's binaries actually live.** The broker MUST install to,
+and health-probe, the directory where the installed binaries actually are — NOT a hardcoded path.
+The install root is derived from the **running beacon's own executable location**: the universal
+installer places every DIG binary (including `dig-updater`) in one install bin dir, so the beacon
+resolves that dir as the parent of its own `current_exe()` and installs each component as a SIBLING
+of itself (falling back to the conventional per-OS path only if its own path cannot be resolved).
+A raw-binary component is replaced at `{root}/{name}` (`.exe` on Windows); a native-package
+component's OS installer owns its own target, and `{root}/{name}` is where the beacon PROBES its
+installed version. This is the installer↔beacon contract: **the installer and the beacon agree on
+the install root because the beacon derives it from where the installer placed the beacon** (recorded
+in the superproject `SYSTEM.md`). Installing to a decoupled hardcoded directory — the prior bug —
+left the user's real binary un-updated while the beacon reported success against a phantom copy.
+
 ---
 
 ## 10. The feed + signing (CI)
@@ -461,14 +492,25 @@ deterministic and reproducible.
 ### 10.3 What the manifest states
 
 For every configured component the signer resolves the **latest GitHub release**, selects the
-per-OS/arch binary assets — named `{prefix}-{version}-{platform-token}` (e.g.
-`dig-node-0.29.0-linux-x64`, `digstore-0.13.1-windows-x64.exe`; sibling `.tar.gz`/companion assets
-are excluded) — downloads each, and records its SHA-256 + size. The component `build` is the packed
-monotonic number `major·10⁶ + minor·10³ + patch`, so a higher release always sorts higher (§5.3);
-`minor`/`patch` MUST stay below 1000 to preserve that ordering. The alpha component set is
-**dig-node, digstore, dig-updater, dig-dns**; `rollback_floor_build` comes from the committed
-`feed-config.json` (alpha default `0`). The component set, floor, and freshness windows all live in
-that one reviewable file — never hard-coded in the signer.
+per-OS/arch assets, downloads each, and records its SHA-256 + size. The asset it selects depends on
+the component's **asset kind** — the signer MUST select the SAME shape the broker will install
+(§9.5), or the broker stages a mislabelled file (a raw executable renamed `dig-node.msi`) and its OS
+installer rejects it (`msiexec` exit 1620):
+
+- **raw binary** (digstore, dig-dns, dig-updater — the default) — `{prefix}-{version}-{os}-{arch}`,
+  with `.exe` on Windows (e.g. `digstore-0.13.1-windows-x64.exe`, `dig-node-0.31.1-linux-x64`);
+- **native package** (dig-node) — the platform installer's native asset name: Windows
+  `{prefix}-{version}-{os}-{arch}.msi`; macOS `{prefix}-{version}-macos.pkg` (ONE universal package,
+  no arch token — both macOS arches resolve to it); Linux `{prefix}_{version}_amd64.deb` (the Debian
+  convention — underscores, `amd64`, no `linux` token, e.g. `dig-node_0.31.1_amd64.deb`).
+
+Sibling `.tar.gz`/companion assets are excluded by requiring an EXACT asset-name match. The component
+`build` is the packed monotonic number `major·10⁶ + minor·10³ + patch`, so a higher release always
+sorts higher (§5.3); `minor`/`patch` MUST stay below 1000 to preserve that ordering. The alpha
+component set is **dig-node (native package), digstore, dig-updater, dig-dns (raw binaries)**; each
+component's `asset_kind` and `rollback_floor_build` come from the committed `feed-config.json` (alpha
+default kind `raw_binary`, floor `0`). The component set, per-component asset kind, floor, and
+freshness windows all live in that one reviewable file — never hard-coded in the signer.
 
 ### 10.4 Byte-identical serving — NO transform (normative)
 
@@ -674,9 +716,11 @@ field is added) so a consumer can tell which fields to expect.
 Persisted at `<state_dir>/config.json` — the SAME Admin/SYSTEM-only directory as
 `trust-state.json` (§6, §9.3), so it inherits the identical directory-level lock-down. Mutating it
 is therefore a privileged operation, gated at the CLI layer by the same elevation check the
-scheduler artifact's own registration uses (§8.4): Windows `net session` (an elevated console),
-Unix effective uid `0`. Reading it is not itself privilege-gated by the beacon — in practice the
-Admin/SYSTEM-only directory means only a privileged reader can open it at all.
+scheduler artifact's own registration uses (§8.4): on Windows the process token's ACTUAL elevation
+state (`GetTokenInformation`/`TokenElevation` — not group membership, and not a `net session` shell-
+out, which false-negatives whenever the Server service is stopped), on Unix effective uid `0`.
+Reading it is not itself privilege-gated by the beacon — in practice the Admin/SYSTEM-only directory
+means only a privileged reader can open it at all.
 
 ```jsonc
 // config.json
