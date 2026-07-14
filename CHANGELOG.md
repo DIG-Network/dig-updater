@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.9.0] - 2026-07-14
+
+### Features
+- **feed:** Per-channel signed feeds (stable + nightly) + feedsign nightly selection (#603) (#17)
+
+### CI
+- **release:** Nightlies polish (#16)
+
 ## [0.8.2] - 2026-07-14
 
 ### CI
