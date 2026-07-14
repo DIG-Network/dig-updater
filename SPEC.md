@@ -520,8 +520,14 @@ no content-encoding so they are served un-transformed (§10.4); CloudFront runs 
 fresh feed is served immediately with no invalidation. The S3 publish is a HARD step — a failure
 reddens the run. CI then SMOKE-TESTS the live primary: it fetches
 `https://updates.dig.net/v1/alpha/manifest.json` and byte-compares it to the exact signed manifest,
-retrying briefly for propagation; a mismatch fails the run. The GitHub `feed` release (§10.1) is
-published in the same run as the fallback base.
+retrying briefly for propagation; a mismatch fails the run.
+
+The GitHub `feed` release (§10.1) is published in the same run as the fallback base, but its publish
+is INDEPENDENT of the primary publish + smoke: it is gated on the keystone verify (§10.6) ALONE, not
+on `updates.dig.net` succeeding. A primary-edge outage — the exact failure the fallback exists to
+hedge — therefore MUST NOT skip the fallback publish. Both bases remain strictly downstream of the
+keystone (an unverified feed is never served to either), and the two refresh independently since the
+beacon selects the freshest manifest by monotonic sequence (§7).
 
 ### 10.8 Transparency log (alpha: log-only, fail-soft)
 
