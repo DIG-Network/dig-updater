@@ -24,6 +24,12 @@
 # CachingDisabled so no invalidation is needed. Since both bases are UNTRUSTED transport (SPEC §1) and
 # the beacon prefers the freshest by monotonic sequence, keeping the GitHub fallback in lock-step
 # costs nothing and hedges an S3/CDN outage.
+#
+# The two publishes are DECOUPLED (#545): the GitHub-release fallback is gated on the keystone verify
+# alone (`always() && steps.keystone.outcome == 'success'`), NOT on the primary S3 publish or its live
+# smoke succeeding — so a primary-edge hiccup that reddens the HARD S3 steps can never skip the very
+# fallback that outage calls for. Both remain strictly downstream of the keystone: neither base is ever
+# served a feed that did not verify end-to-end.
 name: Feed
 
 on:
@@ -119,6 +125,7 @@ jobs:
       # production. It runs BEFORE publish, so an unverifiable feed is never served.
       - name: Verify the signed feed end-to-end (pinned key)
         if: steps.secret.outputs.present == 'true'
+        id: keystone
         # This step runs UNELEVATED, so point the dry check's state dir at a writable workspace
         # path (honored by `Broker::for_dry_check`, #540). Without it the worker cannot create its
         # staging dir under the Admin-only default (`/var/lib/dig-updater`), a valid feed comes back
@@ -189,8 +196,18 @@ jobs:
 
       # FALLBACK publish to the rolling `feed` release. It is a prerelease + not "latest"
       # so it never shadows a component's real version release when the feed resolves that component.
+      #
+      # INTENTIONALLY INDEPENDENT of the S3 primary publish + its live smoke above (#545): the two
+      # bases (updates.dig.net S3/CDN and this GitHub release) refresh independently, and the beacon
+      # picks the freshest by monotonic sequence. The gate is `always() && steps.keystone.outcome ==
+      # 'success'` — NOT the implicit `success()` — so a primary-edge hiccup that reddens the HARD S3
+      # publish or byte-exact smoke can NO LONGER skip this fallback, which is the exact outage it
+      # exists to hedge. It stays STRICTLY downstream of the keystone: `steps.keystone.outcome ==
+      # 'success'` fires only when the pinned-key end-to-end verify passed, so an unverified feed is
+      # never published, and a no-signing-secret run (keystone skipped → outcome != 'success') is a
+      # no-op. `always()` decouples ONLY from the primary edge, never from the trust gate.
       - name: Publish to the rolling `feed` release
-        if: steps.secret.outputs.present == 'true'
+        if: always() && steps.keystone.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
