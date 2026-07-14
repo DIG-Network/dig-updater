@@ -449,12 +449,12 @@ mod tests {
 
     #[test]
     fn resolve_install_root_uses_the_exe_parent() {
-        // The install root is the directory the beacon binary sits in.
-        let exe = PathBuf::from(r"C:\Users\me\AppData\Local\Programs\DigStore\bin\dig-updater.exe");
-        assert_eq!(
-            resolve_install_root(Some(exe), &Platform::current()),
-            PathBuf::from(r"C:\Users\me\AppData\Local\Programs\DigStore\bin")
-        );
+        // The install root is the directory the beacon binary sits in. Built with `join` so the
+        // separators are the host's — a literal `C:\...` string is a single un-splittable component
+        // on Unix, which would make this pass on Windows yet fail on Linux.
+        let bin = PathBuf::from("Programs").join("DigStore").join("bin");
+        let exe = bin.join("dig-updater.exe");
+        assert_eq!(resolve_install_root(Some(exe), &Platform::current()), bin);
     }
 
     #[test]
@@ -497,15 +497,17 @@ mod tests {
 
     #[test]
     fn alpha_defaults_in_adds_the_exe_suffix_on_windows() {
-        let bin = Path::new(r"C:\apps\DigStore\bin");
+        // The `windows` PLATFORM (not the host) drives the `.exe` suffix; `join` keeps the expected
+        // paths on the host's separators so the assertion holds on both Windows and Linux.
+        let bin = PathBuf::from("apps").join("DigStore").join("bin");
         let windows = Platform {
             os: "windows".into(),
             arch: "x64".into(),
         };
-        let cat = Catalog::alpha_defaults_in(bin, &windows);
+        let cat = Catalog::alpha_defaults_in(&bin, &windows);
         assert_eq!(
             cat.target("digstore").unwrap().dest,
-            PathBuf::from(r"C:\apps\DigStore\bin\digstore.exe")
+            bin.join("digstore.exe")
         );
         // dig-node is a native package on Windows (MSI), but its PROBE dest still points at the
         // sibling exe the installer/MSI places in the bin dir.
@@ -515,7 +517,7 @@ mod tests {
         );
         assert_eq!(
             cat.target("dig-node").unwrap().dest,
-            PathBuf::from(r"C:\apps\DigStore\bin\dig-node.exe")
+            bin.join("dig-node.exe")
         );
     }
 
