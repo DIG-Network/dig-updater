@@ -738,7 +738,7 @@ Administrator/root.
 
 | Command | Reads | Writes | Elevation | Notes |
 |---|---|---|---|---|
-| `check` / `check --dry-run` | `trust-state.json` (freshness compare) | `status.json` (best-effort) | No | Never installs, never advances trust state, never pause-gated. |
+| `check` / `check --dry-run` | `trust-state.json` (freshness compare) | `status.json` (best-effort) | No | Never installs, never advances trust state, never pause-gated. State dir honors `$DIG_UPDATER_STATE_DIR` (below); the `status.json` refresh is fail-soft. |
 | `check --now` | — | everything a full pass writes | Whatever `run` requires | Identical to `run` — an on-demand trigger of the SAME `Broker::run_once_with_feed`. |
 | `run` | `config.json`, `trust-state.json` | `trust-state.json`, `status.json`, installed binaries | Whatever the per-OS install path requires | Pause-gated (§13.1); this is what the scheduler artifact invokes. |
 | `channel get` | `status.json` | — | No | |
@@ -751,3 +751,20 @@ Administrator/root.
 Every command MUST offer both a human-readable line and a `--json` machine-readable object (§6.2).
 The feed base is overridable per `--feed-base <url>`/`$DIG_UPDATER_FEED_BASE` on `check` and `run`
 alike (untrusted transport, §1); the pinned root key has no such override.
+
+**Dry-check state directory (`$DIG_UPDATER_STATE_DIR`).** A DRY `check` MUST run without write access
+to the Admin/SYSTEM-only default state directory. When `$DIG_UPDATER_STATE_DIR` is set to a non-empty
+path, the dry check uses it as its state directory (and derives the `-status` sibling from it, §13.2);
+when unset or empty it falls back to the hardened OS default. This override applies ONLY to the dry
+check — the full pass / install path (`run`, `check --now`) ALWAYS uses the hardened default and is
+never relocatable, so the anti-rollback trust state can never be pointed at a directory an
+unprivileged process can roll back (§6, §9.3). Because a dry verify must download and digest-verify
+each artifact into a staging directory, an UNWRITABLE state dir makes the worker unable to stage and a
+valid, correctly-signed feed is reported as a `staging_io_error` rejection rather than verified; the
+override is how an unprivileged operator or CI (e.g. the signed-feed end-to-end keystone) runs `check`
+successfully.
+
+**Fail-soft status refresh.** The verify VERDICT a `check` reports (`.status`) is authoritative and
+independent of whether `status.json` (§13.2) could be written. A failure to refresh the status mirror
+(a permission the unprivileged runner lacks) MUST warn and continue — it MUST NOT change the exit code
+or suppress the `--json` verdict.

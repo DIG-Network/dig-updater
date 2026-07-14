@@ -104,6 +104,13 @@ jobs:
       # production. It runs BEFORE publish, so an unverifiable feed is never served.
       - name: Verify the signed feed end-to-end (pinned key)
         if: steps.secret.outputs.present == 'true'
+        # This step runs UNELEVATED, so point the dry check's state dir at a writable workspace
+        # path (honored by `Broker::for_dry_check`, #540). Without it the worker cannot create its
+        # staging dir under the Admin-only default (`/var/lib/dig-updater`), a valid feed comes back
+        # as a `staging_io_error` rejection, and the keystone fails. The code is fail-soft either
+        # way; this keeps the run clean (no permission warning) and independent of the runner user.
+        env:
+          DIG_UPDATER_STATE_DIR: ${{ runner.temp }}/dig-updater-state
         run: |
           set -euo pipefail
           python3 -m http.server 8099 --bind 127.0.0.1 --directory feed-out &

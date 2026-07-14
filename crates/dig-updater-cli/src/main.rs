@@ -249,7 +249,10 @@ fn resolve_feed(feed_base: Option<String>) -> Vec<FeedSource> {
 /// or advances trust state; also never gates on a pause ([`Broker::run_once_with_feed`] does —
 /// inspecting what the beacon WOULD do stays available while paused).
 fn run_dry_check(feed_base: Option<String>, json: bool) -> ExitCode {
-    let broker = match Broker::new() {
+    // `for_dry_check` (not `new`) so `DIG_UPDATER_STATE_DIR` can point an UNELEVATED check at a
+    // writable state dir — the dry verify never installs, so this can't defeat anti-rollback, and
+    // it lets the signed-feed keystone verify without Admin rights (#540).
+    let broker = match Broker::for_dry_check() {
         Ok(b) => b,
         Err(e) => return fail(&e, json),
     };
