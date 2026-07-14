@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 use dig_updater_trust::{Artifact, Component, SignedDelegation, SignedManifest};
 
 pub use assemble::{assemble_delegation, assemble_manifest};
-pub use config::{ComponentConfig, FeedConfig};
+pub use config::{AssetKind, ComponentConfig, FeedConfig};
 pub use error::FeedsignError;
 pub use resolve::{select_artifacts, GithubRelease, ResolvedArtifact};
 pub use sign::{assert_pinned_root, is_pinned_root, signing_key_from_secret};
