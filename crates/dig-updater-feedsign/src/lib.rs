@@ -39,6 +39,7 @@ mod error;
 mod resolve;
 mod sign;
 mod source;
+mod transparency;
 mod version;
 
 use base64::Engine as _;
@@ -53,6 +54,9 @@ pub use error::FeedsignError;
 pub use resolve::{select_artifacts, GithubRelease, ResolvedArtifact};
 pub use sign::{assert_pinned_root, is_pinned_root, signing_key_from_secret};
 pub use source::{GithubSource, ReleaseSource};
+pub use transparency::{
+    TransparencyRecord, SIGNATURE_FILE, SIGNING_BYTES_FILE, TARGETS_PUBKEY_FILE,
+};
 
 /// The names of the two feed objects, at `{feed-base}/{delegation,manifest}.json` (SPEC §10).
 pub const DELEGATION_FILE: &str = "delegation.json";

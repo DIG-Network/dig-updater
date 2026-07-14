@@ -7,11 +7,17 @@
 //!
 //! | purpose            | flag           | env                     | default            |
 //! |--------------------|----------------|-------------------------|--------------------|
-//! | config file        | `--config`     | `FEEDSIGN_CONFIG`       | `feed-config.json` |
-//! | output directory   | `--out`        | `FEEDSIGN_OUT`          | `feed-out`         |
-//! | generated unix ts  | `--generated`  | `FEEDSIGN_GENERATED`    | (required)         |
-//! | signing key (PEM/…)| —              | `BEACON_SIGNING_KEY`    | (required)         |
-//! | GitHub token       | —              | `GITHUB_TOKEN`          | (optional)         |
+//! | config file        | `--config`          | `FEEDSIGN_CONFIG`           | `feed-config.json` |
+//! | output directory   | `--out`             | `FEEDSIGN_OUT`              | `feed-out`         |
+//! | transparency dir   | `--transparency-out`| `FEEDSIGN_TRANSPARENCY_OUT` | (optional)         |
+//! | generated unix ts  | `--generated`       | `FEEDSIGN_GENERATED`        | (required)         |
+//! | signing key (PEM/…)| —                   | `BEACON_SIGNING_KEY`        | (required)         |
+//! | GitHub token       | —                   | `GITHUB_TOKEN`              | (optional)         |
+//!
+//! When `--transparency-out` is set, the signer also writes the transparency-log triple (signed
+//! bytes + detached signature + targets public-key PEM) there, for the workflow to upload to a
+//! public transparency log (Rekor, #533). It is optional so the offline signer + tests never need
+//! it; the feed itself is unaffected either way.
 //!
 //! The `generated` timestamp is REQUIRED and never defaulted to the clock, so a run is
 //! deterministic + reproducible (SPEC §10): the workflow supplies `date +%s`.
@@ -76,6 +82,13 @@ fn run() -> Result<String, FeedsignError> {
 
     let feed = produce_feed(&config, &source, generated, &signing_key)?;
     feed.write_to(std::path::Path::new(&out_dir))?;
+
+    // Optionally emit the transparency-log triple for a public log (Rekor, #533). Derived from the
+    // signed feed, so it can only reflect exactly what was published.
+    if let Some(dir) = input(&args, "--transparency-out", "FEEDSIGN_TRANSPARENCY_OUT") {
+        feed.transparency()?.write_to(std::path::Path::new(&dir))?;
+    }
+
     Ok(feed.summary())
 }
 

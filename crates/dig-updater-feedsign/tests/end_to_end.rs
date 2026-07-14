@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use dig_updater_feedsign::{
     produce_feed, FeedConfig, FeedsignError, GithubRelease, GithubSource, ReleaseSource,
+    SIGNATURE_FILE, SIGNING_BYTES_FILE, TARGETS_PUBKEY_FILE,
 };
 use dig_updater_trust::{
     verify_artifact_digest, verify_update_chain, SignedDelegation, SignedManifest, TrustState,
@@ -248,6 +249,91 @@ fn summary_is_informative_and_secret_free() {
     // The private seed bytes must never surface in the summary.
     let seed_b64 = base64::engine::general_purpose::STANDARD.encode(signing_key.to_bytes());
     assert!(!summary.contains(&seed_b64));
+}
+
+/// The transparency record derives, from the produced feed alone, the exact bytes the targets key
+/// signed — and the detached signature over them verifies under the recorded targets public key.
+/// This is what a public transparency log (Rekor, #533) records so any observer can later prove
+/// this manifest was publicly logged.
+#[test]
+fn transparency_record_signature_verifies_over_signed_bytes() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let record = feed
+        .transparency()
+        .expect("transparency derives from a produced feed");
+
+    // The signed bytes are the manifest payload EXACTLY as it will be served (the crate's
+    // canonicalization, reused — not a re-serialization).
+    let manifest = SignedManifest::from_json(&feed.manifest_json).unwrap();
+    assert_eq!(record.signing_bytes, manifest.signed_payload());
+
+    // The recorded public key is the targets key, and the detached 64-byte signature verifies
+    // over the signed bytes under it — the property a transparency log entry attests.
+    assert_eq!(
+        record.targets_pubkey,
+        signing_key.verifying_key().to_bytes()
+    );
+    assert_eq!(record.signature.len(), 64);
+    let vk = VerifyingKey::from_bytes(&record.targets_pubkey).unwrap();
+    let sig = Signature::from_slice(&record.signature).unwrap();
+    vk.verify(&record.signing_bytes, &sig)
+        .expect("the detached targets signature must verify over the signed bytes");
+}
+
+/// The targets public key is emitted as a standard Ed25519 SubjectPublicKeyInfo PEM (RFC 8410),
+/// so `rekor-cli --pki-format=x509 --public-key` accepts it: a 12-byte SPKI prefix + the raw
+/// 32-byte key, base64-wrapped between the PUBLIC KEY armor.
+#[test]
+fn transparency_pubkey_is_spki_ed25519_pem() {
+    // The fixed DER prefix of an Ed25519 SPKI: SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING }.
+    const SPKI_ED25519_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let record = feed.transparency().unwrap();
+
+    let pem = record.targets_pubkey_pem();
+    assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----\n"));
+    assert!(pem.trim_end().ends_with("-----END PUBLIC KEY-----"));
+
+    // The DER between the armor is the SPKI prefix followed by the raw 32-byte key.
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .expect("PEM body is base64");
+    let mut expected = SPKI_ED25519_PREFIX.to_vec();
+    expected.extend_from_slice(&signing_key.verifying_key().to_bytes());
+    assert_eq!(der, expected);
+}
+
+/// `write_transparency_to` emits the triple — signed bytes, detached signature, and PEM public key
+/// — byte-for-byte as derived, at the names the workflow feeds to `rekor-cli`.
+#[test]
+fn write_transparency_emits_the_triple() {
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+    let feed = produce_feed(&config(), &fake_source(), GENERATED, &signing_key).unwrap();
+    let record = feed.transparency().unwrap();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    record.write_to(dir.path()).unwrap();
+
+    assert_eq!(
+        std::fs::read(dir.path().join(SIGNING_BYTES_FILE)).unwrap(),
+        record.signing_bytes
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(SIGNATURE_FILE)).unwrap(),
+        record.signature
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(TARGETS_PUBKEY_FILE)).unwrap(),
+        record.targets_pubkey_pem()
+    );
 }
 
 /// A LIVE smoke test against the real GitHub API + release assets, signing with a THROWAWAY key

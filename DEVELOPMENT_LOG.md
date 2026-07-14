@@ -97,6 +97,28 @@ change diary.
 - **`build` packs `major·10⁶ + minor·10³ + patch`** (minor/patch < 1000, enforced) so a higher
   release always sorts higher for the anti-downgrade floor. Per component; the manifest-level
   `rollback_floor_build` is a single value compared to every component's build (alpha floor 0).
+
+## Primary publish + transparency (#535 / #533)
+
+- **The S3 key prefix MUST equal the beacon's `PRIMARY_FEED_BASE` path byte-for-byte.** The beacon
+  fetches `https://updates.dig.net/v1/alpha/{delegation,manifest}.json`, so the feed publishes to
+  `s3://<bucket>/v1/alpha/`. Objects go up with `Content-Type: application/json` and no
+  content-encoding (§10.4 no-transform); CloudFront is CachingDisabled so no invalidation is needed
+  and a fresh feed is served immediately. CI uses OIDC (`id-token: write` + `configure-aws-credentials`
+  assuming `AWS_DEPLOY_ROLE_ARN`) — no static AWS keys. A live byte-exact smoke (curl the primary,
+  `cmp` to the signed manifest) is the end-to-end proof the CDN serves it un-transformed.
+- **Ed25519 (PureEdDSA) is not generally compatible with Rekor `hashedrekord`.** `hashedrekord`
+  attests only a digest, but PureEdDSA verifies over the WHOLE message, so a server-side re-verify of
+  the signature against a bare hash isn't possible — Rekor may reject the entry. The alpha step is
+  therefore FAIL-SOFT + log-only (a Rekor outage/rejection NEVER blocks the 6h heartbeat), and the
+  beacon-side inclusion-verify is deferred to beta (#533), which should switch to the full-artifact
+  `rekord` type (the manifest is small + already public) or Ed25519ph. The transparency triple
+  (signed bytes + detached raw 64-byte sig + targets SPKI-PEM) is DERIVED from the produced feed, so
+  it can only ever reflect exactly what was published — no second serializer.
+- **Ed25519 SPKI PEM is a fixed 12-byte prefix + the raw 32-byte key.** `30 2a 30 05 06 03 2b 65 70
+  03 21 00` then the key (44 bytes DER), base64-wrapped at 64 cols between `PUBLIC KEY` armor — the
+  form `rekor-cli --pki-format=x509 --public-key` accepts. (Mirrors the 16-byte PKCS#8-v1 PRIVATE
+  prefix used on the signing side.)
 - **Asset match is exact.** `{prefix}-{version}-{token}` where token ∈ {`linux-x64`,`macos-arm64`,
   `macos-x64`,`windows-x64.exe`}. Exactness is load-bearing: a digstore release also ships `digs-…`
   and `digstore-…-x86_64-unknown-linux-gnu.tar.gz`; only the exact binary name is an artifact.
