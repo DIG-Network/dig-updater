@@ -44,7 +44,7 @@ The full, normative contract is **[`SPEC.md`](./SPEC.md)** — read it before ch
 | `crates/dig-updater-trust` | **Security core:** signed manifest + delegation types, monotonic trust state, Ed25519 + SHA-256 verification, the pinned root key. |
 | `crates/dig-updater-broker` | Privileged orchestration: spawn the sandboxed worker, the single-instance lock, ACL self-check, install/health-gate/rollback, the per-OS scheduler artifact (`scheduler` module), and the beacon's own self-update (`selfupdate` module). |
 | `crates/dig-updater-worker` | Unprivileged fetch/verify worker — the only part that touches the network. |
-| `crates/dig-updater-cli` | The `dig-updater` binary: `check` (dry verify), `run` (a full pass — what the schedule invokes), `schedule install\|uninstall\|status`, `status`. |
+| `crates/dig-updater-cli` | The `dig-updater` binary — the operator interface: `check [--now\|--dry-run]`, `run` (a full pass — what the schedule invokes), `channel get\|set`, `pause [--until <ts>] / resume`, `schedule install\|uninstall\|status`, `status` (unprivileged). |
 | `crates/dig-updater-feedsign` | CI-only feed signer (never shipped in the beacon binary). |
 
 ## Build
@@ -85,8 +85,9 @@ The dedicated `scheduler-elevated` CI job runs both on all three OSes on every P
 
 ## Status
 
-Alpha: the trust core, the install path, and the scheduling/self-update surface are implemented
-and tested (epic **#504**, work-units -A/-C/-D/-E/-F). Remaining follow-ups — CLI polish
-(channel/pause), the `updates.dig.net` feed origin, native packages + installer registration,
-the `dig-node` updater RPC proxy, an Updates UI, and docs — are tracked under #504. Nothing is
-released to users yet. License: **GPL-2.0-only**.
+Alpha: the trust core, the install path, the scheduling/self-update surface, and the operator CLI
+(channel/pause/status) are implemented and tested (epic **#504**, work-units -A/-C/-D/-E/-F/-G).
+Remaining follow-ups — the `updates.dig.net` feed origin, native packages + installer
+registration, the `dig-node` updater RPC proxy (built on the `status.json` contract in `SPEC.md`
+§13), an Updates UI, and docs — are tracked under #504. Nothing is released to users yet.
+License: **GPL-2.0-only**.

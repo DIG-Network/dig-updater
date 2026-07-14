@@ -75,39 +75,14 @@ pub fn status() -> Result<ScheduleStatus, BrokerError> {
 #[cfg(windows)]
 mod imp {
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     use super::content::{windows_task_xml, JITTER_WINDOW, WINDOWS_TASK_PATH};
     use super::ScheduleStatus;
+    use crate::elevation::require_elevated;
     use crate::error::BrokerError;
     use crate::install::trusted_absolute;
     use crate::secure::harden_state_dir;
-
-    /// The absolute, trusted path to `net.exe` — never a bare name resolved through `PATH`.
-    fn net() -> Result<PathBuf, BrokerError> {
-        let system_root = std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("windir"))
-            .ok_or_else(|| BrokerError::Io("neither %SystemRoot% nor %windir% is set".into()))?;
-        trusted_absolute(PathBuf::from(system_root).join("System32").join("net.exe"))
-            .map_err(BrokerError::Io)
-    }
-
-    /// Is this process elevated (Administrator)? `net session` succeeds only when elevated — the
-    /// same probe dig-relay's own service registration uses, so both repos fail the same way for
-    /// the same reason. The `net.exe` is resolved by its absolute, trusted path (`%SystemRoot%\System32\net.exe`)
-    /// rather than a bare name, preventing PATH-search hijacking attacks.
-    fn is_elevated() -> bool {
-        match net() {
-            Ok(net_exe) => Command::new(net_exe)
-                .arg("session")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false),
-            Err(_) => false,
-        }
-    }
 
     /// The absolute, trusted path to `schtasks.exe` — never a bare name resolved through `PATH`.
     fn schtasks() -> Result<PathBuf, BrokerError> {
@@ -207,17 +182,6 @@ mod imp {
         })
     }
 
-    fn require_elevated() -> Result<(), BrokerError> {
-        if is_elevated() {
-            Ok(())
-        } else {
-            Err(BrokerError::Io(
-                "registering the daily schedule requires an elevated (Administrator) console"
-                    .into(),
-            ))
-        }
-    }
-
     /// Encode `text` as UTF-16LE bytes with a leading byte-order mark — the exact form
     /// `schtasks /XML` requires (see [`install`]'s comment on why a plain UTF-8 file is rejected).
     fn utf16le_with_bom(text: &str) -> Vec<u8> {
@@ -269,6 +233,7 @@ mod imp {
         systemd_service_unit, systemd_timer_unit, JITTER_WINDOW, SYSTEMD_UNIT_NAME,
     };
     use super::ScheduleStatus;
+    use crate::elevation::require_elevated;
     use crate::error::BrokerError;
     use crate::install::first_trusted;
 
@@ -306,7 +271,7 @@ mod imp {
     }
 
     pub(super) fn install(exe: &Path) -> Result<(), BrokerError> {
-        require_root()?;
+        require_elevated()?;
         write_unit(&service_path(), &systemd_service_unit(exe))?;
         write_unit(&timer_path(), &systemd_timer_unit(JITTER_WINDOW))?;
         let systemctl = systemctl()?;
@@ -329,7 +294,7 @@ mod imp {
     }
 
     pub(super) fn uninstall() -> Result<(), BrokerError> {
-        require_root()?;
+        require_elevated()?;
         let systemctl = systemctl()?;
         // Best-effort: disabling an already-absent/disabled timer is not fatal — the goal is a
         // clean removal either way.
@@ -375,17 +340,6 @@ mod imp {
             }
         })
     }
-
-    fn require_root() -> Result<(), BrokerError> {
-        // SAFETY: `geteuid` has no preconditions and is always safe to call.
-        if unsafe { libc::geteuid() } == 0 {
-            Ok(())
-        } else {
-            Err(BrokerError::Io(
-                "registering the daily schedule requires root".into(),
-            ))
-        }
-    }
 }
 
 // ------------------------------------------ macOS ------------------------------------------------
@@ -398,6 +352,7 @@ mod imp {
 
     use super::content::{launchd_jitter, launchd_plist, LAUNCHD_LABEL};
     use super::ScheduleStatus;
+    use crate::elevation::require_elevated;
     use crate::error::BrokerError;
     use crate::install::first_trusted;
 
@@ -410,7 +365,7 @@ mod imp {
     }
 
     pub(super) fn install(exe: &Path) -> Result<(), BrokerError> {
-        require_root()?;
+        require_elevated()?;
         // `launchctl bootstrap` REFUSES an already-bootstrapped label (idempotent re-install —
         // e.g. a re-run installer — would otherwise error), so clear any prior registration
         // first, exactly like dig-installer's own dig-dns LaunchDaemon install does: a fresh
@@ -445,7 +400,7 @@ mod imp {
     }
 
     pub(super) fn uninstall() -> Result<(), BrokerError> {
-        require_root()?;
+        require_elevated()?;
         bootout_and_remove_plist();
         Ok(())
     }
@@ -480,17 +435,6 @@ mod imp {
                 format!("{LAUNCHD_LABEL} is not loaded")
             },
         })
-    }
-
-    fn require_root() -> Result<(), BrokerError> {
-        // SAFETY: `geteuid` has no preconditions and is always safe to call.
-        if unsafe { libc::geteuid() } == 0 {
-            Ok(())
-        } else {
-            Err(BrokerError::Io(
-                "registering the daily schedule requires root".into(),
-            ))
-        }
     }
 }
 
