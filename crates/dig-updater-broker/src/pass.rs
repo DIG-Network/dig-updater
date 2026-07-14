@@ -90,7 +90,11 @@ pub struct ComponentOutcome {
     pub action: String,
     /// What actually happened.
     pub result: ComponentResult,
-    /// A human-readable detail (the version transition, or the failure reason).
+    /// A human-readable detail. For [`ComponentResult::Installed`] this is the version the health
+    /// gate ACTUALLY re-observed on disk after installing (#582) — verified reality, never the
+    /// plan's pre-install prediction ([`PlannedComponent::summary`](crate::plan::PlannedComponent)).
+    /// Every other result carries the plan summary or a failure reason, neither of which claims to
+    /// describe a post-install state.
     pub detail: String,
 }
 
@@ -349,10 +353,14 @@ impl Installer<'_> {
 
         match install_step(&private, &self.retry) {
             InstallOutcome::Installed => match check_health(&pc.dest, &pc.version, self.health) {
-                Ok(()) => Ok(ComponentOutcome::from(
+                // `pc.summary` is the PLAN's pre-install prediction ("v0.14.0 -> v0.15.0") — once
+                // the install has actually happened, that prediction is stale. Report what the
+                // health gate just re-observed on disk instead (#582), so a later `status` read
+                // states verified reality rather than replaying what this pass merely intended.
+                Ok(detected) => Ok(ComponentOutcome::from(
                     pc,
                     ComponentResult::Installed,
-                    pc.summary.clone(),
+                    verified_install_detail(&pc.name, &detected),
                 )),
                 Err(detail) => {
                     self.rollback(snapshot, &pc.dest, floor)?;
@@ -419,6 +427,18 @@ pub fn spawn_version_probe() -> impl Fn(&Path) -> DetectedVersion {
     dig_release_resolver::detect_installed_version
 }
 
+/// The detail persisted for a just-installed, health-verified component: what the health gate
+/// ACTUALLY found running at its destination (#582), not the plan's pre-install prediction.
+/// `detected` is always [`DetectedVersion::Present`] here — [`check_health`]'s success arm only
+/// returns after ruling out [`DetectedVersion::Absent`] — but the match stays total rather than
+/// unwrapping, so a future change to that invariant fails safe instead of panicking.
+fn verified_install_detail(component: &str, detected: &DetectedVersion) -> String {
+    match detected {
+        DetectedVersion::Present(raw) => format!("{component} now reports {raw}"),
+        DetectedVersion::Absent => format!("{component} installed, but its version is unknown"),
+    }
+}
+
 /// Map a trust rejection during the broker's independent re-verify to a distinct broker error.
 fn reverify_err(e: TrustError) -> BrokerError {
     BrokerError::ReverifyFailed(format!("{e} ({})", e.code()))
@@ -440,6 +460,22 @@ mod tests {
             let serialized = serde_json::to_string(&result).unwrap();
             assert_eq!(serialized, format!("\"{token}\""));
         }
+    }
+
+    #[test]
+    fn verified_install_detail_states_what_was_observed_not_a_plan_prediction() {
+        // #582: the persisted detail must name the version the health gate ACTUALLY re-observed
+        // on disk, in the caller's own words ("now reports") — never a "vX -> vY" plan summary
+        // computed before the install ran.
+        let detail = verified_install_detail(
+            "dig-dns",
+            &DetectedVersion::Present("dig-dns 0.13.0".to_string()),
+        );
+        assert_eq!(detail, "dig-dns now reports dig-dns 0.13.0");
+        assert!(
+            !detail.contains("->"),
+            "must not read like a plan-time transition summary: {detail}"
+        );
     }
 
     #[test]

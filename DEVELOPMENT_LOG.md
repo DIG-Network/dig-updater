@@ -301,3 +301,41 @@ one and it still fails on the next:
   in one bin dir, so components install as SIBLINGS of the running beacon, auto-matching wherever the
   installer put things with zero cross-repo path config. Falls back to the per-OS default only if
   `current_exe()` can't be resolved. This is the installer↔beacon install-root contract (SYSTEM.md).
+
+## Unprivileged `check` UX + status truthfulness (#582, v0.8.1)
+
+- **`std::fs::create_dir_all`'s "already exists" recovery can itself be access-denied, turning a
+  benign collision into a bare, cryptic `os error 183`.** `CreateDirectory`/`mkdir` reports
+  `ERROR_ALREADY_EXISTS` for a directory that is genuinely already there just as readily as for a
+  real name collision; std's own recovery (`Path::is_dir()`) distinguishes the two by reading the
+  path's metadata — but that read can ITSELF be access-denied when the existing directory is
+  SYSTEM/Admin-owned (exactly what the hardened default state dir is), so the raw code propagates
+  verbatim instead of a clean "already there" outcome. #540 only fixed the CI keystone (an explicit
+  `$DIG_UPDATER_STATE_DIR` override); an everyday unprivileged `dig-updater check` with NO override
+  still hit the Admin-only default and surfaced this as `rejected (staging_io_error): ... os error
+  183` — a message with no actionable next step. Two independent, complementary fixes: (1)
+  `dry_check_state_dir` now relocates to a per-user writable location
+  (`%LOCALAPPDATA%\DIG\updater` / `$XDG_CACHE_HOME/dig-updater`) whenever the hardened default isn't
+  actually usable — checked by ELEVATION first (cheap short-circuit) and, only when elevated, a REAL
+  writability probe (an "elevated" console can still be denied by an unusual ACL); (2) the worker's
+  own staging `create_dir_all` now tolerates `AlreadyExists` explicitly and proves usability with a
+  real write, so even a directory that reaches the worker unusable degrades to an honest "not
+  writable" detail instead of a bare OS error code. The install/full-pass path (`Broker::new`) is
+  untouched — it stays pinned to the hardened default so anti-rollback can never be relocated.
+- **A deterministic, portable stand-in for "this identity cannot use the directory": occupy the
+  exact target PATH with a plain file.** Simulating a genuinely ACL-denied SYSTEM-owned directory
+  needs real elevation/ACLs and doesn't run in ordinary CI. Writing a plain file at the directory's
+  path instead reproduces the exact same `AlreadyExists`-on-`create_dir_all` outcome deterministically
+  on every OS, with no privilege setup — the write-probe that follows then fails for its own reason
+  (not a directory), proving the "clear detail, not a raw code" behavior without needing to fake
+  elevation at all.
+- **A persisted "installed" detail built from the PLAN (pre-install) rather than the post-install
+  health probe silently drifts into a lie.** `Installer::apply_component`'s success arm used to
+  report `pc.summary` — the version transition `Plan::build` predicted BEFORE the install ran — as
+  the persisted `status.json` detail. The result TOKEN (`ComponentResult::Installed`) was always
+  correct (it's only reached after `check_health` passes), but the STRING beside it was a stale
+  prediction, not what the health gate had just re-observed running at `pc.dest`. Fix: `check_health`
+  now returns the actually-detected `DetectedVersion` on success (not just `Ok(())`), and the success
+  arm builds its detail from that ("dig-dns now reports dig-dns 0.13.0") instead of the plan summary.
+  `last_check`/`last_check_kind` already timestamp every snapshot, so a reader can tell a persisted
+  detail is only as current as that timestamp — no separate staleness field was needed.

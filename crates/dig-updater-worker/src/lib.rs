@@ -78,8 +78,8 @@ pub fn run(request: &WorkerRequest, root: &VerifyingKey) -> Result<VerifiedPlan,
     )?;
 
     // SPEC §9 step 6: download + digest-verify each artifact for this platform, to staging.
-    std::fs::create_dir_all(&request.staging_dir).map_err(|e| WorkerError::Io(e.to_string()))?;
     let staging_dir = Path::new(&request.staging_dir);
+    ensure_staging_dir(staging_dir)?;
     let mut artifacts = Vec::new();
     for component in &manifest.manifest.components {
         if let Some(artifact) = component.artifact(&request.platform.os, &request.platform.arch) {
@@ -102,6 +102,38 @@ pub fn run(request: &WorkerRequest, root: &VerifyingKey) -> Result<VerifiedPlan,
         manifest_json: feed.manifest_json,
         artifacts,
     })
+}
+
+/// Ensure `staging_dir` exists and is genuinely usable by THIS (possibly unprivileged) process —
+/// the fix for a bare `os error 183` an unelevated `dig-updater check` used to surface (#582).
+///
+/// `CreateDirectory`/`mkdir` report "already exists" just as readily for a directory that is
+/// genuinely already there as for a real name collision, and `std::fs::create_dir_all`'s own
+/// recovery from that (`Path::is_dir()`) can itself be access-denied when the existing directory
+/// is SYSTEM/Admin-owned — so the raw, cryptic OS error propagated verbatim even though nothing
+/// was actually colliding. Tolerating `AlreadyExists` explicitly and then proving usability with a
+/// real write turns that into either a clean success or an honest "not writable" detail that names
+/// the actual problem instead of a bare error code.
+///
+/// # Errors
+///
+/// [`WorkerError::Io`] if the directory could not be created for any OTHER reason, or exists but
+/// cannot be written into by this process.
+fn ensure_staging_dir(staging_dir: &Path) -> Result<(), WorkerError> {
+    if let Err(e) = std::fs::create_dir_all(staging_dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(WorkerError::Io(e.to_string()));
+        }
+    }
+    let probe = staging_dir.join(".dig-updater-write-probe");
+    std::fs::write(&probe, []).map_err(|e| {
+        WorkerError::Io(format!(
+            "{} exists but is not writable by this process: {e}",
+            staging_dir.display()
+        ))
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// A verified-transport-independent bundle of the two signed feed documents plus which source
@@ -243,5 +275,44 @@ mod tests {
         let err = fetch_feed(&[]).unwrap_err();
         assert!(matches!(err, WorkerError::FeedUnavailable(_)));
         assert_eq!(err.code(), "feed_unavailable");
+    }
+
+    #[test]
+    fn a_fresh_staging_dir_is_created_and_usable() {
+        let tmp = tempfile::tempdir().expect("scratch dir");
+        let staging = tmp.path().join("staging");
+        ensure_staging_dir(&staging).expect("a brand-new dir must be created and usable");
+        assert!(staging.is_dir());
+    }
+
+    #[test]
+    fn a_pre_existing_writable_staging_dir_is_tolerated_not_rejected() {
+        // Reproduces the "already there" half of #582: `create_dir_all` reports `AlreadyExists`
+        // for a directory the SAME process already created and can freely use — that must never
+        // surface as a failure.
+        let tmp = tempfile::tempdir().expect("scratch dir");
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).expect("pre-create it once already");
+        ensure_staging_dir(&staging).expect("an already-existing, writable dir must be tolerated");
+    }
+
+    #[test]
+    fn a_staging_path_occupied_by_a_plain_file_reports_a_clear_detail_not_a_bare_os_code() {
+        // Before #582's fix, `create_dir_all`'s raw `AlreadyExists` error propagated verbatim —
+        // the exact cryptic "os error 183" an unelevated `check` surfaced when the default staging
+        // dir was SYSTEM-owned. Occupying the staging PATH ITSELF with a plain file reproduces the
+        // same `AlreadyExists` outcome deterministically, with no ACL/elevation needed: it proves
+        // this now degrades to an honest "not writable" detail instead.
+        let tmp = tempfile::tempdir().expect("scratch dir");
+        let staging = tmp.path().join("staging");
+        std::fs::write(&staging, b"not a directory").expect("occupy the staging path with a file");
+
+        let err = ensure_staging_dir(&staging)
+            .expect_err("a file occupying the staging path can never be staged into");
+        assert_eq!(err.code(), "staging_io_error");
+        assert!(
+            err.to_string().contains("not writable"),
+            "must name the real problem, not a bare OS error code: {err}"
+        );
     }
 }

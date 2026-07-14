@@ -22,6 +22,10 @@ pub type VersionProbe<'a> = dyn Fn(&Path) -> DetectedVersion + 'a;
 
 /// Health-gate a just-installed component: the binary at `dest` must now report `expected_version`.
 ///
+/// On success, returns what was ACTUALLY observed on disk — not merely a pass/fail token — so the
+/// caller can report the verified reality of the install (#582) rather than replaying the
+/// plan-time prediction it started from.
+///
 /// # Errors
 ///
 /// A human-readable detail string if the binary is absent or reports a version other than
@@ -30,14 +34,14 @@ pub fn check_health(
     dest: &Path,
     expected_version: &str,
     probe: &VersionProbe,
-) -> Result<(), String> {
+) -> Result<DetectedVersion, String> {
     let detected = probe(dest);
     if matches!(detected, DetectedVersion::Absent) {
         return Err(format!("nothing installed at {}", dest.display()));
     }
     let decision = decide(&detected, expected_version);
     if decision.action == UpdateAction::Skip {
-        Ok(())
+        Ok(detected)
     } else {
         Err(format!(
             "post-install version check failed: {}",
@@ -56,9 +60,13 @@ mod tests {
     }
 
     #[test]
-    fn matching_version_is_healthy() {
+    fn matching_version_is_healthy_and_returns_what_was_actually_observed() {
         let probe = |_: &Path| DetectedVersion::Present("digstore 0.15.0".to_string());
-        assert!(check_health(&dest(), "0.15.0", &probe).is_ok());
+        assert_eq!(
+            check_health(&dest(), "0.15.0", &probe).expect("a matching version is healthy"),
+            DetectedVersion::Present("digstore 0.15.0".to_string()),
+            "the caller needs the OBSERVED reality, not just a pass/fail token (#582)"
+        );
     }
 
     #[test]
