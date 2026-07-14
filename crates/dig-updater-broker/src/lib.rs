@@ -230,6 +230,13 @@ impl Broker {
             return Ok(PassReport::already_running());
         };
 
+        // #546: SELF-HEAL our own daily wake. The daily SYSTEM/root task was registered exactly
+        // once by the installer and never re-asserted, so the moment it went missing auto-updates
+        // died permanently. Now every pass (this runs BEFORE the pause gate, so even a paused
+        // beacon keeps its schedule alive) re-registers a provably-absent task. Best-effort — an
+        // unprivileged or unreadable outcome is logged, never fatal to the pass.
+        self.self_heal_schedule();
+
         // The pause gate runs next, still before the network or the ACL self-check are touched
         // (SPEC §13.1). Unlike `dry_check`'s status-only config read, this one GATES a real pass,
         // so a corrupt config fails closed (`?`) instead of silently defaulting to "not paused".
@@ -532,8 +539,38 @@ impl Broker {
         const ONE_DAY_SECS: u64 = 24 * 60 * 60;
         scheduler::status()
             .ok()
-            .filter(|status| status.installed)
+            .filter(|status| status.installed())
             .map(|_| now + ONE_DAY_SECS)
+    }
+
+    /// Self-heal the daily schedule (#546): (re-)register the scheduler artifact when it is provably
+    /// absent, so a beacon whose task was deleted resurrects its own daily wake. Best-effort — see
+    /// [`scheduler::ensure`] — resolving the beacon's own path and running the ensure; any failure
+    /// (unprivileged caller, unreadable status) is logged, never propagated to fail the pass.
+    fn self_heal_schedule(&self) {
+        self.self_heal_schedule_with(scheduler::ensure);
+    }
+
+    /// The injectable core of [`Self::self_heal_schedule`]: production passes [`scheduler::ensure`];
+    /// tests pass a fake so both the success and failure branches are covered without touching the
+    /// OS scheduler (matching the injectable-`is_elevated`/version-probe idiom used elsewhere).
+    fn self_heal_schedule_with(
+        &self,
+        ensure: impl FnOnce(&Path) -> Result<scheduler::EnsureAction, BrokerError>,
+    ) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                eprintln!(
+                    "dig-updater: warning: could not resolve the beacon path to self-heal the \
+                     daily schedule: {e}"
+                );
+                return;
+            }
+        };
+        if let Err(e) = ensure(&exe) {
+            eprintln!("dig-updater: warning: could not self-heal the daily schedule: {e}");
+        }
     }
 }
 
@@ -698,6 +735,31 @@ mod tests {
     #[test]
     fn now_is_after_2020() {
         assert!(now_unix_secs() > 1_577_836_800); // 2020-01-01
+    }
+
+    #[test]
+    fn self_heal_schedule_is_best_effort_across_every_ensure_outcome() {
+        // #546: self-healing the schedule must NEVER fail (or panic) a pass, whichever branch the
+        // ensure takes — re-registered, already registered, left-unknown, or an outright error
+        // (e.g. an unprivileged caller that can't register a SYSTEM schedule). Injecting the ensure
+        // covers all branches without touching the real OS scheduler.
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        for outcome in [
+            Ok(scheduler::EnsureAction::Reregistered),
+            Ok(scheduler::EnsureAction::AlreadyRegistered),
+            Ok(scheduler::EnsureAction::LeftUnknown),
+            Err(BrokerError::Io("not elevated".into())),
+        ] {
+            // Must return normally regardless — no panic, no propagated error.
+            broker.self_heal_schedule_with(|exe| {
+                assert!(
+                    exe.is_absolute(),
+                    "ensure is handed the resolved beacon path"
+                );
+                outcome
+            });
+        }
     }
 
     #[test]

@@ -105,7 +105,10 @@ impl Catalog {
     /// installer (#504-H) and tests can substitute their own destinations.
     #[must_use]
     pub fn alpha_defaults(platform: &Platform) -> Self {
-        Self::alpha_defaults_in(&resolve_install_root(std::env::current_exe().ok(), platform), platform)
+        Self::alpha_defaults_in(
+            &resolve_install_root(std::env::current_exe().ok(), platform),
+            platform,
+        )
     }
 
     /// [`Self::alpha_defaults`] with the install root supplied explicitly — the pure core, so the

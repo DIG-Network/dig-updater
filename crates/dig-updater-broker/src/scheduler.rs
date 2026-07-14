@@ -31,14 +31,79 @@ use std::path::Path;
 
 use crate::error::BrokerError;
 
-/// Whether the daily schedule is currently registered, and a human detail for `dig-updater
-/// schedule status`.
+/// The determined presence of the daily scheduler artifact — with the crucial distinction between
+/// "provably absent" and "presence could not be determined" (#546).
+///
+/// The pre-#546 code collapsed both into a single `installed: bool`, so a registered-but-ACL-locked
+/// task (a `schtasks /Query` that failed with *access denied*) reported exactly like a genuinely
+/// missing one — which both lied to `dig-updater schedule status` AND would have driven the
+/// self-heal ([`ensure`]) to needlessly recreate a task that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulePresence {
+    /// The scheduler artifact is registered.
+    Registered,
+    /// The scheduler artifact is provably ABSENT (the OS reported "no such task"). This is the ONLY
+    /// state the self-heal re-registers from.
+    Absent,
+    /// The artifact's presence could not be determined (e.g. the query was access-denied). NOT the
+    /// same as [`Self::Absent`] — the self-heal must never recreate a task that might already exist.
+    Unknown,
+}
+
+/// Whether the daily schedule is registered, and a human detail for `dig-updater schedule status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleStatus {
-    /// Is the artifact registered with the OS scheduler right now?
-    pub installed: bool,
-    /// A human-readable detail (the artifact path/label, or why it is absent).
+    /// The determined presence of the artifact with the OS scheduler right now.
+    pub presence: SchedulePresence,
+    /// A human-readable detail (the artifact path/label, or why it is absent/unreadable).
     pub detail: String,
+}
+
+impl ScheduleStatus {
+    /// A `Registered` status carrying `detail`.
+    fn registered(detail: String) -> Self {
+        Self {
+            presence: SchedulePresence::Registered,
+            detail,
+        }
+    }
+    /// An `Absent` status carrying `detail`.
+    fn absent(detail: String) -> Self {
+        Self {
+            presence: SchedulePresence::Absent,
+            detail,
+        }
+    }
+    /// An `Unknown` (presence-undeterminable) status carrying `detail`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn unknown(detail: String) -> Self {
+        Self {
+            presence: SchedulePresence::Unknown,
+            detail,
+        }
+    }
+
+    /// Whether the artifact is registered (`presence == Registered`). The convenience predicate the
+    /// CLI + status-mirror read; a `Unknown`/`Absent` presence both answer `false`, but callers that
+    /// must NOT act on "can't tell" (the self-heal) inspect [`Self::presence`] directly.
+    #[must_use]
+    pub fn installed(&self) -> bool {
+        self.presence == SchedulePresence::Registered
+    }
+}
+
+/// What [`ensure`] decided to do about the daily schedule this pass.
+///
+/// A value (not just a side effect) so the self-heal DECISION is unit-testable without touching the
+/// OS ([`ensure_decision`]) and so a caller/log can report which branch ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureAction {
+    /// Already registered — left untouched.
+    AlreadyRegistered,
+    /// Presence could not be determined (e.g. access-denied) — left untouched, never recreated.
+    LeftUnknown,
+    /// Provably absent — (re-)registered this pass.
+    Reregistered,
 }
 
 /// Register the daily scheduler artifact that invokes `<exe> run`.
@@ -70,6 +135,45 @@ pub fn status() -> Result<ScheduleStatus, BrokerError> {
     imp::status()
 }
 
+/// Ensure the daily schedule is registered, SELF-HEALING a provably-absent one (#546).
+///
+/// This is the fix for the #1 "beacon never updates" cause: the daily SYSTEM/root task was
+/// registered exactly ONCE by the installer, and no pass ever re-registered it — so the moment the
+/// task went missing, auto-updates were permanently dead. Every `run`/`check --now` pass now calls
+/// this, so a beacon that runs (elevated) for ANY reason resurrects its own daily wake.
+///
+/// Idempotent and conservative:
+/// - [`SchedulePresence::Registered`] → left untouched ([`EnsureAction::AlreadyRegistered`]).
+/// - [`SchedulePresence::Unknown`] → left untouched ([`EnsureAction::LeftUnknown`]): a task whose
+///   presence can't be read (e.g. access-denied) is NEVER recreated, or we'd risk clobbering a
+///   present-but-unreadable one.
+/// - [`SchedulePresence::Absent`] → (re-)registered ([`EnsureAction::Reregistered`]).
+///
+/// # Errors
+///
+/// [`BrokerError`] if the OS status probe fails outright, or — only when re-registering — if
+/// registration fails (e.g. the caller is not elevated: registering a SYSTEM/root schedule is a
+/// privileged act, §8.4). The caller (`Broker::run_once_with_feed`) treats such a failure as
+/// best-effort and non-fatal.
+pub fn ensure(exe: &Path) -> Result<EnsureAction, BrokerError> {
+    let action = ensure_decision(imp::status()?.presence);
+    if action == EnsureAction::Reregistered {
+        imp::install(exe)?;
+    }
+    Ok(action)
+}
+
+/// The pure decision [`ensure`] makes from a presence reading — split out so every branch is
+/// exercised deterministically without touching the OS.
+#[must_use]
+fn ensure_decision(presence: SchedulePresence) -> EnsureAction {
+    match presence {
+        SchedulePresence::Registered => EnsureAction::AlreadyRegistered,
+        SchedulePresence::Unknown => EnsureAction::LeftUnknown,
+        SchedulePresence::Absent => EnsureAction::Reregistered,
+    }
+}
+
 // ---------------------------------------- Windows ----------------------------------------------
 
 #[cfg(windows)]
@@ -78,7 +182,7 @@ mod imp {
     use std::process::Command;
 
     use super::content::{windows_task_xml, JITTER_WINDOW, WINDOWS_TASK_PATH};
-    use super::ScheduleStatus;
+    use super::{SchedulePresence, ScheduleStatus};
     use crate::elevation::require_elevated;
     use crate::error::BrokerError;
     use crate::install::trusted_absolute;
@@ -155,10 +259,14 @@ mod imp {
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run schtasks: {e}")))?;
         if output.status.success() {
+            remove_empty_task_folder();
             return Ok(());
         }
-        // Idempotent: deleting an already-absent task is success, not an error.
-        if !status()?.installed {
+        // Idempotent: deleting an already-absent task is success, not an error. Only a PROVABLY
+        // absent task counts — an access-denied query (`Unknown`) means we could neither delete nor
+        // confirm removal, which is a real failure, not a benign no-op.
+        if status()?.presence == SchedulePresence::Absent {
+            remove_empty_task_folder();
             return Ok(());
         }
         Err(BrokerError::Io(format!(
@@ -173,17 +281,57 @@ mod imp {
             .hide_console()
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run schtasks: {e}")))?;
-        Ok(if output.status.success() {
-            ScheduleStatus {
-                installed: true,
-                detail: format!("registered at {WINDOWS_TASK_PATH}"),
+        Ok(classify_query(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+        ))
+    }
+
+    /// Classify a `schtasks /Query` outcome into a [`ScheduleStatus`] (#546).
+    ///
+    /// Exit 0 (the task printed) is [`SchedulePresence::Registered`]. A non-zero exit happens for two
+    /// very different reasons the pre-#546 code conflated into a single "not installed":
+    /// - **absent** — "ERROR: The system cannot find the file specified." (`0x80070002`) or "The
+    ///   specified task name ... does not exist" (`0x8004131F`);
+    /// - **access-denied** — "ERROR: Access is denied." (`0x80070005`), e.g. an unprivileged
+    ///   `schedule status` against the SYSTEM task, or its ACL-hardened definition file.
+    ///
+    /// Only a recognized access-denied signal yields [`SchedulePresence::Unknown`]; every other
+    /// failure stays [`SchedulePresence::Absent`], preserving the pre-#546 default so the self-heal
+    /// still fires (and status still reads NOT REGISTERED) for the common, possibly-localized
+    /// not-found message — while fixing the one dangerous conflation (a locked task looking absent).
+    fn classify_query(success: bool, stderr: &str) -> ScheduleStatus {
+        if success {
+            return ScheduleStatus::registered(format!("registered at {WINDOWS_TASK_PATH}"));
+        }
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("access is denied") || lower.contains("0x80070005") {
+            return ScheduleStatus::unknown(format!(
+                "cannot determine whether {WINDOWS_TASK_PATH} is registered (access denied); \
+                 re-run elevated to read it"
+            ));
+        }
+        ScheduleStatus::absent(format!("no task registered at {WINDOWS_TASK_PATH}"))
+    }
+
+    /// Best-effort removal of the now-empty `\DIG` Task Scheduler FOLDER after the task itself is
+    /// deleted, so an empty folder can't masquerade as a partial install (#546).
+    ///
+    /// The folder is Task Scheduler's on-disk representation at `%SystemRoot%\System32\Tasks\DIG`;
+    /// once `schtasks /Delete` removed the task's definition file, removing its empty parent tidies
+    /// up. [`std::fs::remove_dir`] removes an EMPTY directory only — so if any OTHER DIG task lives
+    /// under `\DIG` this is a silent no-op (the safe behavior), and a guard restricts it to the
+    /// `DIG` subfolder so the `Tasks` root itself is never touched. Never fatal: a leftover empty
+    /// folder is cosmetic.
+    fn remove_empty_task_folder() {
+        let Ok(task_file) = definition_file() else {
+            return;
+        };
+        if let Some(folder) = task_file.parent() {
+            if folder.file_name().and_then(|n| n.to_str()) == Some("DIG") {
+                let _ = std::fs::remove_dir(folder);
             }
-        } else {
-            ScheduleStatus {
-                installed: false,
-                detail: format!("no task registered at {WINDOWS_TASK_PATH}"),
-            }
-        })
+        }
     }
 
     /// Encode `text` as UTF-16LE bytes with a leading byte-order mark — the exact form
@@ -198,7 +346,56 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::utf16le_with_bom;
+        use super::{classify_query, utf16le_with_bom};
+        use crate::scheduler::SchedulePresence;
+
+        #[test]
+        fn classify_query_reports_a_successful_query_as_registered() {
+            assert_eq!(
+                classify_query(true, "").presence,
+                SchedulePresence::Registered
+            );
+        }
+
+        #[test]
+        fn classify_query_reports_a_not_found_failure_as_absent() {
+            // The two shapes schtasks prints for a genuinely missing task.
+            let file_not_found = "ERROR: The system cannot find the file specified.";
+            let no_such_task = "ERROR: The specified task name \"\\DIG\\dig-updater\" \
+                                does not exist in the system.";
+            assert_eq!(
+                classify_query(false, file_not_found).presence,
+                SchedulePresence::Absent
+            );
+            assert_eq!(
+                classify_query(false, no_such_task).presence,
+                SchedulePresence::Absent
+            );
+        }
+
+        #[test]
+        fn classify_query_reports_access_denied_as_unknown_not_absent() {
+            // The #546 fix: a locked-but-present task must NOT masquerade as absent — recognized
+            // by the English message and/or the 0x80070005 code.
+            assert_eq!(
+                classify_query(false, "ERROR: Access is denied.").presence,
+                SchedulePresence::Unknown
+            );
+            assert_eq!(
+                classify_query(false, "some prefix 0x80070005 suffix").presence,
+                SchedulePresence::Unknown
+            );
+        }
+
+        #[test]
+        fn classify_query_defaults_an_unrecognized_failure_to_absent() {
+            // Preserves the pre-#546 default so the self-heal still fires for an unfamiliar
+            // (e.g. localized) not-found message; only recognized access-denied becomes Unknown.
+            assert_eq!(
+                classify_query(false, "ERROR: something unexpected happened").presence,
+                SchedulePresence::Absent
+            );
+        }
 
         #[test]
         fn utf16le_with_bom_starts_with_the_little_endian_bom() {
@@ -322,28 +519,19 @@ mod imp {
 
     pub(super) fn status() -> Result<ScheduleStatus, BrokerError> {
         if !service_path().exists() || !timer_path().exists() {
-            return Ok(ScheduleStatus {
-                installed: false,
-                detail: format!(
-                    "no unit files at {UNIT_DIR}/{SYSTEMD_UNIT_NAME}.{{service,timer}}"
-                ),
-            });
+            return Ok(ScheduleStatus::absent(format!(
+                "no unit files at {UNIT_DIR}/{SYSTEMD_UNIT_NAME}.{{service,timer}}"
+            )));
         }
         let systemctl = systemctl()?;
         let enabled = run(&systemctl, &["is-enabled", &timer_unit_name()])?;
         Ok(if enabled.status.success() {
-            ScheduleStatus {
-                installed: true,
-                detail: format!("{} is enabled", timer_unit_name()),
-            }
+            ScheduleStatus::registered(format!("{} is enabled", timer_unit_name()))
         } else {
-            ScheduleStatus {
-                installed: false,
-                detail: format!(
-                    "unit files present but {} is not enabled",
-                    timer_unit_name()
-                ),
-            }
+            ScheduleStatus::absent(format!(
+                "unit files present but {} is not enabled",
+                timer_unit_name()
+            ))
         })
     }
 }
@@ -437,13 +625,10 @@ mod imp {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        Ok(ScheduleStatus {
-            installed: registered,
-            detail: if registered {
-                format!("{LAUNCHD_LABEL} is loaded")
-            } else {
-                format!("{LAUNCHD_LABEL} is not loaded")
-            },
+        Ok(if registered {
+            ScheduleStatus::registered(format!("{LAUNCHD_LABEL} is loaded"))
+        } else {
+            ScheduleStatus::absent(format!("{LAUNCHD_LABEL} is not loaded"))
         })
     }
 }
@@ -471,5 +656,39 @@ mod imp {
         Err(BrokerError::Unimplemented(
             "scheduler artifact (unsupported OS)",
         ))
+    }
+}
+
+// -------------------- portable self-heal DECISION tests (every OS) -------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_re_registers_only_a_provably_absent_schedule() {
+        // The heart of #546: a provably-absent schedule self-heals; a registered one is left
+        // alone; and — the safety property — a presence that can't be read is NEVER recreated.
+        assert_eq!(
+            ensure_decision(SchedulePresence::Absent),
+            EnsureAction::Reregistered
+        );
+        assert_eq!(
+            ensure_decision(SchedulePresence::Registered),
+            EnsureAction::AlreadyRegistered
+        );
+        assert_eq!(
+            ensure_decision(SchedulePresence::Unknown),
+            EnsureAction::LeftUnknown,
+        );
+    }
+
+    #[test]
+    fn installed_is_true_only_for_registered_never_for_unknown() {
+        assert!(ScheduleStatus::registered("x".into()).installed());
+        assert!(!ScheduleStatus::absent("x".into()).installed());
+        // An access-denied "can't tell" must NOT read as installed — but also must not read as a
+        // confident "absent" to the self-heal (that distinction lives in `presence`).
+        assert!(!ScheduleStatus::unknown("x".into()).installed());
     }
 }

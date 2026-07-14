@@ -159,6 +159,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_asset_kind_and_defaults_it_to_raw_binary() {
+        // dig-node opts into the native-package selection; an entry that omits `asset_kind` stays a
+        // raw binary — so existing config entries need no change (#580).
+        let json = r#"{
+            "components": [
+                { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node", "asset_kind": "native_package" },
+                { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore" }
+            ]
+        }"#;
+        let c = FeedConfig::from_json(json).unwrap();
+        assert_eq!(c.components[0].asset_kind, AssetKind::NativePackage);
+        assert_eq!(c.components[1].asset_kind, AssetKind::RawBinary);
+    }
+
+    #[test]
     fn rejects_empty_components() {
         let json = r#"{ "components": [] }"#;
         assert!(matches!(

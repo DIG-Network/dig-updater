@@ -40,7 +40,13 @@ const PLATFORMS: &[(&str, &str)] = &[
 ///
 /// Any `(os, arch)` outside the fixed [`PLATFORMS`] set falls back to the raw-binary name; the set
 /// is a compile-time constant, so that arm is unreachable in practice and exists only for totality.
-fn expected_asset_name(prefix: &str, version: &str, os: &str, arch: &str, kind: AssetKind) -> String {
+fn expected_asset_name(
+    prefix: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+    kind: AssetKind,
+) -> String {
     match (kind, os) {
         (AssetKind::NativePackage, "windows") => format!("{prefix}-{version}-{os}-{arch}.msi"),
         (AssetKind::NativePackage, "macos") => format!("{prefix}-{version}-macos.pkg"),
@@ -120,8 +126,13 @@ pub fn select_artifacts(
     let version = release.asset_version();
     let mut artifacts = Vec::new();
     for (os, arch) in PLATFORMS {
-        let expected =
-            expected_asset_name(&component.asset_prefix, version, os, arch, component.asset_kind);
+        let expected = expected_asset_name(
+            &component.asset_prefix,
+            version,
+            os,
+            arch,
+            component.asset_kind,
+        );
         if let Some(asset) = release.assets.iter().find(|a| a.name == expected) {
             artifacts.push(ResolvedArtifact {
                 os: (*os).to_string(),
@@ -180,19 +191,43 @@ mod tests {
         );
         // Native packages: the platform installer's own name.
         assert_eq!(
-            expected_asset_name("dig-node", "0.31.1", "windows", "x64", AssetKind::NativePackage),
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "windows",
+                "x64",
+                AssetKind::NativePackage
+            ),
             "dig-node-0.31.1-windows-x64.msi"
         );
         assert_eq!(
-            expected_asset_name("dig-node", "0.31.1", "macos", "arm64", AssetKind::NativePackage),
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "macos",
+                "arm64",
+                AssetKind::NativePackage
+            ),
             "dig-node-0.31.1-macos.pkg"
         );
         assert_eq!(
-            expected_asset_name("dig-node", "0.31.1", "macos", "x64", AssetKind::NativePackage),
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "macos",
+                "x64",
+                AssetKind::NativePackage
+            ),
             "dig-node-0.31.1-macos.pkg"
         );
         assert_eq!(
-            expected_asset_name("dig-node", "0.31.1", "linux", "x64", AssetKind::NativePackage),
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "linux",
+                "x64",
+                AssetKind::NativePackage
+            ),
             "dig-node_0.31.1_amd64.deb"
         );
     }
