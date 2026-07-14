@@ -45,8 +45,8 @@ pub fn require(is_elevated: impl FnOnce() -> bool) -> Result<(), BrokerError> {
 #[cfg(windows)]
 #[must_use]
 pub fn is_elevated() -> bool {
-    use std::process::{Command, Stdio};
     use crate::proc::HideConsole;
+    use std::process::{Command, Stdio};
 
     // `net session` succeeds only from an elevated console — the same probe dig-relay's and
     // dig-dns's own service registration use, so every DIG service-registering CLI fails the same

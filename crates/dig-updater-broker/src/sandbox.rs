@@ -85,10 +85,10 @@ pub fn prepare_worker_writable_dir(dir: &Path, sandbox: Sandbox) -> Result<(), B
 #[cfg(unix)]
 mod imp {
     use super::*;
+    use crate::proc::HideConsole;
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use crate::proc::HideConsole;
 
     /// True when the broker runs as root (uid 0) and therefore MUST drop privilege before running
     /// network-facing code.
@@ -179,9 +179,9 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use crate::proc::HideConsole;
     use std::io;
     use std::process::{Command, Stdio};
-    use crate::proc::HideConsole;
 
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{

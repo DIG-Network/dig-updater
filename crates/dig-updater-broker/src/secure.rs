@@ -60,8 +60,8 @@ pub fn harden_state_dir(path: &Path) -> Result<(), BrokerError> {
 /// artifact) and kept for a directory (the state/staging/last-known-good/apply dirs).
 #[cfg(windows)]
 fn harden_windows_path(path: &Path) -> Result<(), BrokerError> {
-    use std::process::Command;
     use crate::proc::HideConsole;
+    use std::process::Command;
     let inherit = if path.is_dir() { "(OI)(CI)" } else { "" };
     let status = Command::new(icacls_program()?)
         .arg(path)
@@ -141,8 +141,8 @@ pub fn harden_public_status_path(path: &Path) -> Result<(), BrokerError> {
 /// owner rights full, `Everyone` read+execute).
 #[cfg(windows)]
 fn harden_windows_public_status_path(path: &Path) -> Result<(), BrokerError> {
-    use std::process::Command;
     use crate::proc::HideConsole;
+    use std::process::Command;
     let inherit = if path.is_dir() { "(OI)(CI)" } else { "" };
     let status = Command::new(icacls_program()?)
         .arg(path)
