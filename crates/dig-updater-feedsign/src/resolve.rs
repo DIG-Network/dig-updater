@@ -11,18 +11,50 @@
 
 use serde::Deserialize;
 
-use crate::config::ComponentConfig;
+use crate::config::{AssetKind, ComponentConfig};
 use crate::error::FeedsignError;
 
-/// The platforms the beacon ships to, as `(os, arch, asset-token)` where the OS/arch tokens match
-/// the manifest's `artifact.os`/`artifact.arch` vocabulary (SPEC §5.3) and the asset-token is the
-/// suffix the release assets use.
-const PLATFORMS: &[(&str, &str, &str)] = &[
-    ("linux", "x64", "linux-x64"),
-    ("macos", "arm64", "macos-arm64"),
-    ("macos", "x64", "macos-x64"),
-    ("windows", "x64", "windows-x64.exe"),
+/// The `(os, arch)` platforms the beacon ships to, matching the manifest's `artifact.os`/
+/// `artifact.arch` vocabulary (SPEC §5.3). The exact asset FILE NAME each platform maps to depends
+/// on the component's [`AssetKind`] — see [`expected_asset_name`].
+const PLATFORMS: &[(&str, &str)] = &[
+    ("linux", "x64"),
+    ("macos", "arm64"),
+    ("macos", "x64"),
+    ("windows", "x64"),
 ];
+
+/// The exact release-asset file name a component of `kind` publishes for `(os, arch)` at `version`.
+///
+/// The DIG release repos name assets by two conventions, and the feed MUST select the one the
+/// broker will actually install (#580):
+///
+/// - **[`AssetKind::RawBinary`]** — `{prefix}-{version}-{os}-{arch}`, with `.exe` on Windows (e.g.
+///   `digstore-0.13.1-windows-x64.exe`, `dig-node-0.31.1-linux-x64`).
+/// - **[`AssetKind::NativePackage`]** — the platform installer's native name:
+///   - Windows `.msi`: `{prefix}-{version}-{os}-{arch}.msi` (`dig-node-0.31.1-windows-x64.msi`);
+///   - macOS `.pkg`: `{prefix}-{version}-macos.pkg` — ONE universal package, no arch token, so both
+///     `macos/arm64` and `macos/x64` resolve to it;
+///   - Linux `.deb`: `{prefix}_{version}_amd64.deb` — the Debian convention (underscores, `amd64`,
+///     no `linux` token), e.g. `dig-node_0.31.1_amd64.deb`.
+///
+/// Any `(os, arch)` outside the fixed [`PLATFORMS`] set falls back to the raw-binary name; the set
+/// is a compile-time constant, so that arm is unreachable in practice and exists only for totality.
+fn expected_asset_name(
+    prefix: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+    kind: AssetKind,
+) -> String {
+    match (kind, os) {
+        (AssetKind::NativePackage, "windows") => format!("{prefix}-{version}-{os}-{arch}.msi"),
+        (AssetKind::NativePackage, "macos") => format!("{prefix}-{version}-macos.pkg"),
+        (AssetKind::NativePackage, "linux") => format!("{prefix}_{version}_amd64.deb"),
+        (_, "windows") => format!("{prefix}-{version}-{os}-{arch}.exe"),
+        _ => format!("{prefix}-{version}-{os}-{arch}"),
+    }
+}
 
 /// A GitHub release, minimally deserialized: just its tag and assets.
 #[derive(Debug, Clone, Deserialize)]
@@ -93,8 +125,14 @@ pub fn select_artifacts(
 ) -> Result<Vec<ResolvedArtifact>, FeedsignError> {
     let version = release.asset_version();
     let mut artifacts = Vec::new();
-    for (os, arch, token) in PLATFORMS {
-        let expected = format!("{}-{}-{}", component.asset_prefix, version, token);
+    for (os, arch) in PLATFORMS {
+        let expected = expected_asset_name(
+            &component.asset_prefix,
+            version,
+            os,
+            arch,
+            component.asset_kind,
+        );
         if let Some(asset) = release.assets.iter().find(|a| a.name == expected) {
             artifacts.push(ResolvedArtifact {
                 os: (*os).to_string(),
@@ -121,6 +159,15 @@ mod tests {
             name: "dig-node".into(),
             repo: "DIG-Network/dig-node".into(),
             asset_prefix: "dig-node".into(),
+            asset_kind: AssetKind::RawBinary,
+        }
+    }
+
+    /// dig-node as the feed actually tracks it: a native-package component.
+    fn native_package_component() -> ComponentConfig {
+        ComponentConfig {
+            asset_kind: AssetKind::NativePackage,
+            ..component()
         }
     }
 
@@ -129,6 +176,60 @@ mod tests {
             name: name.into(),
             browser_download_url: format!("https://example.test/{name}"),
         }
+    }
+
+    #[test]
+    fn expected_asset_name_encodes_both_conventions() {
+        // Raw binaries: `{prefix}-{version}-{os}-{arch}`, `.exe` on Windows.
+        assert_eq!(
+            expected_asset_name("digstore", "0.13.1", "linux", "x64", AssetKind::RawBinary),
+            "digstore-0.13.1-linux-x64"
+        );
+        assert_eq!(
+            expected_asset_name("digstore", "0.13.1", "windows", "x64", AssetKind::RawBinary),
+            "digstore-0.13.1-windows-x64.exe"
+        );
+        // Native packages: the platform installer's own name.
+        assert_eq!(
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "windows",
+                "x64",
+                AssetKind::NativePackage
+            ),
+            "dig-node-0.31.1-windows-x64.msi"
+        );
+        assert_eq!(
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "macos",
+                "arm64",
+                AssetKind::NativePackage
+            ),
+            "dig-node-0.31.1-macos.pkg"
+        );
+        assert_eq!(
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "macos",
+                "x64",
+                AssetKind::NativePackage
+            ),
+            "dig-node-0.31.1-macos.pkg"
+        );
+        assert_eq!(
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "linux",
+                "x64",
+                AssetKind::NativePackage
+            ),
+            "dig-node_0.31.1_amd64.deb"
+        );
     }
 
     #[test]
@@ -178,12 +279,99 @@ mod tests {
             name: "digstore".into(),
             repo: "DIG-Network/digstore".into(),
             asset_prefix: "digstore".into(),
+            asset_kind: AssetKind::RawBinary,
         };
         let arts = select_artifacts(&release, &cfg).unwrap();
         assert_eq!(arts.len(), 1);
         assert_eq!(
             arts[0].url,
             "https://example.test/digstore-0.13.1-linux-x64"
+        );
+    }
+
+    /// A real dig-node release ships BOTH the raw per-OS binaries AND the native installer packages
+    /// (`.msi`/`.pkg`/`.deb`). As a native-package component (#580), the feed must select the
+    /// PACKAGES — because the broker installs dig-node via `msiexec`/`installer`/`dpkg`, so signing
+    /// the raw PE and staging it as `dig-node.msi` makes `msiexec` reject it (exit 1620).
+    fn dig_node_full_release() -> GithubRelease {
+        GithubRelease {
+            tag_name: "v0.31.1".into(),
+            assets: vec![
+                asset("dig-node-0.31.1-linux-x64"),
+                asset("dig-node-0.31.1-macos-arm64"),
+                asset("dig-node-0.31.1-macos-x64"),
+                asset("dig-node-0.31.1-macos.pkg"),
+                asset("dig-node-0.31.1-windows-x64.exe"),
+                asset("dig-node-0.31.1-windows-x64.msi"),
+                asset("dig-node_0.31.1_amd64.deb"),
+            ],
+        }
+    }
+
+    #[test]
+    fn native_package_windows_selects_the_msi_not_the_raw_exe() {
+        let arts = select_artifacts(&dig_node_full_release(), &native_package_component()).unwrap();
+        let windows = arts
+            .iter()
+            .find(|a| a.os == "windows")
+            .expect("a windows artifact");
+        assert!(
+            windows.url.ends_with("dig-node-0.31.1-windows-x64.msi"),
+            "must select the MSI, got {}",
+            windows.url
+        );
+    }
+
+    #[test]
+    fn native_package_linux_selects_the_underscore_shaped_deb() {
+        let arts = select_artifacts(&dig_node_full_release(), &native_package_component()).unwrap();
+        let linux = arts
+            .iter()
+            .find(|a| a.os == "linux")
+            .expect("a linux artifact");
+        assert!(
+            linux.url.ends_with("dig-node_0.31.1_amd64.deb"),
+            "must select the .deb, got {}",
+            linux.url
+        );
+    }
+
+    #[test]
+    fn native_package_both_macos_arches_select_the_single_universal_pkg() {
+        // dig-node ships ONE universal `-macos.pkg` (no arch token) covering both arm64 and x64, so
+        // both platform entries resolve to the same package URL.
+        let arts = select_artifacts(&dig_node_full_release(), &native_package_component()).unwrap();
+        let macos: Vec<_> = arts.iter().filter(|a| a.os == "macos").collect();
+        assert_eq!(macos.len(), 2, "both macOS arches resolve");
+        for a in macos {
+            assert!(
+                a.url.ends_with("dig-node-0.31.1-macos.pkg"),
+                "must select the .pkg for {}, got {}",
+                a.arch,
+                a.url
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_binary_component_still_selects_the_exe_from_the_same_release() {
+        // The default kind is unchanged: digstore/dig-dns/dig-updater keep resolving the raw
+        // per-OS binaries, never the packages.
+        let arts = select_artifacts(&dig_node_full_release(), &component()).unwrap();
+        let windows = arts
+            .iter()
+            .find(|a| a.os == "windows")
+            .expect("a windows artifact");
+        assert!(
+            windows.url.ends_with("dig-node-0.31.1-windows-x64.exe"),
+            "a raw-binary component selects the .exe, got {}",
+            windows.url
+        );
+        assert!(
+            arts.iter().all(|a| !a.url.ends_with(".msi")
+                && !a.url.ends_with(".pkg")
+                && !a.url.ends_with(".deb")),
+            "a raw-binary component never selects a package"
         );
     }
 

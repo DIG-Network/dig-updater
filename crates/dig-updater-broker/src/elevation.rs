@@ -6,8 +6,9 @@
 //! every platform this beacon ships to. Centralizing the OS probe here means the two callers can
 //! never drift onto two different definitions of "elevated".
 //!
-//! - **Windows:** `net session` only succeeds from an ELEVATED (UAC) console — being a member of
-//!   the Administrators group is not enough on its own.
+//! - **Windows:** the process token reports elevated (`GetTokenInformation`/`TokenElevation`) —
+//!   i.e. the actual UAC elevation state, which is true only from an elevated (Administrator)
+//!   context, NOT merely from membership in the Administrators group.
 //! - **Unix:** the effective uid is `0` (root).
 
 use crate::error::BrokerError;
@@ -42,34 +43,48 @@ pub fn require(is_elevated: impl FnOnce() -> bool) -> Result<(), BrokerError> {
 }
 
 /// Is this process elevated (Administrator on Windows, root on Unix) right now?
+///
+/// Windows: reads the process token's ACTUAL elevation state via `GetTokenInformation` with
+/// `TokenElevation`. This replaces the previous `net session` probe (#546), which shelled out to
+/// `net.exe` and returned a FALSE NEGATIVE whenever the Server (`LanmanServer`) service was stopped
+/// — reporting "not elevated" even from a genuinely elevated console, which then wrongly blocked
+/// the scheduler's own (privileged) registration. The token query has no such external dependency:
+/// it asks the OS directly whether THIS token is elevated.
 #[cfg(windows)]
 #[must_use]
 pub fn is_elevated() -> bool {
-    use crate::proc::HideConsole;
-    use std::process::{Command, Stdio};
+    use std::ffi::c_void;
 
-    // `net session` succeeds only from an elevated console — the same probe dig-relay's and
-    // dig-dns's own service registration use, so every DIG service-registering CLI fails the same
-    // way for the same reason. Resolved by absolute, trusted path (never a bare name through
-    // `PATH`), matching every other native-tool invocation in this crate.
-    let Some(system_root) = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir"))
-    else {
-        return false;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
-    let net_exe = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("net.exe");
-    let Ok(net_exe) = crate::install::trusted_absolute(net_exe) else {
-        return false;
-    };
-    Command::new(net_exe)
-        .arg("session")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .hide_console()
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY: all four calls are FFI into documented, always-available Win32 token APIs.
+    // - `GetCurrentProcess` returns a pseudo-handle that need not (and must not) be closed.
+    // - `OpenProcessToken` fills `token` with an owned handle ONLY on success (`Ok`); we close it
+    //   exactly once on every path out (success or query failure) and never use it after.
+    // - `GetTokenInformation` writes into `elevation`, a fully-initialized stack `TOKEN_ELEVATION`
+    //   whose size we pass, so there is no uninitialized read and no buffer-length mismatch.
+    // On ANY failure we conservatively report "not elevated" (fail-closed), never leaking the token.
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0u32;
+        let query = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        query.is_ok() && elevation.TokenIsElevated != 0
+    }
 }
 
 /// Is this process elevated (Administrator on Windows, root on Unix) right now?
@@ -101,5 +116,22 @@ mod tests {
         let err = require(|| false).expect_err("an unprivileged check must be refused");
         assert!(matches!(err, BrokerError::Io(_)));
         assert!(err.to_string().contains("elevated"));
+    }
+
+    /// The real token probe must run soundly (no panic, no handle leak, no crash) and return a
+    /// definite boolean — we can't assert WHICH value on an arbitrary CI runner, only that the FFI
+    /// path is exercised end-to-end. Its correctness vs the old `net session` probe is the #546 fix.
+    #[cfg(windows)]
+    #[test]
+    fn is_elevated_token_probe_runs_soundly_and_is_stable() {
+        // We can't assert WHICH value on an arbitrary runner, only that the token-query FFI path
+        // runs end-to-end without panicking/leaking and is a pure, repeatable query (the same
+        // process token yields the same answer). Its correctness vs the old `net session` probe —
+        // no dependency on the Server service — is the #546 fix.
+        assert_eq!(
+            is_elevated(),
+            is_elevated(),
+            "the elevation probe is a stable, side-effect-free query"
+        );
     }
 }

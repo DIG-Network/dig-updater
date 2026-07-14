@@ -410,7 +410,7 @@ fn run_schedule(action: ScheduleAction, json: bool) -> ExitCode {
         ScheduleAction::Status => match scheduler::status() {
             Ok(status) => {
                 println!("{}", render_schedule_status(&status, json));
-                if status.installed {
+                if status.installed() {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::from(1)
@@ -511,24 +511,25 @@ fn render_pass_report(report: &PassReport, json: bool) -> String {
 }
 
 /// Render the scheduler artifact's registration status as JSON or a human line. Pure.
+///
+/// Three states, honestly distinct (#546): REGISTERED, NOT REGISTERED (provably absent), and
+/// UNKNOWN (the presence couldn't be read — e.g. an unprivileged query against the SYSTEM task).
+/// UNKNOWN is deliberately NOT reported as NOT REGISTERED, which would have been a lie.
 fn render_schedule_status(status: &scheduler::ScheduleStatus, json: bool) -> String {
     if json {
         serde_json::json!({
             "command": "schedule status",
-            "installed": status.installed,
+            "installed": status.installed(),
             "detail": status.detail,
         })
         .to_string()
     } else {
-        format!(
-            "dig-updater: daily schedule {} — {}",
-            if status.installed {
-                "REGISTERED"
-            } else {
-                "NOT REGISTERED"
-            },
-            status.detail
-        )
+        let label = match status.presence {
+            scheduler::SchedulePresence::Registered => "REGISTERED",
+            scheduler::SchedulePresence::Absent => "NOT REGISTERED",
+            scheduler::SchedulePresence::Unknown => "UNKNOWN",
+        };
+        format!("dig-updater: daily schedule {label} — {}", status.detail)
     }
 }
 
@@ -1011,8 +1012,10 @@ mod tests {
 
     #[test]
     fn render_schedule_status_human_and_json() {
+        use scheduler::SchedulePresence;
+
         let installed = scheduler::ScheduleStatus {
-            installed: true,
+            presence: SchedulePresence::Registered,
             detail: r"registered at \DIG\dig-updater".into(),
         };
         assert!(render_schedule_status(&installed, false).contains("REGISTERED"));
@@ -1021,9 +1024,23 @@ mod tests {
         assert_eq!(json["installed"], true);
 
         let absent = scheduler::ScheduleStatus {
-            installed: false,
+            presence: SchedulePresence::Absent,
             detail: "no task registered".into(),
         };
-        assert!(render_schedule_status(&absent, false).contains("NOT REGISTERED"));
+        let absent_human = render_schedule_status(&absent, false);
+        assert!(absent_human.contains("NOT REGISTERED"));
+        assert!(!absent_human.contains("UNKNOWN"));
+
+        // #546: an access-denied query reads as its own UNKNOWN state, never as NOT REGISTERED.
+        let unknown = scheduler::ScheduleStatus {
+            presence: SchedulePresence::Unknown,
+            detail: "access denied".into(),
+        };
+        let unknown_human = render_schedule_status(&unknown, false);
+        assert!(unknown_human.contains("UNKNOWN"));
+        assert!(!unknown_human.contains("NOT REGISTERED"));
+        let unknown_json: serde_json::Value =
+            serde_json::from_str(&render_schedule_status(&unknown, true)).unwrap();
+        assert_eq!(unknown_json["installed"], false);
     }
 }

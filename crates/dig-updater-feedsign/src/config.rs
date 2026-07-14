@@ -44,6 +44,26 @@ pub struct FeedConfig {
     pub components: Vec<ComponentConfig>,
 }
 
+/// Which KIND of release asset a component ships — and therefore which per-platform asset the feed
+/// selects for it ([`crate::resolve::select_artifacts`]).
+///
+/// This is the crux of #580: the beacon's broker installs some components by replacing a raw
+/// executable in place, and others by handing a native OS installer package to `msiexec`/
+/// `installer`/`dpkg`. The feed MUST sign the SAME shape the broker will install, or the broker
+/// stages a mislabelled file (a raw PE renamed `dig-node.msi`) and its OS installer rejects it
+/// (`msiexec` exit 1620). The two vocabularies are kept in lockstep here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetKind {
+    /// A raw executable, replaced in place: `{prefix}-{version}-{os}-{arch}` (Windows adds `.exe`).
+    /// The default — digstore, dig-dns, and the beacon itself ship this way.
+    #[default]
+    RawBinary,
+    /// A native OS installer package handed to the platform installer: Windows `.msi`, macOS
+    /// `.pkg`, Linux `.deb`. dig-node ships this way (it self-manages its service stop/start).
+    NativePackage,
+}
+
 /// One tracked component: its manifest name and where to resolve its latest release.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComponentConfig {
@@ -53,10 +73,17 @@ pub struct ComponentConfig {
     /// The GitHub `owner/repo` whose latest release supplies this component's build.
     pub repo: String,
     /// The release-asset name prefix that identifies this component's binaries. An asset is a
-    /// match when its name is exactly `{asset_prefix}-{version}-{platform-token}` (e.g.
-    /// `dig-node-0.29.0-linux-x64`), which excludes sibling artifacts like the `.tar.gz` source
-    /// bundles or a differently-named companion binary in the same release.
+    /// match when its name is exactly the shape [`crate::resolve::select_artifacts`] derives for
+    /// this component's [`asset_kind`](ComponentConfig::asset_kind) (e.g. `dig-node-0.29.0-linux-x64`
+    /// for a raw binary, `dig-node_0.29.0_amd64.deb` for a native package), which excludes sibling
+    /// artifacts like the `.tar.gz` source bundles or a differently-named companion binary in the
+    /// same release.
     pub asset_prefix: String,
+    /// Whether this component ships a raw executable or a native installer package (SPEC §10.3).
+    /// Defaults to [`AssetKind::RawBinary`] when omitted, so an existing raw-binary component's
+    /// config entry needs no change.
+    #[serde(default)]
+    pub asset_kind: AssetKind,
 }
 
 fn default_schema() -> u32 {
@@ -129,6 +156,21 @@ mod tests {
         assert_eq!(c.rollback_floor_build, 0);
         assert_eq!(c.manifest_ttl_secs, 12 * 60 * 60);
         assert_eq!(c.delegation_ttl_secs, 30 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn parses_asset_kind_and_defaults_it_to_raw_binary() {
+        // dig-node opts into the native-package selection; an entry that omits `asset_kind` stays a
+        // raw binary — so existing config entries need no change (#580).
+        let json = r#"{
+            "components": [
+                { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node", "asset_kind": "native_package" },
+                { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore" }
+            ]
+        }"#;
+        let c = FeedConfig::from_json(json).unwrap();
+        assert_eq!(c.components[0].asset_kind, AssetKind::NativePackage);
+        assert_eq!(c.components[1].asset_kind, AssetKind::RawBinary);
     }
 
     #[test]

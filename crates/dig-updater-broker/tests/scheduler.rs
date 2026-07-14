@@ -51,14 +51,14 @@ fn install_then_status_then_uninstall_round_trips_cleanly() {
     // Start from a clean slate in case a prior run in this environment left something behind.
     let _ = scheduler::uninstall();
     assert!(
-        !scheduler::status().expect("status").installed,
+        !scheduler::status().expect("status").installed(),
         "must start absent"
     );
 
     scheduler::install(&exe).expect("install must succeed when run elevated");
     let status = scheduler::status().expect("status");
     assert!(
-        status.installed,
+        status.installed(),
         "the artifact must report installed: {}",
         status.detail
     );
@@ -66,7 +66,7 @@ fn install_then_status_then_uninstall_round_trips_cleanly() {
     scheduler::uninstall().expect("uninstall must succeed");
     let status = scheduler::status().expect("status");
     assert!(
-        !status.installed,
+        !status.installed(),
         "the artifact must be gone after uninstall: {}",
         status.detail
     );
@@ -82,7 +82,7 @@ fn install_is_idempotent_and_uninstall_of_an_absent_schedule_succeeds() {
 
     scheduler::install(&exe).expect("first install");
     scheduler::install(&exe).expect("re-install (e.g. a re-run installer) must not error");
-    assert!(scheduler::status().expect("status").installed);
+    assert!(scheduler::status().expect("status").installed());
 
     scheduler::uninstall().expect("uninstall");
     scheduler::uninstall().expect("uninstalling an already-absent schedule must succeed");
@@ -131,6 +131,68 @@ fn windows_task_definition_file_grants_only_admin_system_and_owner() {
     );
 
     scheduler::uninstall().expect("uninstall");
+}
+
+#[test]
+#[ignore = "mutates real OS scheduler state; requires Administrator/root — run via `-- --ignored` \
+            in the elevated scheduler CI job"]
+fn ensure_self_heals_an_absent_schedule_and_is_idempotent() {
+    // #546: `ensure` re-registers a provably-absent schedule (the self-heal), and leaves an
+    // already-registered one untouched — the exact behavior a `run`/`check --now` pass relies on to
+    // resurrect a deleted daily wake.
+    use dig_updater_broker::scheduler::EnsureAction;
+
+    let _guard = serialize();
+    let exe = fake_exe();
+    let _ = scheduler::uninstall();
+    assert!(
+        !scheduler::status().expect("status").installed(),
+        "must start absent"
+    );
+
+    // Absent -> re-registered.
+    assert_eq!(
+        scheduler::ensure(&exe).expect("ensure must self-heal an absent schedule"),
+        EnsureAction::Reregistered
+    );
+    assert!(
+        scheduler::status().expect("status").installed(),
+        "the schedule must exist after the self-heal"
+    );
+
+    // Already registered -> left untouched (idempotent).
+    assert_eq!(
+        scheduler::ensure(&exe).expect("ensure on a present schedule must not error"),
+        EnsureAction::AlreadyRegistered
+    );
+
+    scheduler::uninstall().expect("uninstall");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "mutates real OS scheduler state; requires Administrator — run via `-- --ignored` in \
+            the elevated scheduler CI job"]
+fn windows_uninstall_removes_the_orphan_dig_folder() {
+    // #546: after removing the task, the empty `\DIG` Task Scheduler folder must not linger and
+    // masquerade as a partial install.
+    let _guard = serialize();
+    let exe = fake_exe();
+    let _ = scheduler::uninstall();
+    scheduler::install(&exe).expect("install");
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let dig_folder = std::path::Path::new(&system_root)
+        .join("System32")
+        .join("Tasks")
+        .join("DIG");
+
+    scheduler::uninstall().expect("uninstall");
+    assert!(
+        !dig_folder.exists(),
+        "the empty \\DIG task folder must be removed on uninstall: {}",
+        dig_folder.display()
+    );
 }
 
 #[cfg(target_os = "linux")]

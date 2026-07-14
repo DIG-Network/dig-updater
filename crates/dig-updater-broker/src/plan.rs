@@ -94,18 +94,29 @@ impl Catalog {
 
     /// The alpha-channel defaults for the tracked component set on `platform` (SPEC §10.3). dig-node
     /// installs as a native package (MSI/pkg/deb) that self-manages its service; digstore, dig-dns
-    /// and the beacon itself are raw-binary replaces. Destinations are the conventional per-OS
-    /// locations; the installer (#504-H) owns the authoritative paths and may override them.
+    /// and the beacon itself are raw-binary replaces.
+    ///
+    /// Destinations are resolved from the RUNNING beacon's own location (#581): the universal
+    /// installer places every DIG binary — including `dig-updater` — in one install bin dir, so the
+    /// components install as SIBLINGS of the beacon. This auto-matches wherever the installer put
+    /// things (e.g. `%LOCALAPPDATA%\Programs\DigStore\bin`) with no cross-repo path config, and — the
+    /// bug this fixes — means the beacon installs to + health-probes the SAME binaries the user
+    /// actually runs, instead of a decoupled hardcoded `C:\Program Files\DIG`. Overridable so the
+    /// installer (#504-H) and tests can substitute their own destinations.
     #[must_use]
     pub fn alpha_defaults(platform: &Platform) -> Self {
+        Self::alpha_defaults_in(
+            &resolve_install_root(std::env::current_exe().ok(), platform),
+            platform,
+        )
+    }
+
+    /// [`Self::alpha_defaults`] with the install root supplied explicitly — the pure core, so the
+    /// per-component destinations + methods are unit-testable without depending on where the test
+    /// binary happens to live.
+    #[must_use]
+    fn alpha_defaults_in(bin_dir: &Path, platform: &Platform) -> Self {
         let windows = platform.os == "windows";
-        let bin_dir: PathBuf = if windows {
-            let program_files =
-                std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
-            PathBuf::from(program_files).join("DIG")
-        } else {
-            PathBuf::from("/usr/local/bin")
-        };
         let exe = |stem: &str| -> PathBuf {
             bin_dir.join(if windows {
                 format!("{stem}.exe")
@@ -263,6 +274,38 @@ impl Plan {
     }
 }
 
+/// Resolve the install root — the directory the beacon installs components INTO — from the running
+/// beacon's own executable path (#581).
+///
+/// `current_exe` is the resolved path of the running beacon (`std::env::current_exe()` in
+/// production; injected in tests). Its PARENT is the install bin dir, because the universal
+/// installer drops `dig-updater(.exe)` there alongside every other DIG binary — so components
+/// install as its siblings and the beacon probes exactly where the user's binaries live. A
+/// `None` (unresolvable exe) or a parentless path falls back to [`default_install_root`], so a
+/// pass never aborts on an exe-path lookup failure.
+#[must_use]
+fn resolve_install_root(current_exe: Option<PathBuf>, platform: &Platform) -> PathBuf {
+    current_exe
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_install_root(platform))
+}
+
+/// The conventional per-OS install root, used ONLY as the fallback when the beacon's own exe path
+/// cannot be resolved ([`resolve_install_root`]). Not the primary source of truth — the running
+/// beacon's location is (#581).
+#[must_use]
+fn default_install_root(platform: &Platform) -> PathBuf {
+    if platform.os == "windows" {
+        let program_files =
+            std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+        PathBuf::from(program_files).join("DIG")
+    } else {
+        PathBuf::from("/usr/local/bin")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +445,102 @@ mod tests {
         })
         .expect_err("a manifest artifact with no staged file is incomplete");
         assert!(matches!(err, BrokerError::StagedArtifactMissing { .. }));
+    }
+
+    #[test]
+    fn resolve_install_root_uses_the_exe_parent() {
+        // The install root is the directory the beacon binary sits in. Built with `join` so the
+        // separators are the host's — a literal `C:\...` string is a single un-splittable component
+        // on Unix, which would make this pass on Windows yet fail on Linux.
+        let bin = PathBuf::from("Programs").join("DigStore").join("bin");
+        let exe = bin.join("dig-updater.exe");
+        assert_eq!(resolve_install_root(Some(exe), &Platform::current()), bin);
+    }
+
+    #[test]
+    fn resolve_install_root_falls_back_to_the_per_os_default_when_exe_is_unresolvable() {
+        // A `None` exe path (current_exe() failed) must not abort a pass — it falls back to the
+        // conventional per-OS root.
+        let windows = Platform {
+            os: "windows".into(),
+            arch: "x64".into(),
+        };
+        assert!(resolve_install_root(None, &windows).ends_with("DIG"));
+
+        let linux = Platform {
+            os: "linux".into(),
+            arch: "x64".into(),
+        };
+        assert_eq!(
+            resolve_install_root(None, &linux),
+            PathBuf::from("/usr/local/bin")
+        );
+    }
+
+    #[test]
+    fn alpha_defaults_in_installs_every_component_as_a_sibling_of_the_bin_dir() {
+        let bin = Path::new("/opt/digstore/bin");
+        let cat = Catalog::alpha_defaults_in(bin, &platform()); // linux platform
+        assert_eq!(
+            cat.target("dig-node").unwrap().dest,
+            PathBuf::from("/opt/digstore/bin/dig-node")
+        );
+        assert_eq!(
+            cat.target("digstore").unwrap().dest,
+            PathBuf::from("/opt/digstore/bin/digstore")
+        );
+        assert_eq!(
+            cat.target("dig-updater").unwrap().dest,
+            PathBuf::from("/opt/digstore/bin/dig-updater")
+        );
+    }
+
+    #[test]
+    fn alpha_defaults_in_adds_the_exe_suffix_on_windows() {
+        // The `windows` PLATFORM (not the host) drives the `.exe` suffix; `join` keeps the expected
+        // paths on the host's separators so the assertion holds on both Windows and Linux.
+        let bin = PathBuf::from("apps").join("DigStore").join("bin");
+        let windows = Platform {
+            os: "windows".into(),
+            arch: "x64".into(),
+        };
+        let cat = Catalog::alpha_defaults_in(&bin, &windows);
+        assert_eq!(
+            cat.target("digstore").unwrap().dest,
+            bin.join("digstore.exe")
+        );
+        // dig-node is a native package on Windows (MSI), but its PROBE dest still points at the
+        // sibling exe the installer/MSI places in the bin dir.
+        assert_eq!(
+            cat.target("dig-node").unwrap().method,
+            InstallMethod::WindowsMsi
+        );
+        assert_eq!(
+            cat.target("dig-node").unwrap().dest,
+            bin.join("dig-node.exe")
+        );
+    }
+
+    #[test]
+    fn alpha_defaults_installs_beside_the_running_beacon_not_a_hardcoded_dir() {
+        // #581: the catalog must install to + probe the SAME directory the universal installer
+        // placed the beacon in — derived from the beacon's OWN location — NOT a hardcoded
+        // `C:\Program Files\DIG` / `/usr/local/bin`. `current_exe().parent()` is that install dir.
+        let exe_dir = std::env::current_exe()
+            .expect("current exe")
+            .parent()
+            .expect("exe has a parent")
+            .to_path_buf();
+        let cat = Catalog::alpha_defaults(&Platform::current());
+        for name in ["dig-node", "digstore", "dig-dns", "dig-updater"] {
+            let dest = &cat.target(name).unwrap().dest;
+            assert!(
+                dest.starts_with(&exe_dir),
+                "{name} must install beside the beacon at {}, got {}",
+                exe_dir.display(),
+                dest.display()
+            );
+        }
     }
 
     #[test]
