@@ -124,7 +124,7 @@ fn dry_check_loads_state_spawns_worker_and_never_writes_state() {
     let server = Server::start(test_feed());
 
     let report = broker
-        .dry_check(vec![FeedSource::new(&server.base)])
+        .dry_check(Some(vec![FeedSource::new(&server.base)]))
         .expect("dry_check runs the worker and parses its report");
 
     // The worker pins the production key, so a test-signed feed is rejected — proving the whole
@@ -151,7 +151,7 @@ fn dry_check_still_returns_its_verdict_when_the_status_mirror_cannot_be_written(
 
     let server = Server::start(test_feed());
     let report = broker
-        .dry_check(vec![FeedSource::new(&server.base)])
+        .dry_check(Some(vec![FeedSource::new(&server.base)]))
         .expect("an unwritable status mirror must not fail the dry check");
 
     // The verdict is still produced (Rejected here only because the worker pins the production

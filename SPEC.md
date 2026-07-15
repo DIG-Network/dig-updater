@@ -5,7 +5,8 @@ beacon (`dig-updater`). An independent reimplementation MUST be buildable agains
 document alone. The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are used per RFC 2119.
 
 The beacon keeps every installed DIG binary (`dig-node`, `dig-installer`, `dig-relay`,
-future components) current on the **nightly alpha channel**: once a day it fetches a signed
+future components) current on its configured update **channel** — `stable` (tested releases, the
+default) or `nightly` (bleeding-edge builds) (§13.1): once a day it fetches that channel's signed
 description of the latest builds, verifies it, downloads the artifacts, verifies each one,
 and installs them behind a health gate — rolling back on failure.
 
@@ -214,7 +215,7 @@ An implementation MUST include a test that a manifest carrying an unknown field 
 
 ---
 
-## 6. Monotonic trust state
+## 6. Monotonic trust state — PER CHANNEL
 
 The beacon persists the freshest values it has ever accepted. This state is what turns a
 validly-signed but *stale* manifest (a freeze or rollback replay) into a rejected one.
@@ -241,15 +242,52 @@ TrustState {
   missing a known mark (a truncation/tamper) MUST fail closed, NOT be read as a zeroed baseline —
   only a wholly-absent state file is a fresh install.
 
+### 6.1 One independent state PER CHANNEL
+
+Because the feed is published per channel (§10.1), each channel keeps its OWN monotonic trust
+state, persisted in a SEPARATE file in the same Admin/SYSTEM-only directory with identical
+hardening: `trust-state-nightly.json` and `trust-state-stable.json`. A pass loads AND advances ONLY
+the file for the channel it is tracking (§13.1). This yields the per-channel anti-rollback
+invariants:
+
+- **A channel switch can never rewind the OTHER channel's floor.** Each channel's four marks are a
+  high-water mark WITHIN that channel alone; while a beacon tracks one channel, the other channel's
+  file is untouched. A `stable → nightly → stable` switch therefore leaves the stable marks exactly
+  where they were — a switch cannot lower any floor. The two floors are structurally independent.
+- **A freshly-selected channel's first-manifest replay is bounded by ANTI-FREEZE, not by monotonic
+  state.** A channel with no prior state file accepts its first valid, UNEXPIRED manifest as the
+  baseline. The `now <= manifest.expires` check (§7.1) is ABSOLUTE (wall-clock vs `expires`),
+  independent of monotonic state — so an adversary cannot serve a >12h-stale, validly-signed
+  manifest as that "first" baseline after a switch.
+- **Cross-channel version movement is an AUTHORIZED operator action, not a rollback exploit.**
+  Switching `nightly → stable` installs the last stable `vX.Y.Z` — OLDER code than nightly HEAD — a
+  deliberate "downgrade to tested". `channel set` is elevation-gated (§13.1); anti-rollback's job is
+  ONLY to stop a network adversary forcing an old build WITHIN a channel, which per-channel state
+  keeps entirely separate from the operator's cross-channel choice.
+- **Build scales are per channel and never compared across channels.** Stable uses the packed-semver
+  `build` (`major·10⁶ + minor·10³ + patch`); nightly uses the UTC build date `YYYYMMDD` (§10.3).
+  Because each channel's anti-downgrade comparison is bounded to its own state file, the two scales
+  never meet.
+
+**Legacy migration.** The pre-channel beacon kept a single `trust-state.json`. On the first load
+after upgrade the NIGHTLY channel ADOPTS that legacy file (legacy alpha ≡ nightly, §10.1), so an
+install already on the bleeding-edge stream keeps its monotonic marks with no reset; STABLE has no
+legacy file and starts fresh (its first unexpired manifest is the baseline, bounded by anti-freeze
+above). Once a channel's own file exists it is authoritative — the legacy file is never written to
+again and never shadows it.
+
 ---
 
 ## 7. Freshness — anti-rollback, anti-freeze, anti-downgrade
 
 A valid signature is necessary but NOT sufficient. Before acting on a manifest the beacon MUST
-enforce, in addition to the signature checks (§9):
+enforce, in addition to the signature checks (§9), against the tracked channel's OWN monotonic state
+(§6.1):
 
 1. **Not expired.** `now <= manifest.expires`. The delegation MUST also satisfy
-   `now <= delegation.expires`.
+   `now <= delegation.expires`. This ABSOLUTE wall-clock check is what bounds a freshly-selected
+   channel's first-manifest replay (§6.1) — it does not depend on prior monotonic state, so a fresh
+   channel's baseline manifest cannot be a >12h-stale replay.
 2. **Anti-rollback (sequence).** `manifest.sequence >= state.sequence`.
 3. **Anti-freeze (generated).** `manifest.generated >= state.generated`.
 4. **Delegation monotonicity.** `manifest.root_version >= state.root_version`.
@@ -397,9 +435,10 @@ containing folder (Windows `\DIG`) so an empty folder cannot masquerade as a par
 
 ## 9. Verification algorithm (normative)
 
-Given the pinned root key `R`, the persisted `TrustState S`, a `SignedDelegation D`, a
-`SignedManifest M`, and the current time `now`, a pass MUST proceed in this order and MUST
-abort (install nothing) on the first failure:
+Given the pinned root key `R`, the persisted `TrustState S` — of the TRACKED channel (§6.1), loaded
+from that channel's own `trust-state-<channel>.json` — a `SignedDelegation D`, a `SignedManifest M`,
+and the current time `now`, a pass MUST proceed in this order and MUST abort (install nothing) on
+the first failure:
 
 1. **Verify the delegation.** Decode `D.signature` (base64→64 bytes). Verify it strictly over
    `D`'s **received payload bytes** (§5.4) under `R`. On failure → reject. Then require
@@ -487,14 +526,14 @@ the freshest manifest by monotonic `sequence`, keeping them in lock-step is a re
 a trust dependency — a client that reaches either base installs the identical verified bytes.
 
 **Legacy `/v1/alpha` (back-compat).** The pre-channel beacon fetched a single feed at
-`https://updates.dig.net/v1/alpha` + the rolling `feed` release. Until the beacon's channel-aware
-fetch ladder ships (#604), those bases MUST keep serving: the `stable` feed is mirrored to
-`/v1/alpha` + the rolling `feed` release byte-for-byte, so a not-yet-upgraded beacon keeps receiving
-exactly the content it already got (its selection is unchanged — `releases/latest`). The
-legacy alpha ≡ nightly mapping and the migration of installed alpha beacons onto `/v1/nightly` are
-the beacon's responsibility (#604, with per-channel trust state); the feed side only keeps
-`/v1/alpha` alive, unchanged, alongside the two channel feeds. `/v1/alpha` + `feed` retire once
-every beacon has upgraded past #604.
+`https://updates.dig.net/v1/alpha` + the rolling `feed` release. A channel-aware beacon (#604) NO
+LONGER fetches these: it derives its ladder from the tracked channel (`/v1/<channel>` + the
+`feed-<channel>` release, §13.1), maps a legacy `alpha` config to NIGHTLY (alpha ≡ nightly),
+adopting its old single-channel trust state as the nightly per-channel state (§6.1). The legacy
+bases MUST nonetheless keep serving for beacons NOT YET upgraded past #604: the `stable` feed is
+mirrored to `/v1/alpha` + the rolling `feed` release byte-for-byte, so an un-upgraded beacon keeps
+receiving exactly the content it already got. `/v1/alpha` + `feed` retire once every beacon has
+upgraded past #604.
 
 ### 10.2 Cadence + freshness
 
@@ -752,8 +791,9 @@ field is added) so a consumer can tell which fields to expect.
 
 ### 13.1 `config.json` — the Admin-writable channel + pause state
 
-Persisted at `<state_dir>/config.json` — the SAME Admin/SYSTEM-only directory as
-`trust-state.json` (§6, §9.3), so it inherits the identical directory-level lock-down. Mutating it
+Persisted at `<state_dir>/config.json` — the SAME Admin/SYSTEM-only directory as the per-channel
+`trust-state-<channel>.json` (§6.1, §9.3), so it inherits the identical directory-level lock-down.
+Mutating it
 is therefore a privileged operation, gated at the CLI layer by the same elevation check the
 scheduler artifact's own registration uses (§8.4): on Windows the process token's ACTUAL elevation
 state (`GetTokenInformation`/`TokenElevation` — not group membership, and not a `net session` shell-
@@ -764,25 +804,29 @@ means only a privileged reader can open it at all.
 ```jsonc
 // config.json
 {
-  "schema":        1,        // u32, on-disk schema version
-  "channel":       "alpha",  // "alpha" | "stable" — the update channel this beacon tracks
-  "paused":        false,    // bool — auto-updates are suspended
-  "paused_until":  null      // u64 unix seconds, or null — an optional pause deadline (a "snooze")
+  "schema":        1,          // u32, on-disk schema version
+  "channel":       "stable",   // "nightly" | "stable" — the update channel this beacon tracks
+  "paused":        false,      // bool — auto-updates are suspended
+  "paused_until":  null        // u64 unix seconds, or null — an optional pause deadline (a "snooze")
 }
 ```
 
-- `channel` — `"alpha"` is the only channel the feed serves today (§10.3); `"stable"` is a
-  reserved, not-yet-servable value. A conformant CLI MUST refuse `channel set stable` with a clear
-  reason rather than silently accepting a value that will never actually change what is fetched.
+- `channel` — the update channel this beacon tracks: `"stable"` (tested `vX.Y.Z` releases) or
+  `"nightly"` (bleeding-edge `main`-HEAD builds). It selects BOTH which signed feed the beacon
+  fetches (`/v1/<channel>`, §10.1) AND which per-channel monotonic trust state it advances (§6.1).
+  Both channels are fully servable. The legacy pre-channel token `"alpha"` deserializes to
+  `"nightly"` (alpha ≡ nightly, §10.1) and is re-persisted as `"nightly"`, so an old `config.json`
+  and an old `channel set alpha` keep working transparently. A conformant CLI accepts `nightly`,
+  `stable`, and the `alpha` alias, and refuses any other token with a clear usage error.
 - `paused` / `paused_until` — a pass is EFFECTIVELY paused at a given time `now` iff `paused` is
   `true` AND (`paused_until` is absent OR `now < paused_until`). A pause with no `paused_until`
   stays in effect until an explicit `resume`; a pause WITH a `paused_until` lapses on its own once
   `now` reaches it — a caller need not `resume` a timed snooze for it to stop gating passes. This
   is the exact predicate `is_paused_at` in the reference implementation.
-- A missing `config.json` is a fresh install: `channel = "alpha"`, `paused = false`,
-  `paused_until = null`. A PRESENT but malformed file MUST fail closed (rejected, not silently
-  reset to the fresh-install default) — an operator's channel/pause choice is not something a
-  parse error should silently discard.
+- A missing `config.json` is a fresh install: `channel = "stable"` (the safe default — tested
+  releases only; nightly is opt-in), `paused = false`, `paused_until = null`. A PRESENT but
+  malformed file MUST fail closed (rejected, not silently reset to the fresh-install default) — an
+  operator's channel/pause choice is not something a parse error should silently discard.
 - **Enforcement point.** `Broker::run_once`/`run_once_with_feed` (a FULL pass — the daily schedule
   OR an on-demand `check --now`) MUST consult the effective pause state, inside the single-instance
   lock (§8.2) and BEFORE the network or the ACL self-check are touched, and MUST return a distinct,
@@ -806,7 +850,7 @@ Administrator/root.
 {
   "schema":           1,                 // u32, on-disk schema version
   "version":          "0.6.0",            // the beacon binary version that wrote this snapshot
-  "channel":          "alpha",
+  "channel":          "stable",           // "nightly" | "stable" (the tracked channel)
   "paused":           false,              // the EFFECTIVE value (a lapsed timed pause reports
                                            // false here even before an explicit `resume`)
   "paused_until":     null,
@@ -836,17 +880,18 @@ Administrator/root.
 }
 ```
 
-- **Not authoritative.** `trust_state` here is a read-only COPY for observability. The
-  ENFORCEMENT copy — the one §7/§9 checks a candidate manifest against — is exclusively the
-  Admin-only `trust-state.json` (§6). A reader that trusted `status.json`'s `trust_state` for a
-  SECURITY decision would be trusting an unauthenticated local file; that is acceptable for "should
-  I show a badge", never for "should I install this".
+- **Not authoritative.** `trust_state` here is a read-only COPY (of the TRACKED channel's marks) for
+  observability. The ENFORCEMENT copy — the one §7/§9 checks a candidate manifest against — is
+  exclusively the Admin-only per-channel `trust-state-<channel>.json` (§6.1). A reader that trusted
+  `status.json`'s `trust_state` for a SECURITY decision would be trusting an unauthenticated local
+  file; that is acceptable for "should I show a badge", never for "should I install this".
 - **Refreshed after every check/run/config change.** A conformant beacon writes a fresh
   `status.json` after `check` (dry or `--now`), `run`, `channel set`, `pause`, and `resume` — a
   config-only mutation refreshes just the `channel`/`paused`/`paused_until` fields, preserving the
   last check/run's `last_check*`/`components` history rather than clobbering it. Writing this file
   is BEST-EFFORT: a failure to persist it MUST NOT fail the check/run/config-change itself — only
-  `config.json`/`trust-state.json` are security-load-bearing; `status.json` is informational.
+  `config.json` + the per-channel `trust-state-<channel>.json` are security-load-bearing;
+  `status.json` is informational.
 - **An `installed` component's `detail` states VERIFIED reality, never a plan-time prediction.**
   For a full pass, the health gate (§9.5) re-probes the version actually running at the
   component's destination immediately after installing it; the persisted `detail` for a
@@ -870,11 +915,11 @@ Administrator/root.
 
 | Command | Reads | Writes | Elevation | Notes |
 |---|---|---|---|---|
-| `check` / `check --dry-run` | `trust-state.json` (freshness compare) | `status.json` (best-effort) | No | Never installs, never advances trust state, never pause-gated. State dir honors `$DIG_UPDATER_STATE_DIR` (below); the `status.json` refresh is fail-soft. |
+| `check` / `check --dry-run` | `config.json` (channel), `trust-state-<channel>.json` (freshness compare) | `status.json` (best-effort) | No | Never installs, never advances trust state, never pause-gated. Inspects the tracked channel's feed; state dir honors `$DIG_UPDATER_STATE_DIR` (below); the `status.json` refresh is fail-soft. |
 | `check --now` | — | everything a full pass writes | Whatever `run` requires | Identical to `run` — an on-demand trigger of the SAME `Broker::run_once_with_feed`. |
-| `run` | `config.json`, `trust-state.json` | `trust-state.json`, `status.json`, installed binaries | Whatever the per-OS install path requires | Pause-gated (§13.1); this is what the scheduler artifact invokes. |
+| `run` | `config.json`, `trust-state-<channel>.json` | `trust-state-<channel>.json`, `status.json`, installed binaries | Whatever the per-OS install path requires | Pause-gated (§13.1); fetches the tracked channel's feed (§10.1) and advances THAT channel's state; this is what the scheduler artifact invokes. |
 | `channel get` | `status.json` | — | No | |
-| `channel set <alpha>` | `config.json` | `config.json`, `status.json` | Yes | Rejects `stable` (§13.1) and any other token. |
+| `channel set <nightly\|stable>` | `config.json` | `config.json`, `status.json` | Yes | Accepts `nightly`, `stable`, and the `alpha` alias (→ nightly); rejects any other token (§13.1). |
 | `pause [--until <ts>]` | `config.json` | `config.json`, `status.json` | Yes | |
 | `resume` | `config.json` | `config.json`, `status.json` | Yes | |
 | `status` | `status.json` | — | No | Always answerable (§13.2). |

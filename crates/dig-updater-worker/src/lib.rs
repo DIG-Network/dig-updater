@@ -42,9 +42,7 @@ use dig_updater_trust::{
 };
 
 pub use error::WorkerError;
-pub use feed::{
-    production_feed_ladder, FeedSource, Platform, FALLBACK_FEED_BASE, PRIMARY_FEED_BASE,
-};
+pub use feed::{channel_feed_ladder, FeedSource, Platform, FALLBACK_FEED_HOST, PRIMARY_FEED_HOST};
 pub use net::{size_cap, HARD_CEILING_BYTES};
 pub use report::{StagedArtifact, VerifiedPlan, WorkerReport, WorkerRequest};
 

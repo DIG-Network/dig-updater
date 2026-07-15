@@ -25,6 +25,7 @@ use base64::Engine as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+use dig_updater_broker::config::Channel;
 use dig_updater_broker::{
     BrokerError, Catalog, ComponentResult, ComponentTarget, DetectedVersion, InstallMethod,
     Installer, LkgCache, PassReport, RetryPolicy, TrustStateStore,
@@ -179,7 +180,7 @@ fn apply(
     detect: &dyn Fn(&Path) -> DetectedVersion,
     health: &dyn Fn(&Path) -> DetectedVersion,
 ) -> Result<PassReport, BrokerError> {
-    let store = TrustStateStore::at(home);
+    let store = TrustStateStore::for_channel(home, Channel::Stable);
     let loaded = store.load().expect("load state");
     let lkg = LkgCache::at(home.join("lkg"));
     let staging_dir = home.join("staging");
@@ -248,7 +249,7 @@ fn fresh_install_places_bytes_and_advances_state() {
         "real bytes installed"
     );
     assert!(
-        home.path().join("trust-state.json").exists(),
+        home.path().join("trust-state-stable.json").exists(),
         "state persisted"
     );
     assert_state_dir_hardened(home.path());
@@ -363,7 +364,7 @@ fn health_failure_rolls_back_to_the_reverified_previous_build() {
         "a rolled-back pass must NOT advance the trust state"
     );
     assert!(
-        !home.path().join("trust-state.json").exists(),
+        !home.path().join("trust-state-stable.json").exists(),
         "no state write on a failed pass"
     );
 }
@@ -544,7 +545,7 @@ fn apply_self_and_other(
     self_dest: &Path,
     other_dest: &Path,
 ) -> PassReport {
-    let store = TrustStateStore::at(home);
+    let store = TrustStateStore::for_channel(home, Channel::Stable);
     let loaded = store.load().expect("load state");
     let lkg = LkgCache::at(home.join("lkg"));
     let staging_dir = home.join("staging");

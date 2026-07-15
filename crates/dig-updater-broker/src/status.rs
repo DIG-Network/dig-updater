@@ -333,7 +333,7 @@ mod tests {
 
     fn verified_plan() -> WorkerReport {
         WorkerReport::Verified(VerifiedPlan {
-            source: "https://updates.dig.net/v1/alpha".into(),
+            source: "https://updates.dig.net/v1/nightly".into(),
             schema: 1,
             root_version: 1,
             sequence: 42,

@@ -26,24 +26,36 @@ pub const CONFIG_SCHEMA: u32 = 1;
 
 const CONFIG_FILE: &str = "config.json";
 
-/// The update channel a beacon tracks. `Alpha` is the only channel the feed serves today (SPEC
-/// §10.3); `Stable` is reserved for a future production release and is not yet actionable.
+/// The update channel a beacon tracks — the choice that selects which signed feed it fetches and
+/// which per-channel anti-rollback state it advances (SPEC §10.1, §6, §13.1).
+///
+/// A channel is a fully independent trust context: each has its OWN feed path (`/v1/<channel>`) and
+/// its OWN monotonic `trust-state-<channel>.json` (§6), so switching between channels can never
+/// rewind the OTHER channel's rollback floor (#591 D5).
+///
+/// The legacy pre-channel token `"alpha"` deserializes to [`Channel::Nightly`] (the bleeding-edge
+/// stream alpha testers opted into — SPEC §10.1) and is re-persisted as `"nightly"`, so an old
+/// `config.json` keeps working transparently. Fresh installs default to [`Channel::Stable`] — tested
+/// releases only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
-    /// The nightly alpha channel — the only channel served today.
+    /// Bleeding-edge nightly builds from `main` HEAD (`/v1/nightly`). The legacy `"alpha"` token
+    /// aliases here — alpha ≡ nightly (SPEC §10.1, #591 D3).
+    #[serde(alias = "alpha")]
+    Nightly,
+    /// Tested `vX.Y.Z` releases only (`/v1/stable`) — the default for fresh installs.
     #[default]
-    Alpha,
-    /// Reserved for the future production channel.
     Stable,
 }
 
 impl Channel {
-    /// The wire/CLI token for this channel (`"alpha"` / `"stable"`).
+    /// The wire/CLI token for this channel (`"nightly"` / `"stable"`) — the SAME token that appears
+    /// on the feed path (`/v1/<token>`, SPEC §10.1) and in `config.json`/`status.json`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Alpha => "alpha",
+            Self::Nightly => "nightly",
             Self::Stable => "stable",
         }
     }
@@ -176,12 +188,41 @@ mod tests {
         let (_dir, store) = store();
         let config = UpdaterConfig {
             schema: CONFIG_SCHEMA,
-            channel: Channel::Alpha,
+            channel: Channel::Nightly,
             paused: true,
             paused_until: Some(1_700_000_000),
         };
         store.save(&config).expect("save");
         assert_eq!(store.load().expect("load"), config);
+    }
+
+    #[test]
+    fn a_fresh_install_defaults_to_the_stable_channel() {
+        // SPEC §13.1: a fresh install (no config.json) tracks STABLE — tested releases only, the
+        // safe default. Nightly is opt-in.
+        assert_eq!(UpdaterConfig::default().channel, Channel::Stable);
+        assert_eq!(Channel::default(), Channel::Stable);
+    }
+
+    #[test]
+    fn a_legacy_alpha_config_loads_as_nightly_and_repersists_as_nightly() {
+        // Migration (#591 D3): an old `config.json` written with `"channel":"alpha"` keeps working
+        // — it loads as Nightly (alpha ≡ nightly) and, once re-saved, is persisted as `"nightly"`.
+        let (dir, store) = store();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"schema":1,"channel":"alpha","paused":false,"paused_until":null}"#,
+        )
+        .unwrap();
+        let loaded = store.load().expect("a legacy alpha config still parses");
+        assert_eq!(loaded.channel, Channel::Nightly);
+
+        store.save(&loaded).expect("re-persist");
+        let reserialized = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(
+            reserialized.contains("\"channel\": \"nightly\""),
+            "a migrated alpha config re-persists as nightly, not alpha: {reserialized}"
+        );
     }
 
     #[test]
@@ -211,7 +252,7 @@ mod tests {
 
     #[test]
     fn channel_display_and_as_str_use_the_wire_token() {
-        assert_eq!(Channel::Alpha.as_str(), "alpha");
+        assert_eq!(Channel::Nightly.as_str(), "nightly");
         assert_eq!(Channel::Stable.to_string(), "stable");
     }
 
