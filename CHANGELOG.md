@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-07-15
+
+### Features
+- **beacon:** Track nightly|stable channel with per-channel anti-rollback state + CLI (#18)
+
 ## [0.9.0] - 2026-07-14
 
 ### Features
