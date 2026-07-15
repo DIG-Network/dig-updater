@@ -11,8 +11,10 @@
 //! - `run` — a FULL pass ([`Broker::run_once`]): verify, install behind the health gate, and
 //!   (always last) the beacon's own self-update. This is the command the per-OS scheduler
 //!   artifact ([`dig_updater_broker::scheduler`]) invokes daily.
-//! - `channel get|set <alpha>` — read or set the update channel (SPEC §13.1). `get` never needs
-//!   elevation (it reads the unprivileged status mirror); `set` does (it writes `config.json`).
+//! - `channel get|set <nightly|stable>` — read or set the update channel (SPEC §13.1); the channel
+//!   selects which signed feed the beacon fetches and which per-channel anti-rollback state it
+//!   advances. `get` never needs elevation (it reads the unprivileged status mirror); `set` does
+//!   (it writes `config.json`). The legacy `alpha` token is accepted as an alias for `nightly`.
 //! - `pause [--until <unix-ts>]` / `resume` — suspend/resume auto-updates (SPEC §13.1); a paused
 //!   beacon's next `run`/`check --now` no-ops instead of acting. Requires elevation.
 //! - `schedule install|uninstall|status` — register/remove/report the daily scheduler artifact
@@ -34,7 +36,7 @@ use std::process::ExitCode;
 use dig_updater_broker::config::{Channel, UpdaterConfig};
 use dig_updater_broker::status::StatusSnapshot;
 use dig_updater_broker::{elevation, scheduler, Broker, BrokerError, PassReport};
-use dig_updater_worker::{production_feed_ladder, FeedSource, WorkerReport};
+use dig_updater_worker::{FeedSource, WorkerReport};
 
 const USAGE: &str = "\
 dig-updater — DIG auto-update beacon
@@ -48,7 +50,8 @@ COMMANDS:
     run                  Run one FULL pass: verify, install behind the health gate, and
                          self-update. This is what the daily schedule invokes.
     channel get          Print the currently configured update channel.
-    channel set <alpha>  Set the update channel (requires Administrator/root).
+    channel set <chan>   Set the update channel to `nightly` or `stable` (requires
+                         Administrator/root). `alpha` is accepted as an alias for `nightly`.
     pause [--until <ts>] Suspend auto-updates, optionally until a unix-seconds deadline
                          (requires Administrator/root).
     resume               Resume auto-updates (requires Administrator/root).
@@ -116,7 +119,7 @@ enum CheckMode {
 #[derive(Debug, PartialEq, Eq)]
 enum ChannelAction {
     Get,
-    /// The raw token (e.g. `"alpha"`), validated against the known channels at execution time —
+    /// The raw token (e.g. `"nightly"`), validated against the known channels at execution time —
     /// keeping `parse` itself total and side-effect-free.
     Set(String),
     Unknown(String),
@@ -210,7 +213,7 @@ fn parse_channel_action(action: Option<&str>, token: Option<&str>) -> ChannelAct
     match (action, token) {
         (Some("get"), _) => ChannelAction::Get,
         (Some("set"), Some(token)) => ChannelAction::Set(token.to_string()),
-        (Some("set"), None) => ChannelAction::Unknown("set (missing <alpha>)".to_string()),
+        (Some("set"), None) => ChannelAction::Unknown("set (missing <nightly|stable>)".to_string()),
         (Some(other), _) => ChannelAction::Unknown(other.to_string()),
         (None, _) => ChannelAction::Unknown(String::new()),
     }
@@ -235,14 +238,13 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
-/// Resolve the feed ladder: an explicit override (flag) wins; else `$DIG_UPDATER_FEED_BASE`; else
-/// the production ladder. Only the feed URL is overridable — never the trusted key.
-fn resolve_feed(feed_base: Option<String>) -> Vec<FeedSource> {
-    let override_base = feed_base.or_else(|| std::env::var("DIG_UPDATER_FEED_BASE").ok());
-    match override_base {
-        Some(base) => vec![FeedSource::new(base)],
-        None => production_feed_ladder(),
-    }
+/// Resolve an OPTIONAL feed-transport override: an explicit `--feed-base` flag wins, else
+/// `$DIG_UPDATER_FEED_BASE`. `None` means "no override" — the broker then derives the ladder from
+/// the tracked channel (SPEC §13.1). Only the feed URL is overridable — never the trusted key.
+fn resolve_feed(feed_base: Option<String>) -> Option<Vec<FeedSource>> {
+    feed_base
+        .or_else(|| std::env::var("DIG_UPDATER_FEED_BASE").ok())
+        .map(|base| vec![FeedSource::new(base)])
 }
 
 /// Run a DRY verification pass (`check` / `check --dry-run`) and print the report. Never installs
@@ -339,18 +341,17 @@ fn run_channel(action: ChannelAction, json: bool) -> ExitCode {
     }
 }
 
-/// Validate a `channel set` token against the channels the beacon actually understands. `Stable`
-/// exists as a wire/config value (SPEC §13.1) but is not yet servable, so setting it is refused
-/// with a clear reason rather than silently accepted and then never actually switching feeds.
+/// Validate a `channel set` token against the channels the beacon tracks (SPEC §13.1). Both
+/// `nightly` and `stable` are servable; the legacy `alpha` token is accepted as a hidden alias for
+/// `nightly` (alpha ≡ nightly, #591 D3) so an existing caller keeps working. Anything else is a
+/// clear usage error rather than a silently-ignored value.
 fn parse_channel_token(token: &str) -> Result<Channel, String> {
-    match token {
-        "alpha" => Ok(Channel::Alpha),
-        "stable" => Err(
-            "channel 'stable' is reserved for a future production release; only 'alpha' is \
-             available now"
-                .to_string(),
-        ),
-        other => Err(format!("unknown channel '{other}' (expected 'alpha')")),
+    match token.trim().to_ascii_lowercase().as_str() {
+        "nightly" | "alpha" => Ok(Channel::Nightly),
+        "stable" => Ok(Channel::Stable),
+        other => Err(format!(
+            "unknown channel '{other}' (expected 'nightly' or 'stable')"
+        )),
     }
 }
 
@@ -713,9 +714,9 @@ mod tests {
             }
         );
         assert_eq!(
-            parse(&v(&["channel", "set", "alpha"])),
+            parse(&v(&["channel", "set", "nightly"])),
             Cmd::Channel {
-                action: ChannelAction::Set("alpha".to_string()),
+                action: ChannelAction::Set("nightly".to_string()),
                 json: false
             }
         );
@@ -726,7 +727,7 @@ mod tests {
         assert_eq!(
             parse(&v(&["channel", "set"])),
             Cmd::Channel {
-                action: ChannelAction::Unknown("set (missing <alpha>)".to_string()),
+                action: ChannelAction::Unknown("set (missing <nightly|stable>)".to_string()),
                 json: false
             }
         );
@@ -825,24 +826,24 @@ mod tests {
     }
 
     #[test]
-    fn feed_override_flag_beats_production_ladder() {
-        let sources = resolve_feed(Some("http://x/feed".to_string()));
+    fn feed_override_flag_yields_a_single_source() {
+        let sources = resolve_feed(Some("http://x/feed".to_string())).expect("an override is Some");
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].base, "http://x/feed");
     }
 
     #[test]
-    fn no_override_uses_production_ladder() {
-        // Ensure the env override is not set for this assertion.
+    fn no_override_defers_the_ladder_to_the_broker_channel() {
+        // With no `--feed-base`/env override, `resolve_feed` returns None — the broker then derives
+        // the ladder from the tracked channel (SPEC §13.1), never a hardcoded feed.
         std::env::remove_var("DIG_UPDATER_FEED_BASE");
-        let sources = resolve_feed(None);
-        assert_eq!(sources.len(), 2);
+        assert_eq!(resolve_feed(None), None);
     }
 
     fn verified_report() -> WorkerReport {
         use dig_updater_worker::{StagedArtifact, VerifiedPlan};
         WorkerReport::Verified(VerifiedPlan {
-            source: "https://updates.dig.net/v1/alpha".into(),
+            source: "https://updates.dig.net/v1/nightly".into(),
             schema: 1,
             root_version: 1,
             sequence: 42,
@@ -924,11 +925,11 @@ mod tests {
         let status = never_checked_status();
         let human = render_status(&status, false);
         assert!(human.contains("never checked"));
-        assert!(human.contains("channel=alpha"));
+        assert!(human.contains("channel=stable"));
         assert!(human.contains("paused=false"));
 
         let json: serde_json::Value = serde_json::from_str(&render_status(&status, true)).unwrap();
-        assert_eq!(json["channel"], "alpha");
+        assert_eq!(json["channel"], "stable");
         assert_eq!(json["last_check"], serde_json::Value::Null);
     }
 
@@ -954,12 +955,16 @@ mod tests {
     #[test]
     fn render_channel_human_and_json() {
         assert_eq!(
-            render_channel(Channel::Alpha, false),
-            "dig-updater: channel = alpha"
+            render_channel(Channel::Nightly, false),
+            "dig-updater: channel = nightly"
         );
         let json: serde_json::Value =
-            serde_json::from_str(&render_channel(Channel::Alpha, true)).unwrap();
-        assert_eq!(json["channel"], "alpha");
+            serde_json::from_str(&render_channel(Channel::Nightly, true)).unwrap();
+        assert_eq!(json["channel"], "nightly");
+        // Stable renders its own token too.
+        let stable: serde_json::Value =
+            serde_json::from_str(&render_channel(Channel::Stable, true)).unwrap();
+        assert_eq!(stable["channel"], "stable");
     }
 
     #[test]
@@ -990,12 +995,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_channel_token_accepts_alpha_and_explains_stable_and_unknown() {
-        assert_eq!(parse_channel_token("alpha"), Ok(Channel::Alpha));
-        assert!(parse_channel_token("stable")
-            .unwrap_err()
-            .contains("reserved"));
+    fn parse_channel_token_accepts_nightly_stable_and_the_alpha_alias_rejects_garbage() {
+        assert_eq!(parse_channel_token("nightly"), Ok(Channel::Nightly));
+        assert_eq!(parse_channel_token("stable"), Ok(Channel::Stable));
+        // `alpha` is a hidden back-compat alias for nightly (alpha ≡ nightly, #591 D3).
+        assert_eq!(parse_channel_token("alpha"), Ok(Channel::Nightly));
+        // Case/whitespace tolerant.
+        assert_eq!(parse_channel_token("  STABLE "), Ok(Channel::Stable));
+        // Anything else is a clear usage error, never silently accepted.
         assert!(parse_channel_token("beta").unwrap_err().contains("unknown"));
+        assert!(parse_channel_token("garbage")
+            .unwrap_err()
+            .contains("unknown"));
     }
 
     #[test]

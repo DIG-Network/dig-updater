@@ -31,9 +31,10 @@
 //! Every store this crate persists lives under one of two directories, each with the OPPOSITE
 //! grant from the other — never mix them up:
 //!
-//! - [`Broker::state_dir`] — Admin/SYSTEM-only ([`secure::harden_state_dir`]): `trust-state.json`
-//!   ([`state::TrustStateStore`]) and `config.json` ([`config::ConfigStore`]). Mutating either is
-//!   a privileged act, gated by [`elevation::require_elevated`] at the CLI call site.
+//! - [`Broker::state_dir`] — Admin/SYSTEM-only ([`secure::harden_state_dir`]): the per-channel
+//!   `trust-state-<channel>.json` ([`state::TrustStateStore`]) and `config.json`
+//!   ([`config::ConfigStore`]). Mutating either is a privileged act, gated by
+//!   [`elevation::require_elevated`] at the CLI call site.
 //! - [`Broker::status_dir`] — world-readable ([`secure::harden_public_status_path`]):
 //!   `status.json` ([`status::StatusStore`]), a snapshot ANY identity may read without elevation.
 //!
@@ -71,9 +72,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dig_updater_trust::beacon_root_verifying_key;
-use dig_updater_worker::{
-    production_feed_ladder, FeedSource, Platform, WorkerReport, WorkerRequest,
-};
+use dig_updater_worker::{channel_feed_ladder, FeedSource, Platform, WorkerReport, WorkerRequest};
 
 // Re-exported so consumers (the CLI, tests) can read the enumeration/health probe's inputs +
 // outputs without depending on `dig-release-resolver` directly — the broker owns that contract.
@@ -148,8 +147,8 @@ impl Broker {
         }
     }
 
-    /// The state directory this broker reads/writes (Admin/SYSTEM-only — `trust-state.json` +
-    /// `config.json`).
+    /// The state directory this broker reads/writes (Admin/SYSTEM-only — the per-channel
+    /// `trust-state-<channel>.json` + `config.json`).
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
@@ -162,46 +161,62 @@ impl Broker {
         paths::sibling_status_dir(&self.state_dir)
     }
 
-    /// Run a **dry** update check: load the persisted trust state, spawn the unprivileged worker
-    /// to fetch + verify the feed and stage the artifacts, and return its report. This performs
-    /// NO install and NEVER advances the trust state (SPEC §9 step 7 gates advancement on a
-    /// health-checked install, which is #504-E). Also refreshes the unprivileged status mirror
-    /// (SPEC §13.2) — best-effort; a failure to write it never fails the check itself.
+    /// Run a **dry** update check: load the tracked channel's persisted trust state, spawn the
+    /// unprivileged worker to fetch + verify that channel's feed and stage the artifacts, and return
+    /// its report. This performs NO install and NEVER advances the trust state (SPEC §9 step 7 gates
+    /// advancement on a health-checked install, which is #504-E). Also refreshes the unprivileged
+    /// status mirror (SPEC §13.2) — best-effort; a failure to write it never fails the check itself.
+    ///
+    /// `feed_override` is an untrusted-transport override (`--feed-base`/`$DIG_UPDATER_FEED_BASE`,
+    /// §1); `None` derives the ladder from the tracked channel ([`channel_feed_ladder`]). The
+    /// channel comes from `config.json` — the source of truth — so a dry check inspects the SAME
+    /// channel a full pass would act on.
     ///
     /// # Errors
     ///
     /// [`BrokerError`] if the state cannot be loaded or the worker cannot be run.
-    pub fn dry_check(&self, feed_sources: Vec<FeedSource>) -> Result<WorkerReport, BrokerError> {
-        let loaded = TrustStateStore::at(&self.state_dir).load()?;
-        let report = self.fetch_and_verify(feed_sources, loaded.state, Sandbox::Restricted)?;
-        // The config read here is PURELY for the status mirror (channel/paused to report) — a
+    pub fn dry_check(
+        &self,
+        feed_override: Option<Vec<FeedSource>>,
+    ) -> Result<WorkerReport, BrokerError> {
+        // The config read here is PURELY informational for a dry check (the channel selects which
+        // feed + which per-channel state to inspect, and channel/paused mirror to status) — a
         // corrupt/unreadable config must never fail an otherwise-successful dry check, so it
-        // degrades to the default rather than propagating (contrast `run_once_with_feed`, where
-        // the SAME read gates a real pass and so fails closed).
+        // degrades to the default rather than propagating (contrast `run_once_with_feed`, where the
+        // SAME read gates a real pass and so fails closed).
         let config = ConfigStore::at(&self.state_dir).load().unwrap_or_default();
+        let loaded = TrustStateStore::for_channel(&self.state_dir, config.channel).load()?;
+        let feed_sources =
+            feed_override.unwrap_or_else(|| channel_feed_ladder(config.channel.as_str()));
+        let report = self.fetch_and_verify(feed_sources, loaded.state, Sandbox::Restricted)?;
         self.refresh_status_after_check(&report, &config, now_unix_secs(), loaded.state);
         Ok(report)
     }
 
-    /// Run exactly one FULL update pass against the production feed ladder — the entry point the
-    /// daily scheduler artifact invokes. See [`Self::run_once_with_feed`] for the full contract.
+    /// Run exactly one FULL update pass against the tracked channel's feed ladder — the entry point
+    /// the daily scheduler artifact invokes. The ladder is derived from the persisted channel (SPEC
+    /// §13.1), so `run` fetches + verifies the channel the operator selected. See
+    /// [`Self::run_once_with_feed`] for the full contract.
     ///
     /// # Errors
     ///
     /// See [`Self::run_once_with_feed`].
     pub fn run_once(&self) -> Result<PassReport, BrokerError> {
-        self.run_once_with_feed(production_feed_ladder())
+        self.run_once_with_feed(None)
     }
 
-    /// Run exactly one FULL update pass against an explicit feed ladder: single-instance lock →
-    /// the pause gate → ACL self-check → spawn the unprivileged worker to fetch + verify + stage →
-    /// INDEPENDENTLY re-verify under the pinned key → enumerate → silent per-OS install behind a
-    /// health gate → re-verified rollback on failure → advance the trust state only on full
-    /// success → the beacon's own self-update, always last. This is the beacon's production entry
-    /// point (SPEC §8.2, §9, §9.5) — the one a scheduled wake, a manual `dig-updater run`, or
-    /// `check --now` (#504-G) invokes. [`Self::run_once`] is this with the production ladder;
-    /// threading the feed sources through here is what lets the CLI's `--feed-base` override apply
-    /// to EITHER caller without bypassing any of this gating.
+    /// Run exactly one FULL update pass: single-instance lock → the pause gate → derive the tracked
+    /// channel's feed ladder → ACL self-check → spawn the unprivileged worker to fetch + verify +
+    /// stage → INDEPENDENTLY re-verify under the pinned key → enumerate → silent per-OS install
+    /// behind a health gate → re-verified rollback on failure → advance the CHANNEL's trust state
+    /// only on full success → the beacon's own self-update, always last. This is the beacon's
+    /// production entry point (SPEC §8.2, §9, §9.5) — the one a scheduled wake, a manual
+    /// `dig-updater run`, or `check --now` (#504-G) invokes.
+    ///
+    /// `feed_override` is an untrusted-transport override (`--feed-base`/`$DIG_UPDATER_FEED_BASE`,
+    /// §1); `None` derives the ladder from the persisted channel ([`channel_feed_ladder`]) — which
+    /// is what makes the tracked channel MEAN something. Threading the override through here lets the
+    /// CLI's `--feed-base` apply to EITHER caller without bypassing any of this gating.
     ///
     /// If a prior pass is still holding the lock (its schedule overran), this returns a
     /// [`PassReport::already_running`] immediately rather than an error — SPEC §8.2 makes that an
@@ -223,7 +238,7 @@ impl Broker {
     /// rollback cannot complete; [`BrokerError::Io`] on a filesystem error.
     pub fn run_once_with_feed(
         &self,
-        feed_sources: Vec<FeedSource>,
+        feed_override: Option<Vec<FeedSource>>,
     ) -> Result<PassReport, BrokerError> {
         // Acquired before ANY other work, per SPEC §8.2 — including before `run_pass`'s own
         // harden-then-ACL-check step. On Unix this is safe because the lock creates `state_dir`
@@ -252,9 +267,20 @@ impl Broker {
             return Ok(report);
         }
 
+        // The channel selects BOTH which feed is fetched and which per-channel trust state is
+        // advanced — derived from config unless the caller overrode the transport.
+        let feed_sources =
+            feed_override.unwrap_or_else(|| channel_feed_ladder(config.channel.as_str()));
         let root = beacon_root_verifying_key();
         let probe = pass::spawn_version_probe();
-        let report = self.run_pass(&root, feed_sources, Sandbox::Restricted, &probe, &probe)?;
+        let report = self.run_pass(
+            &root,
+            config.channel,
+            feed_sources,
+            Sandbox::Restricted,
+            &probe,
+            &probe,
+        )?;
         self.refresh_status_after_pass(&report, &config, now_unix_secs());
         Ok(report)
     }
@@ -275,7 +301,10 @@ impl Broker {
     /// floor; [`BrokerError::StateCorrupt`] if the persisted state is malformed; [`BrokerError::Io`]
     /// on a filesystem error.
     pub fn rollback(&self) -> Result<Vec<String>, BrokerError> {
-        let floor = TrustStateStore::at(&self.state_dir)
+        // Anchor the floor to the TRACKED channel's persisted state — the channel a `run` advances,
+        // so a manual rollback is bounded by the same per-channel floor a pass would enforce (§9.5).
+        let channel = ConfigStore::at(&self.state_dir).load()?.channel;
+        let floor = TrustStateStore::for_channel(&self.state_dir, channel)
             .load()?
             .state
             .rollback_floor_build;
@@ -377,17 +406,20 @@ impl Broker {
         Ok(config)
     }
 
-    /// The full production pass, parameterized by the trust `root` and version `probe`s so the
-    /// pinned-key entry point ([`run_once`](Self::run_once)) and future callers share one body.
+    /// The full production pass, parameterized by the trust `root`, the tracked `channel`, and the
+    /// version `probe`s so the pinned-key entry point ([`run_once`](Self::run_once)) and future
+    /// callers share one body. The `channel` selects which per-channel trust state
+    /// ([`TrustStateStore::for_channel`]) this pass loads and advances (SPEC §6, #591 D5).
     fn run_pass(
         &self,
         root: &ed25519_dalek::VerifyingKey,
+        channel: Channel,
         feed_sources: Vec<FeedSource>,
         sandbox: Sandbox,
         detect: &health::VersionProbe,
         health: &health::VersionProbe,
     ) -> Result<PassReport, BrokerError> {
-        let store = TrustStateStore::at(&self.state_dir);
+        let store = TrustStateStore::for_channel(&self.state_dir, channel);
         let staging_dir = self.staging_dir();
         let apply_dir = self.apply_dir();
         let lkg = LkgCache::at(self.lkg_dir());
@@ -496,10 +528,10 @@ impl Broker {
         self.write_status_best_effort(&StatusSnapshot::from_dry_check(report, &ctx));
     }
 
-    /// Persist the status mirror produced by a FULL pass, re-reading the trust state so a
-    /// just-advanced set of marks (a successful install) is reflected immediately.
+    /// Persist the status mirror produced by a FULL pass, re-reading the tracked channel's trust
+    /// state so a just-advanced set of marks (a successful install) is reflected immediately.
     fn refresh_status_after_pass(&self, report: &PassReport, config: &UpdaterConfig, now: u64) {
-        let trust_state = TrustStateStore::at(&self.state_dir)
+        let trust_state = TrustStateStore::for_channel(&self.state_dir, config.channel)
             .load()
             .map(|loaded| loaded.state)
             .unwrap_or_default();
@@ -661,6 +693,7 @@ mod tests {
         let err = broker
             .run_pass(
                 &root,
+                Channel::Stable,
                 vec![FeedSource::new("http://127.0.0.1:9/feed")],
                 Sandbox::Inherit,
                 &probe,
@@ -702,8 +735,9 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
 
-        // Persist a trust state whose enforced floor is build 10_000.
-        let store = TrustStateStore::at(broker.state_dir());
+        // Persist the STABLE channel's trust state (the default) whose enforced floor is build
+        // 10_000 — the same channel the manual `rollback()` reads from config.
+        let store = TrustStateStore::for_channel(broker.state_dir(), Channel::Stable);
         let persisted = dig_updater_trust::TrustState {
             root_version: 1,
             sequence: 1,
@@ -846,7 +880,7 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
         let err = broker
-            .set_channel(Channel::Alpha, || false)
+            .set_channel(Channel::Nightly, || false)
             .expect_err("setting the channel without elevation must be refused");
         assert!(matches!(err, BrokerError::Io(_)));
     }
@@ -888,8 +922,9 @@ mod tests {
     fn status_and_channel_reads_never_require_elevation() {
         let home = tempfile::tempdir().expect("home");
         let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
-        // A fresh install: never checked, default channel — answerable with NO privilege probe.
-        assert_eq!(broker.channel().expect("channel get"), Channel::Alpha);
+        // A fresh install: never checked, default channel (stable) — answerable with NO privilege
+        // probe.
+        assert_eq!(broker.channel().expect("channel get"), Channel::Stable);
         assert_eq!(
             broker.status().expect("status"),
             StatusSnapshot::never_checked()
@@ -900,9 +935,10 @@ mod tests {
     fn set_channel_updates_both_the_config_and_the_status_mirror() {
         let home = tempfile::tempdir().expect("home");
         let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+        // Switch OFF the default (stable) so the assertion proves the set actually took.
         broker
-            .set_channel(Channel::Alpha, || true)
+            .set_channel(Channel::Nightly, || true)
             .expect("an elevated channel set succeeds");
-        assert_eq!(broker.channel().expect("channel get"), Channel::Alpha);
+        assert_eq!(broker.channel().expect("channel get"), Channel::Nightly);
     }
 }

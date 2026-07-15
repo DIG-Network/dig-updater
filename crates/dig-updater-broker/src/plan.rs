@@ -31,14 +31,30 @@ pub const BEACON_COMPONENT_NAME: &str = "dig-updater";
 /// comparison agrees byte-for-byte with the number the signed manifest carries.
 const FIELD_RADIX: u64 = 1_000;
 
-/// Pack a `major.minor.patch` version string into the manifest's monotonic `build` number.
+/// Pack an installed component's `--version` string into its monotonic `build` number — on the
+/// SAME per-channel scale the signed manifest's `build`/floor use (SPEC §10.3, §7.5, #591 D5).
 ///
-/// Mirrors the feed-signer's `Version::build_number` (SPEC §10.3). Returns `None` for anything not
-/// parseable as three decimal fields with `minor`/`patch` below the radix — the caller treats an
-/// unparseable installed version as "cannot prove its age", which is the conservative default on
-/// the rollback-floor check.
+/// The version string is SELF-DESCRIBING, so no channel argument is needed:
+///
+/// - a **nightly** prerelease `X.Y.Z-nightly.YYYYMMDD.<sha>` packs to its UTC build DATE `YYYYMMDD`
+///   ([`nightly_build_date`]) — the nightly scale, matching the feed-signer's `parse_nightly_build`.
+///   The nightly `-suffix` is NEVER semver-parsed into the anti-downgrade decision (#591 D5): doing
+///   so would pack it onto the stable thousands-scale and mis-compare it against a YYYYMMDD floor.
+/// - a **stable** `major.minor.patch` (v-prefix + `+build` metadata tolerated) packs to the packed
+///   monotonic semver, mirroring the feed-signer's `Version::build_number`.
+///
+/// Returns `None` for anything it cannot age — a malformed nightly date, or a non-semver stable
+/// string — which the caller treats as "cannot prove its age", the conservative default on the
+/// rollback-floor check. The two scales are never compared across channels: each channel keeps its
+/// own monotonic trust state (§6, `state.rs`), so a stable build (thousands) and a nightly build
+/// (tens of millions) never meet.
 #[must_use]
 pub fn pack_build(version: &str) -> Option<u64> {
+    // A nightly-shaped version is aged by its date, never by its semver core — even when the date
+    // is malformed (in which case it is un-ageable, NOT silently semver-packed onto the wrong scale).
+    if version.contains("-nightly.") {
+        return nightly_build_date(version);
+    }
     let trimmed = version.trim().strip_prefix('v').unwrap_or(version.trim());
     let core = trimmed.split(['-', '+']).next().unwrap_or(trimmed);
     let mut parts = core.split('.');
@@ -49,6 +65,24 @@ pub fn pack_build(version: &str) -> Option<u64> {
         return None;
     }
     Some(major * FIELD_RADIX * FIELD_RADIX + minor * FIELD_RADIX + patch)
+}
+
+/// The nightly build number: the UTC build DATE `YYYYMMDD` parsed from a nightly prerelease version
+/// `X.Y.Z-nightly.YYYYMMDD.<sha>` (#590/#591 D5).
+///
+/// Mirrors the feed-signer's `parse_nightly_build` (SPEC §10.3) so the beacon ages an installed
+/// nightly on the SAME scale the signed manifest's nightly `build`/floor use. `None` when the
+/// `-nightly.` date segment is not exactly eight decimal digits — a malformed local nightly is
+/// treated as un-ageable (fail-safe: a rollback refuses what it cannot prove is at/above the floor)
+/// rather than mis-packed onto the stable scale.
+#[must_use]
+fn nightly_build_date(version: &str) -> Option<u64> {
+    let after = version.split("-nightly.").nth(1)?;
+    let date = after.split('.').next().unwrap_or_default();
+    if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    date.parse::<u64>().ok()
 }
 
 /// How a tracked component's artifact is installed on the host.
@@ -92,9 +126,10 @@ impl Catalog {
         Self { targets }
     }
 
-    /// The alpha-channel defaults for the tracked component set on `platform` (SPEC §10.3). dig-node
-    /// installs as a native package (MSI/pkg/deb) that self-manages its service; digstore, dig-dns
-    /// and the beacon itself are raw-binary replaces.
+    /// The default tracked-component catalog on `platform` (SPEC §10.3) — channel-agnostic, since
+    /// both channels track the SAME component set, differing only in which release each resolves.
+    /// dig-node installs as a native package (MSI/pkg/deb) that self-manages its service; digstore,
+    /// dig-dns and the beacon itself are raw-binary replaces.
     ///
     /// Destinations are resolved from the RUNNING beacon's own location (#581): the universal
     /// installer places every DIG binary — including `dig-updater` — in one install bin dir, so the
@@ -372,6 +407,41 @@ mod tests {
         assert_eq!(pack_build("garbage"), None);
         assert_eq!(pack_build("1.2"), None);
         assert_eq!(pack_build("1.1000.0"), None);
+    }
+
+    #[test]
+    fn pack_build_of_a_nightly_version_is_its_utc_date_not_the_semver_core() {
+        // A nightly `--version` is aged by its YYYYMMDD build DATE — the same scale the feed-signer
+        // stamps on the nightly manifest `build`/floor (SPEC §10.3, #591 D5) — NOT by semver-packing
+        // its `X.Y.Z` core (which would land on the stable thousands-scale and mis-compare against a
+        // date-scale floor). Here 0.9.0 would semver-pack to 9_000, but the nightly build is the date.
+        assert_eq!(
+            pack_build("0.9.0-nightly.20260714.abc1234"),
+            Some(20_260_714)
+        );
+        assert_eq!(
+            pack_build("0.31.1-nightly.20251231.deadbeef"),
+            Some(20_251_231)
+        );
+        assert_eq!(pack_build("1.2.3-nightly.20260101.f00"), Some(20_260_101));
+    }
+
+    #[test]
+    fn pack_build_of_a_nightly_version_with_a_bad_date_is_unageable() {
+        // A nightly-SHAPED string with a malformed date is un-ageable (None) — it must NOT silently
+        // fall through to semver-packing its `X.Y.Z` core onto the wrong scale. A rollback then
+        // refuses what it cannot prove is at/above the floor (fail-safe), rather than mis-comparing.
+        assert_eq!(pack_build("0.9.0-nightly.2026071.abc"), None); // 7-digit date
+        assert_eq!(pack_build("0.9.0-nightly.notadate.abc"), None);
+        assert_eq!(pack_build("0.9.0-nightly."), None); // empty date
+    }
+
+    #[test]
+    fn pack_build_still_ignores_ordinary_non_nightly_prerelease_metadata() {
+        // A plain `-rc`/`+build` suffix on a STABLE version is dropped and the semver core is packed
+        // (unchanged behaviour) — only the `-nightly.` shape switches to the date scale.
+        assert_eq!(pack_build("0.15.0-rc.1"), Some(15_000));
+        assert_eq!(pack_build("0.15.0+build.7"), Some(15_000));
     }
 
     #[test]
