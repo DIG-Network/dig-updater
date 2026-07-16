@@ -1160,12 +1160,15 @@ Two channels ship from one orchestrator (`.github/workflows/nightly-release.yml`
 The orchestrator triggers ONLY on:
 
 - `schedule: cron '0 0 * * *'` — **midnight UTC** (GitHub Actions cron is always UTC; a top-of-hour
-  cron MAY be delayed under load — acceptable, since both channels are idempotent), and
+  cron MAY be delayed under load — acceptable, since the nightly channel is idempotent), and
 - `workflow_dispatch` with two inputs: `channel` (`both` | `stable` | `nightly`, default `both`) and
   `force` (boolean, default `false`).
 
-It MUST NOT trigger on `push` to `main`. A schedule run exercises BOTH channels; a dispatch runs the
-selected channel(s).
+It MUST NOT trigger on `push` to `main`. A schedule run cuts ONLY the nightly channel — the STABLE
+`vX.Y.Z` tag is cut solely by a manual `workflow_dispatch` (`channel: stable` or `both`), never by
+the cron (a scheduled `both` = nightly only). This is CLAUDE.md §3.6-A: in `modules/apps`, a stable
+release is manual-dispatch-only, so a fleet-reaching version tag is always a deliberate human act.
+A dispatch runs the selected channel(s).
 
 **Dispatch-reachable jobs are bound to `main` (defense-in-depth).** Every job that pushes a tag or a
 changelog commit with `RELEASE_TOKEN` (the `stable` job's `git push origin HEAD:main`; the
@@ -1180,7 +1183,8 @@ environment-scoped `RELEASE_TOKEN`; the ref guard is accident/abuse protection o
 
 **60-day auto-disable caveat.** GitHub auto-disables a `schedule:` trigger after 60 days with no
 repo activity on a public repo, with no auto-re-enable — and since this cron is the ONLY automatic
-release trigger, a quiet repo can silently stop releasing with no error surfaced anywhere. Detect
+release trigger (nightlies), a quiet repo can silently stop cutting nightlies with no error surfaced
+anywhere (stable releases are unaffected — they are manual-dispatch-only). Detect
 it with `gh api repos/<owner>/<repo>/actions/workflows/nightly-release.yml --jq .state` (a value of
 `disabled_inactivity` means it was auto-disabled) and recover with `gh workflow enable
 nightly-release.yml` (see `runbooks/release.md`). Any repo activity resets the 60-day counter.
