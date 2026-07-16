@@ -89,6 +89,17 @@ fn current_config_schema() -> u32 {
     CONFIG_SCHEMA
 }
 
+/// Does the raw `config.json` object explicitly DECLARE a `channel` field? Used only to tell a
+/// pre-channel-field LEGACY config (adopt nightly — see [`ConfigStore::load`]) apart from a config
+/// that recorded its channel. A non-object or unparseable body answers `false` (the migration
+/// decision is moot — `load` deserializes it separately and fails closed on real corruption).
+fn bytes_declare_channel(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| value.as_object().map(|obj| obj.contains_key("channel")))
+        .unwrap_or(false)
+}
+
 impl Default for UpdaterConfig {
     fn default() -> Self {
         Self {
@@ -142,8 +153,22 @@ impl ConfigStore {
     /// if the file exists but is not valid [`UpdaterConfig`] JSON.
     pub fn load(&self) -> Result<UpdaterConfig, BrokerError> {
         match std::fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| BrokerError::StateCorrupt(format!("config: {e}"))),
+            Ok(bytes) => {
+                let mut config: UpdaterConfig = serde_json::from_slice(&bytes)
+                    .map_err(|e| BrokerError::StateCorrupt(format!("config: {e}")))?;
+                // Migration edge (#621 item 2): a `config.json` that EXISTS but entirely LACKS the
+                // `channel` field is a PRE-channel-field legacy config. Those beacons ran the single
+                // legacy `alpha` ≡ nightly stream (§10.1), so they must ADOPT nightly — not silently
+                // start a fresh STABLE trust state, which the struct `#[default]` would otherwise
+                // pick and which would numerically brick their nightly-scale (`YYYYMMDD`) marks. A
+                // fresh install has NO file at all (handled below), so a field-absent-but-present
+                // config is unambiguously legacy: field-present configs (including `"alpha"`, which
+                // aliases to nightly through serde) keep their recorded channel untouched.
+                if !bytes_declare_channel(&bytes) {
+                    config.channel = Channel::Nightly;
+                }
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UpdaterConfig::default()),
             Err(e) => Err(BrokerError::Io(e.to_string())),
         }
@@ -222,6 +247,30 @@ mod tests {
         assert!(
             reserialized.contains("\"channel\": \"nightly\""),
             "a migrated alpha config re-persists as nightly, not alpha: {reserialized}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_config_missing_the_channel_field_adopts_nightly_not_stable() {
+        // #621 item 2: a `config.json` that EXISTS but has NO `channel` field is a pre-channel-field
+        // legacy config — those beacons ran the single legacy `alpha` ≡ nightly stream, so on first
+        // load they must ADOPT nightly. The struct `#[default]` is Stable, so without the migration
+        // guard this would silently start a fresh stable trust state and numerically brick the
+        // beacon's existing nightly-scale marks (below-floor self-DoS). A missing FILE (fresh
+        // install) still correctly defaults to stable — see `a_fresh_install_defaults_to_the_stable_channel`.
+        let (dir, store) = store();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"schema":1,"paused":false,"paused_until":null}"#,
+        )
+        .unwrap();
+        let loaded = store
+            .load()
+            .expect("a field-absent legacy config still parses");
+        assert_eq!(
+            loaded.channel,
+            Channel::Nightly,
+            "a pre-channel-field config must adopt nightly, not the struct-default stable"
         );
     }
 

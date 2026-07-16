@@ -180,6 +180,21 @@ fn apply(
     detect: &dyn Fn(&Path) -> DetectedVersion,
     health: &dyn Fn(&Path) -> DetectedVersion,
 ) -> Result<PassReport, BrokerError> {
+    apply_with_suppress(root, report, home, dest, detect, health, false)
+}
+
+/// As [`apply`], but lets a caller set `suppress_state_advance` (#621 item 1 — an overridden feed
+/// installs but must not advance the tracked channel's persisted trust state).
+#[allow(clippy::too_many_arguments)]
+fn apply_with_suppress(
+    root: &VerifyingKey,
+    report: &WorkerReport,
+    home: &Path,
+    dest: &Path,
+    detect: &dyn Fn(&Path) -> DetectedVersion,
+    health: &dyn Fn(&Path) -> DetectedVersion,
+    suppress_state_advance: bool,
+) -> Result<PassReport, BrokerError> {
     let store = TrustStateStore::for_channel(home, Channel::Stable);
     let loaded = store.load().expect("load state");
     let lkg = LkgCache::at(home.join("lkg"));
@@ -209,6 +224,7 @@ fn apply(
         detect,
         health,
         service_ctl: &|_, _| Ok(()),
+        suppress_state_advance,
     };
     installer.apply(root, report, loaded)
 }
@@ -256,6 +272,52 @@ fn fresh_install_places_bytes_and_advances_state() {
         "state persisted"
     );
     assert_state_dir_hardened(home.path());
+}
+
+#[test]
+fn an_overridden_feed_installs_the_bytes_but_never_advances_the_tracked_channel_state() {
+    // #621 item 1: a real pass with an out-of-band `--feed-base`/`$DIG_UPDATER_FEED_BASE` override
+    // may fetch marks on a DIFFERENT channel's version scale than the tracked channel. Folding those
+    // into the tracked channel's monotonic trust state would corrupt its anti-rollback floor (a
+    // below-floor self-DoS the operator could not easily undo). So `suppress_state_advance` installs
+    // the bytes as normal but WITHHOLDS the state advance — nothing is persisted for the channel.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("digstore");
+
+    let artifact = b"an-override-fetched-digstore-binary";
+    let srv = Server::bind();
+    let m = manifest(&srv.base, "0.2.0", 2_000, 0, artifact);
+    let _guard = srv.serve(routes(&m, artifact));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let detect = |_: &Path| DetectedVersion::Absent;
+    let health = |_: &Path| DetectedVersion::Present("digstore 0.2.0".to_string());
+    let result = apply_with_suppress(
+        &test_root().verifying_key(),
+        &report,
+        home.path(),
+        &dest,
+        &detect,
+        &health,
+        true, // feed overridden → suppress the state advance
+    )
+    .expect("apply succeeds even when state advance is suppressed");
+
+    assert!(result.applied);
+    assert_eq!(result.components[0].result, ComponentResult::Installed);
+    assert!(
+        !result.state_advanced,
+        "an overridden-feed pass must NOT advance the tracked channel's trust state"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        artifact,
+        "the bytes are still installed — only the state advance is withheld"
+    );
+    assert!(
+        !home.path().join("trust-state-stable.json").exists(),
+        "no trust state is persisted for the tracked channel from an off-channel override feed"
+    );
 }
 
 #[test]
@@ -594,6 +656,7 @@ fn apply_self_and_other(
         detect: &detect,
         health: &health,
         service_ctl: &|_, _| Ok(()),
+        suppress_state_advance: false,
     };
     installer
         .apply(&test_root().verifying_key(), report, loaded)
@@ -774,6 +837,7 @@ fn apply_with_service(
         detect,
         health,
         service_ctl,
+        suppress_state_advance: false,
     };
     installer
         .apply(&test_root().verifying_key(), report, loaded)
@@ -954,6 +1018,7 @@ fn apply_aliased(
         detect,
         health,
         service_ctl,
+        suppress_state_advance: false,
     };
     installer.apply(&test_root().verifying_key(), report, loaded)
 }

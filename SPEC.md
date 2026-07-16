@@ -268,6 +268,12 @@ invariants:
   `build` (`major·10⁶ + minor·10³ + patch`); nightly uses the UTC build date `YYYYMMDD` (§10.3).
   Because each channel's anti-downgrade comparison is bounded to its own state file, the two scales
   never meet.
+- **The last-known-good rollback cache is ALSO per channel.** The cached last-known-good build a
+  rollback restores (§9.5) is stored in a per-channel subdirectory (`lkg/<channel>`), mirroring the
+  per-channel trust state. A channel's cached build and the rollback floor gating it are therefore
+  ALWAYS on the same version scale, so a channel switch can never leave a nightly-dated build
+  (`YYYYMMDD`) cached where a later stable-channel restore would compare it against the semver floor
+  and pass spuriously. A shared cache would cross the scales that the state files keep separate.
 
 **Legacy migration.** The pre-channel beacon kept a single `trust-state.json`. On the first load
 after upgrade the NIGHTLY channel ADOPTS that legacy file (legacy alpha ≡ nightly, §10.1), so an
@@ -407,7 +413,20 @@ operation (Administrator on Windows, root on Unix) — the same precondition the
 Every artifact invokes the SAME command: a full pass (§9), never the dry check. The jitter
 spreads fleet-wide load off a single instant; boot recovery ensures a machine that was off past
 the scheduled time still gets a prompt update on its next boot rather than waiting a full day
-for the next occurrence. The Windows Task definition file, and (on Unix) the unit/plist files
+for the next occurrence.
+
+**Discoverable identity (MANDATORY).** The scheduler artifact MUST present the human-readable
+display name **`DIG NETWORK: BEACON`** wherever the OS surfaces it, PARALLEL to the OS-service
+identities `DIG NETWORK: NODE` (dig-node) and `DIG NETWORK: DNS` (dig-dns) — the ecosystem's
+canonical OS-service identity contract (superproject `SYSTEM.md`). Windows carries it in the
+Scheduled Task `<RegistrationInfo><Description>` (with the task's canonical `<URI>` = `\DIG\dig-updater`);
+systemd carries it in the `.service` + `.timer` `Description=`; launchd's identity IS its canonical
+reverse-DNS `Label` (`net.dignetwork.dig-updater` — macOS surfaces no separate friendly name). The
+machine identifiers are unchanged (the Windows task path, the systemd unit stem, the launchd label
+stay canonical); the display name is a legibility label. `dig-updater status` and `dig-updater
+schedule status` MUST echo `DIG NETWORK: BEACON` so the beacon's identity + health are readable
+without inspecting the OS scheduler. A change to this display name is a cross-repo contract change
+coordinated with `SYSTEM.md` + the `canonical` skill. The Windows Task definition file, and (on Unix) the unit/plist files
 themselves, MUST be locked down to the same Admin/SYSTEM-or-root bar as every other guarded path
 this beacon depends on (§9.3) — Unix unit/plist files follow the platform convention of
 root-owned, mode `0644` (world-readable, root-writable only, matching how `systemctl status`/
@@ -1038,6 +1057,17 @@ Every command MUST offer both a human-readable line and a `--json` machine-reada
 The feed base is overridable per `--feed-base <url>`/`$DIG_UPDATER_FEED_BASE` on `check` and `run`
 alike (untrusted transport, §1); the pinned root key has no such override.
 
+**An overridden feed on a real pass installs but MUST NOT advance the tracked channel's trust
+state.** The feed override selects the transport (which base the manifest is fetched from), while the
+tracked channel — the source of truth for WHICH per-channel state file (§6.1) a pass advances — comes
+from `config.json`. A `run --feed-base <other-channel's feed>` therefore fetches marks that may be on
+a DIFFERENT channel's build scale (nightly `YYYYMMDD` vs stable packed-semver). Folding those into
+the tracked channel's monotonic state would numerically corrupt its anti-rollback floor — e.g. a
+nightly-scale mark advancing `trust-state-stable.json` bricks future stable updates below the false
+floor (an operator-triggered self-DoS). So on a full pass where the feed was overridden, the beacon
+MUST install the verified binaries as normal but MUST NOT advance (and thus MUST NOT persist) the
+tracked channel's trust state. A normal (non-overridden) pass advances state as usual (§9 step 7).
+
 **Dry-check state directory (`$DIG_UPDATER_STATE_DIR`).** A DRY `check` MUST run without write access
 to the Admin/SYSTEM-only default state directory. Resolution order:
 
@@ -1130,16 +1160,31 @@ Two channels ship from one orchestrator (`.github/workflows/nightly-release.yml`
 The orchestrator triggers ONLY on:
 
 - `schedule: cron '0 0 * * *'` — **midnight UTC** (GitHub Actions cron is always UTC; a top-of-hour
-  cron MAY be delayed under load — acceptable, since both channels are idempotent), and
+  cron MAY be delayed under load — acceptable, since the nightly channel is idempotent), and
 - `workflow_dispatch` with two inputs: `channel` (`both` | `stable` | `nightly`, default `both`) and
   `force` (boolean, default `false`).
 
-It MUST NOT trigger on `push` to `main`. A schedule run exercises BOTH channels; a dispatch runs the
-selected channel(s).
+It MUST NOT trigger on `push` to `main`. A schedule run cuts ONLY the nightly channel — the STABLE
+`vX.Y.Z` tag is cut solely by a manual `workflow_dispatch` (`channel: stable` or `both`), never by
+the cron (a scheduled `both` = nightly only). This is CLAUDE.md §3.6-A: in `modules/apps`, a stable
+release is manual-dispatch-only, so a fleet-reaching version tag is always a deliberate human act.
+A dispatch runs the selected channel(s).
+
+**Dispatch-reachable jobs are bound to `main` (defense-in-depth).** Every job that pushes a tag or a
+changelog commit with `RELEASE_TOKEN` (the `stable` job's `git push origin HEAD:main`; the
+`nightly-meta` job the nightly tag/publish gate on) MUST carry an `if: github.ref == 'refs/heads/main'`
+guard on its `if:` condition — mirroring `feed.yml`'s H1 signing guard. `workflow_dispatch` runs the
+workflow FROM the selected ref, so without this guard a dispatch (`channel=stable`) selected against a
+NON-main branch would checkout that branch and push ITS commits to `main` (past branch protection,
+since the release changelog commit rides `enforce_admins=false`) and cut a fleet-reaching `vX.Y.Z`.
+The cron always runs on `main` and the production dispatch is always against `main`, so the guard
+costs nothing legitimate. The true boundary remains who-can-dispatch (write access) + a main-only
+environment-scoped `RELEASE_TOKEN`; the ref guard is accident/abuse protection on top.
 
 **60-day auto-disable caveat.** GitHub auto-disables a `schedule:` trigger after 60 days with no
 repo activity on a public repo, with no auto-re-enable — and since this cron is the ONLY automatic
-release trigger, a quiet repo can silently stop releasing with no error surfaced anywhere. Detect
+release trigger (nightlies), a quiet repo can silently stop cutting nightlies with no error surfaced
+anywhere (stable releases are unaffected — they are manual-dispatch-only). Detect
 it with `gh api repos/<owner>/<repo>/actions/workflows/nightly-release.yml --jq .state` (a value of
 `disabled_inactivity` means it was auto-disabled) and recover with `gh workflow enable
 nightly-release.yml` (see `runbooks/release.md`). Any repo activity resets the 60-day counter.

@@ -39,6 +39,39 @@ fn nightly_release() -> String {
     workflow("nightly-release.yml")
 }
 
+/// Extract a job's `if:` condition block: the lines from the job's `if:` key up to the next
+/// sibling key at the same indentation (e.g. `runs-on:`). Returns the raw condition text so a
+/// guard can assert on which trigger events can reach the job. `job` is the job key as it appears
+/// at two-space indentation (e.g. `stable:`).
+fn job_if_condition(workflow: &str, job: &str) -> String {
+    let mut lines = workflow.lines().peekable();
+    // Advance to the job declaration (`  <job>:` at two-space indent).
+    let job_header = format!("  {job}");
+    for line in lines.by_ref() {
+        if line == job_header {
+            break;
+        }
+    }
+    // Within the job, capture the `if:` value block until the next key at four-space indent.
+    let mut in_if = false;
+    let mut captured: Vec<&str> = Vec::new();
+    for line in lines {
+        let is_job_key = line.starts_with("    ") && !line.starts_with("     ");
+        if in_if && is_job_key && line.trim_start().contains(':') {
+            break;
+        }
+        if line.trim_start().starts_with("if:") {
+            in_if = true;
+            captured.push(line);
+            continue;
+        }
+        if in_if {
+            captured.push(line);
+        }
+    }
+    captured.join("\n")
+}
+
 /// Extract a workflow's top-level `on:` trigger block: the lines from `on:` (exclusive) up to
 /// the next top-level key (a non-indented `word:` such as `jobs:`/`concurrency:`/`permissions:`).
 /// Everything nested under `on:` stays; sibling top-level keys are excluded.
@@ -200,6 +233,44 @@ fn nightly_job_prunes_to_a_retention_window() {
         wf.contains("--cleanup-tag"),
         "pruning must delete BOTH the GitHub release and its git tag (`gh release delete \
          --cleanup-tag`), never orphan a dated `nightly-YYYYMMDD` tag"
+    );
+}
+
+#[test]
+fn dispatch_reachable_jobs_are_bound_to_the_main_ref() {
+    // #616 (mirrors feed.yml's H1, #540): the stable + nightly-meta jobs push tags + a changelog
+    // commit to main with RELEASE_TOKEN (past branch protection). Both are workflow_dispatch-
+    // reachable, so a dispatch selected against a non-main branch could push THAT branch's commits.
+    // Each dispatch-reachable job's `if:` must therefore bind to `github.ref == 'refs/heads/main'`,
+    // so an off-main dispatch is an inert no-op. The cron + the production dispatch both run on main.
+    let wf = nightly_release();
+    let guards = wf.matches("github.ref == 'refs/heads/main'").count();
+    assert!(
+        guards >= 2,
+        "both the `stable` and `nightly-meta` job `if:` conditions must bind to \
+         `github.ref == 'refs/heads/main'` (found {guards} occurrences)"
+    );
+}
+
+#[test]
+fn schedule_cuts_only_nightlies_stable_is_manual_dispatch_only() {
+    // CLAUDE.md §3.6-A (user 2026-07-16 policy clarification): in `modules/apps`, a stable
+    // `vX.Y.Z` tag is cut ONLY by a manual `workflow_dispatch(channel: stable|both)`. The
+    // midnight CRON cuts ONLY nightlies — the schedule MUST NOT reach the stable changelog+tag
+    // job. So the STABLE job's `if:` must gate on `workflow_dispatch` and MUST NOT contain a
+    // `github.event_name == 'schedule'` disjunct (a schedule run would otherwise `git push
+    // origin HEAD:main` a release without a human dispatching it).
+    let wf = nightly_release();
+    let stable_if = job_if_condition(&wf, "stable:");
+    assert!(
+        !stable_if.contains("github.event_name == 'schedule'"),
+        "the STABLE job `if:` must NOT be reachable from a `schedule` event — the cron cuts \
+         nightlies only; stable is manual-dispatch-only (CLAUDE.md §3.6-A). stable `if:`:\n{stable_if}"
+    );
+    assert!(
+        stable_if.contains("github.event_name == 'workflow_dispatch'"),
+        "the STABLE job `if:` must gate on `github.event_name == 'workflow_dispatch'` so only a \
+         manual dispatch can cut a stable release. stable `if:`:\n{stable_if}"
     );
 }
 

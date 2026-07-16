@@ -6,13 +6,16 @@
 # It replaces the old "tag-and-release-on-every-merge-to-main" model. Releases are no longer cut
 # per merge; they are batched to a nightly cron (+ manual dispatch), across two channels:
 #
-#   • STABLE channel  (job `stable`): the unchanged changelog+tag logic, now driven by the cron
-#     instead of push-to-main. It reads the version from Cargo.toml and cuts `vX.Y.Z` ONLY when
-#     that tag does not already exist — i.e. only when the version file was bumped since the last
-#     release (an unchanged version = the tag exists = a no-op). Cutting the tag = git-cliff
+#   • STABLE channel  (job `stable`): the unchanged changelog+tag logic, now cut ONLY by a manual
+#     `workflow_dispatch` (channel: stable|both) — the midnight cron NEVER runs it (CLAUDE.md
+#     §3.6-A: in modules/apps a stable tag is manual-dispatch-only). It reads the version from
+#     Cargo.toml and cuts `vX.Y.Z` ONLY when that tag does not already exist — i.e. only when the
+#     version file was bumped since the last release (an unchanged version = the tag exists = a
+#     no-op). Cutting the tag = git-cliff
 #     regenerates CHANGELOG.md, commits it to main, tags that commit `vX.Y.Z`, and pushes both
 #     with RELEASE_TOKEN. The pushed `v*` tag then fires the STABLE binary build+publish
-#     (release.yml). This is the SAME stable path as before — only its trigger changed.
+#     (release.yml). This is the SAME stable path as before — only its trigger changed: it now
+#     fires solely on a manual dispatch, never on the cron.
 #
 #   • NIGHTLY channel (jobs `nightly-meta` → `nightly-build` → `nightly-publish`): every night it
 #     builds `main` HEAD and publishes a GitHub PRE-release (never `latest`) under a dated tag
@@ -70,14 +73,26 @@ jobs:
   # → commit + tag + push (RELEASE_TOKEN). The pushed `v*` tag fires release.yml (the binary build).
   stable:
     name: Stable — changelog + tag
-    # Run on the schedule (both channels) or when dispatch selects stable/both. The
+    # Manual-dispatch-ONLY (CLAUDE.md §3.6-A): a stable `vX.Y.Z` tag is cut solely by a human
+    # `workflow_dispatch(channel: stable|both)` — the midnight cron cuts nightlies only and MUST
+    # NOT reach this job (a scheduled `both` = nightly only). The
     # `!startsWith(...chore(release):...)` guard is preserved from the on-merge era: it is INERT on
-    # schedule/dispatch (there is no `head_commit`), but it keeps the release changelog commit
-    # self-labelled so the loop stays safe even if a push trigger is ever re-introduced.
+    # dispatch (there is no `head_commit`), but it keeps the release changelog commit self-labelled
+    # so the loop stays safe even if a push trigger is ever re-introduced.
+    # #616 (mirrors feed.yml's H1, #540): the STABLE job does `git push origin HEAD:main` with
+    # RELEASE_TOKEN (past branch protection, `enforce_admins=false`) and cuts a fleet-reaching
+    # `vX.Y.Z`. Bind that capability to REVIEWED main code: a `workflow_dispatch(channel=stable)`
+    # selected against a NON-main branch would otherwise checkout that branch and push ITS commits to
+    # main. The cron always runs on main and the production dispatch is always against main, so this
+    # ref guard costs nothing legitimate — it closes the accident/abuse path. (The real boundary
+    # remains who-can-dispatch = write-access + a main-only environment-scoped RELEASE_TOKEN; this is
+    # defense-in-depth on top.)
     if: >-
       ${{
+        github.ref == 'refs/heads/main' &&
         !startsWith(github.event.head_commit.message, 'chore(release):') &&
-        (github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both')
+        github.event_name == 'workflow_dispatch' &&
+        (inputs.channel == 'stable' || inputs.channel == 'both')
       }}
     runs-on: ubuntu-latest
     steps:
@@ -192,8 +207,11 @@ jobs:
   # 1) meta: gate on the token + synthesize the nightly version and tags (nothing is committed).
   nightly-meta:
     name: Nightly — resolve version
+    # #616: same main-ref bind as the stable job — the nightly channel also tags + publishes with
+    # RELEASE_TOKEN, so it too is restricted to reviewed main code (the downstream build/publish
+    # jobs gate on this job's outputs).
     if: >-
-      ${{ github.event_name == 'schedule' || inputs.channel == 'nightly' || inputs.channel == 'both' }}
+      ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || inputs.channel == 'nightly' || inputs.channel == 'both') }}
     runs-on: ubuntu-latest
     outputs:
       token_present: ${{ steps.token.outputs.present }}

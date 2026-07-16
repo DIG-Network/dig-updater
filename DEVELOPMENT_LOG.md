@@ -408,3 +408,28 @@ one and it still fails on the next:
   (unverified property → permanent rollback → un-updatable, incl. security updates). Unify the alias
   refresh across raw AND package methods: after ANY successful primary install, copy the installed
   primary → each alias. Then the health gate reliably passes.
+- **Per-channel state must be isomorphic across EVERY cache, not just the trust-state file.** #591
+  made `trust-state-<channel>.json` per-channel, but two sibling caches still crossed channels and
+  each is a latent below-floor self-DoS (#621): (1) the last-known-good rollback cache (`lkg/`) was
+  SHARED, so after a nightly→stable switch a nightly-dated build (`~20260714`) could survive and be
+  compared against the stable semver floor (`~15000`) — `LkgCache::restore` passes spuriously. Fix:
+  cache per channel (`lkg/<channel>`), mirroring the state file, so a cached build + the floor gating
+  it are always on one scale. (2) A `run --feed-base <other-channel-feed>` derives the state FILE from
+  `config.channel` but the feed LADDER from the override — so off-channel `YYYYMMDD` marks advance the
+  stable state file and brick future stable updates. Fix: an overridden-feed pass installs but MUST
+  NOT advance/persist the tracked channel's trust state (`suppress_state_advance`). Rule: whenever a
+  value is made per-channel, sweep ALL per-run state (caches, floors, override paths) for the same
+  split — the state file is necessary but not sufficient.
+- **A field-absent legacy `config.json` is unambiguously the pre-channel (nightly) beacon.** The
+  `#[serde(default)]` on `channel` defaults a MISSING field to the struct default (Stable) — but a
+  config FILE that exists yet omits `channel` predates the channel field entirely, i.e. the legacy
+  `alpha`≡nightly stream. Defaulting it to Stable would start a fresh stable trust-state and strand
+  its nightly marks. Distinguish field-ABSENT (parse to `serde_json::Value`, check the key) from a
+  missing FILE (fresh install → correctly Stable): field-absent-but-present ⇒ adopt Nightly (#621 #2).
+- **The beacon's scheduled task carries a "DIG NETWORK: BEACON" DISPLAY identity, parallel to the
+  dig-node/dig-dns OS services (SYSTEM.md OS-service identity contract).** A scheduled task/timer/
+  daemon has no separate display-name field like a Windows service, so surface it via the Windows
+  Task `<RegistrationInfo><Description>` (+ canonical `<URI>`), the systemd `.service`/`.timer`
+  `Description=`, and echo it in `dig-updater status` / `schedule status`. launchd has no friendly
+  name — its identity IS the reverse-DNS `Label` (`net.dignetwork.dig-updater`). Machine identifiers
+  stay canonical; the display name is legibility-only and is a cross-repo contract (#546).
