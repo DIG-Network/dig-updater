@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.14.0] - 2026-07-16
+
+### Features
+- **beacon:** Mop-up — nightlies main-ref guard, per-channel fail-safes, discoverable identity (#23)
+
 ## [0.13.0] - 2026-07-16
 
 ### Bug Fixes
