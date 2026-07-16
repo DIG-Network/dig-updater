@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.11.0] - 2026-07-16
+
+### Features
+- **beacon:** Force-installed ext channel follows the tracked channel (#613) (#20)
+
 ## [0.10.1] - 2026-07-16
 
 ### Bug Fixes
