@@ -474,10 +474,13 @@ After installing verified artifacts, the broker MUST run a health check appropri
 component (e.g. the service starts and answers a liveness probe). If the health check fails,
 the broker MUST roll back to the last known-good build and MUST re-verify the rollback target
 against the trust chain before reinstating it (a rollback is an install and gets the same
-verification). A rollback MUST NOT downgrade below `rollback_floor_build`; a manual/out-of-band
-rollback MUST read that floor from the PERSISTED (Admin/SYSTEM-only) trust state, never a
-caller-supplied value, since the last-known-good record's digest is self-recorded beside the cached
-bytes. State migrations
+verification). A CROSS-PASS rollback (reinstating an older cached
+build) MUST NOT downgrade below `rollback_floor_build`; a manual/out-of-band rollback MUST read that
+floor from the PERSISTED (Admin/SYSTEM-only) trust state, never a caller-supplied value, since the
+last-known-good record's digest is self-recorded beside the cached bytes. The floor gate does NOT
+apply to an IN-PASS restore-in-place of the just-captured current snapshot (restoring bytes onto their
+own destination can never be a downgrade relative to itself — the exemption that keeps "never left
+missing" unconditional even for an un-ageable build). State migrations
 MUST be backward-compatible: a build's on-disk state MUST remain readable by the immediately
 prior build, so a rollback never bricks on unreadable state and never destroys data
 (no destructive down-migration).
@@ -507,7 +510,12 @@ outcome), and if the second rename fails the move-aside MUST be undone — throu
 rename, not a best-effort one-shot — so the original target is left byte-intact. If that undo ALSO
 fails (a double fault that would otherwise leave the target MISSING), the replace MUST report a
 FAILED (not deferred) outcome so the caller's last-known-good rollback (§9.5) reinstates the target.
-Across every branch the target is NEVER left half-written or missing. This is the SAME running-target-safe swap
+That in-pass rollback restores the snapshot captured at the destination moments earlier in the SAME
+pass — a restore-in-place, NOT a downgrade — so it is EXEMPT from the anti-downgrade floor gate and
+MUST reinstate the target unconditionally, including when the prior build's version was un-ageable
+(unparseable → no build number). The floor gate still applies UNCHANGED to a CROSS-PASS rollback that
+reinstates an older cached build. Across every branch the target is NEVER left half-written or missing
+— an unconditional invariant, regardless of the installed build's ageability. This is the SAME running-target-safe swap
 the beacon's own self-update uses (§8.1); there is ONE implementation shared by every raw-binary
 component and the self-update.
 

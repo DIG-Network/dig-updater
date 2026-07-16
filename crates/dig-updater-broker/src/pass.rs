@@ -46,7 +46,7 @@ use crate::install::{
     InstallOutcome, RetryPolicy,
 };
 use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONENT_NAME};
-use crate::rollback::{LkgCache, LkgEntry};
+use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
 use crate::selfupdate::apply_self_update;
 use crate::state::{LoadedState, TrustStateStore};
@@ -396,7 +396,11 @@ impl Installer<'_> {
         floor: u64,
     ) -> Result<(), BrokerError> {
         match snapshot {
-            Some(entry) => self.lkg.restore(&entry, floor),
+            // This is the IN-PASS rollback: `entry` holds the bytes captured at `dest` moments ago
+            // (pass step "snapshot the currently-installed binary"), so restoring them is a
+            // restore-in-place — floor-EXEMPT so it never leaves dest missing even when the prior
+            // build was un-ageable (#558, the double-rename-fault branch).
+            Some(entry) => self.lkg.restore(&entry, floor, RestoreKind::InPlace),
             None => {
                 if dest.exists() {
                     std::fs::remove_file(dest).map_err(|e| BrokerError::RollbackFailed {

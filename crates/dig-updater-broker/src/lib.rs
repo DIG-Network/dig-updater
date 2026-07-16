@@ -88,7 +88,7 @@ pub use pass::{ComponentOutcome, ComponentResult, Installer, PassReport};
 pub use plan::{
     Catalog, ComponentTarget, InstallMethod, Plan, PlannedComponent, BEACON_COMPONENT_NAME,
 };
-pub use rollback::LkgCache;
+pub use rollback::{LkgCache, RestoreKind};
 pub use sandbox::Sandbox;
 pub use secure::Repair;
 pub use spawn::spawn_worker;
@@ -312,7 +312,8 @@ impl Broker {
         let mut restored = Vec::new();
         for component in cache.cached_components() {
             let entry = cache.load_entry(&component)?;
-            cache.restore(&entry, floor)?;
+            // A manual, out-of-band rollback reinstates a possibly-older cached build — floor-GATED.
+            cache.restore(&entry, floor, RestoreKind::CrossPass)?;
             restored.push(component);
         }
         Ok(restored)

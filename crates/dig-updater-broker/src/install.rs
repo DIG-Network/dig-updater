@@ -1046,12 +1046,66 @@ mod tests {
         );
 
         // The caller's LKG rollback (fires on Failed) reinstates dest — so it is never left missing.
-        lkg.restore(&snapshot, 0)
+        // The pass restores the just-captured snapshot in-place (floor-exempt, RestoreKind::InPlace).
+        lkg.restore(&snapshot, 0, crate::rollback::RestoreKind::InPlace)
             .expect("the last-known-good rollback restores dest on Failed");
         assert_eq!(
             std::fs::read(&dest).unwrap(),
             b"original-running-bytes",
             "dest is restored to its original bytes — never left missing on any branch"
+        );
+    }
+
+    /// #558 (round 2): the SAME double-rename fault when the prior build is UN-AGEABLE
+    /// (`installed_build == None` — a malformed-date nightly / unparseable core, `plan.rs::pack_build`
+    /// returns None). The in-pass rollback MUST still restore dest — the floor gate is bypassed for a
+    /// restore-in-place, so dest is never left missing regardless of ageability.
+    #[test]
+    fn a_double_rename_fault_with_an_unageable_build_still_rolls_back_dest_558() {
+        use crate::rollback::{LkgCache, RestoreKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("bin").join("dig-dns");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"original-running-bytes").unwrap();
+
+        // The prior build's version is un-ageable → snapshot records build = None.
+        let lkg = LkgCache::at(dir.path().join("lkg"));
+        let snapshot = lkg
+            .snapshot("dig-dns", &dest, None)
+            .unwrap()
+            .expect("the original target is snapshotted");
+
+        let private = dest.with_extension(VERIFIED_RAW_EXT);
+        std::fs::write(&private, b"new-verified-bytes").unwrap();
+
+        let policy = RetryPolicy {
+            attempts: 2,
+            backoff: Duration::ZERO,
+        };
+        let target = dest.clone();
+        let outcome = rename_into_place_with(&private, &dest, &policy, |_policy, from, to| {
+            if to == target.as_path() {
+                Err(std::io::Error::other("injected: cannot place at dest"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        });
+
+        assert!(
+            matches!(outcome, InstallOutcome::Failed { .. }),
+            "a double rename fault must escalate to Failed, got {outcome:?}"
+        );
+        assert!(!dest.exists(), "the double fault leaves dest missing");
+
+        // Even with an un-ageable prior build, the in-pass restore-in-place reinstates dest under a
+        // high floor — the round-1 gap where the None arm refused BEFORE writing dest is closed.
+        lkg.restore(&snapshot, 10_000, RestoreKind::InPlace)
+            .expect("an un-ageable in-pass snapshot is still restored (floor-exempt)");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"original-running-bytes",
+            "dest is restored even when the prior build was un-ageable — never left missing"
         );
     }
 }
