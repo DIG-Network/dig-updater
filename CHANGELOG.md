@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.0] - 2026-07-16
+
+### Features
+- **schedule:** Add `schedule ensure` verb + Admin-only opt-out sentinel (#584) (#21)
+
 ## [0.11.0] - 2026-07-16
 
 ### Features
