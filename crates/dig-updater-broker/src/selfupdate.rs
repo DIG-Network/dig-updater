@@ -10,108 +10,34 @@
 //! snapshotting, health-gating, and rollback are the same shared machinery every other component
 //! goes through (see `Installer::apply_component`).
 //!
-//! - **Unix** replaces the running executable with a single atomic rename. The kernel keeps the
-//!   OLD inode open for whichever process is still executing it — renaming its directory entry
-//!   away is invisible to that process and takes effect only for the NEXT invocation of the path.
-//!   This is exactly [`crate::install`]'s existing raw-binary replace, reused verbatim.
+//! - **Unix** replaces the running executable's directory entry: the kernel keeps the OLD inode
+//!   open for whichever process is still executing it, so the swap is invisible to that process and
+//!   takes effect only for the NEXT invocation of the path.
 //! - **Windows** cannot overwrite a loaded image's bytes in place (a direct replace on the
 //!   currently-executing path routinely fails with a sharing violation), but CAN rename it out of
 //!   the way — the loader shares delete/rename access on the running file, which is exactly the
-//!   technique long-lived self-updating Windows programs use. So this stages the swap as two
-//!   plain renames: the running image moves aside to a `.old` sibling, then the already-verified
-//!   private copy takes its name. If either half fails, the swap is undone rather than left
-//!   half-applied — never mid-pass, never a beacon left unable to start.
+//!   technique long-lived self-updating Windows programs use: the running image moves aside to a
+//!   `.old` sibling, then the already-verified private copy takes its name, undoing itself on a
+//!   failed second rename so the beacon is never left without a working binary.
+//!
+//! Both are the SAME running-target-safe swap every raw-binary component now goes through
+//! ([`crate::install::rename_into_place`], generalized for #558 from this module's original
+//! self-update-only move-aside), so the self-update carries no bespoke replace logic of its own.
 
 use std::path::Path;
-#[cfg(windows)]
-use std::path::PathBuf;
 
-use crate::install::{InstallOutcome, RetryPolicy};
+use crate::install::{rename_into_place, InstallOutcome, RetryPolicy};
 
 /// Apply the beacon's own verified `private` copy over its running image at `dest`.
 ///
 /// Called ONLY after every other actionable component in the pass has already been applied (see
 /// the module doc) — `private` has already passed the same digest re-verification every other
-/// component's staged artifact does ([`crate::install::stage_and_verify_private`]).
+/// component's staged artifact does ([`crate::install::stage_and_verify_private`]). The replace
+/// itself is the shared, running-target-safe [`rename_into_place`]: replacing the beacon's own
+/// running image is exactly the running-peer case that path already handles (#558).
 #[must_use]
 pub fn apply_self_update(private: &Path, dest: &Path, policy: &RetryPolicy) -> InstallOutcome {
-    #[cfg(windows)]
-    {
-        windows_swap(private, dest, policy)
-    }
-    #[cfg(not(windows))]
-    {
-        // Unix permits replacing a running executable's directory entry outright — no dance
-        // needed, so this is precisely the raw-binary path every other component already uses.
-        crate::install::rename_into_place(private, dest, policy)
-    }
-}
-
-/// The Windows two-rename swap: move the running image aside, then place the verified copy in
-/// its name. Undoes itself on a failed second rename, so the beacon is never left without a
-/// working binary at `dest`.
-#[cfg(windows)]
-fn windows_swap(private: &Path, dest: &Path, policy: &RetryPolicy) -> InstallOutcome {
-    let old = superseded_sibling(dest);
-    // Best-effort: a `.old` left behind by a pass that could not yet delete it (still locked by
-    // that pass's own then-running image) may have unlocked by now — clear it opportunistically
-    // so it never accumulates across many passes. Its continued presence is harmless either way.
-    let _ = std::fs::remove_file(&old);
-
-    if dest.exists() {
-        if let Err(e) = rename_with_retry(dest, &old, policy) {
-            let _ = std::fs::remove_file(private);
-            return InstallOutcome::Deferred {
-                reason: format!(
-                    "the running image at {} is locked after retries: {e}",
-                    dest.display()
-                ),
-            };
-        }
-    }
-
-    match rename_with_retry(private, dest, policy) {
-        Ok(()) => {
-            // The running process is still executing from the (renamed-away) `old` file object —
-            // renaming a file does not relocate an already-open image mapping — so `old` is
-            // ordinary, non-executing content by the time we get here and usually deletes cleanly.
-            let _ = std::fs::remove_file(&old);
-            InstallOutcome::Installed
-        }
-        Err(e) => {
-            // Put the running image back so the beacon is left WORKING, never half-swapped.
-            let _ = std::fs::rename(&old, dest);
-            let _ = std::fs::remove_file(private);
-            InstallOutcome::Deferred {
-                reason: format!("could not place the new image at {}: {e}", dest.display()),
-            }
-        }
-    }
-}
-
-/// The `.old` sibling a superseded self-image is renamed to, so it never collides with a peer
-/// component's own private-copy naming convention.
-#[cfg(windows)]
-fn superseded_sibling(dest: &Path) -> PathBuf {
-    dest.with_extension("dig-updater-old")
-}
-
-/// Retry a plain rename with `policy`'s backoff, surfacing the last error on give-up.
-#[cfg(windows)]
-fn rename_with_retry(from: &Path, to: &Path, policy: &RetryPolicy) -> std::io::Result<()> {
-    let mut last = None;
-    for attempt in 0..policy.attempts.max(1) {
-        match std::fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last = Some(e);
-                if attempt + 1 < policy.attempts && !policy.backoff.is_zero() {
-                    std::thread::sleep(policy.backoff * (attempt + 1));
-                }
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| std::io::Error::other("no attempts made")))
+    rename_into_place(private, dest, policy)
 }
 
 #[cfg(test)]
@@ -167,7 +93,7 @@ mod tests {
         let outcome = apply_self_update(&private, &dest, &no_backoff());
         assert_eq!(outcome, InstallOutcome::Installed);
         assert!(
-            !superseded_sibling(&dest).exists(),
+            !dest.with_extension("dig-updater-old").exists(),
             "the superseded .old copy is cleaned up once the swap succeeds"
         );
     }

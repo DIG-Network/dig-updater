@@ -495,6 +495,19 @@ the install root because the beacon derives it from where the installer placed t
 in the superproject `SYSTEM.md`). Installing to a decoupled hardcoded directory — the prior bug —
 left the user's real binary un-updated while the beacon reported success against a phantom copy.
 
+**Resilient raw-binary replace — running/in-use targets.** A raw-binary component may be a running
+service (e.g. dig-dns) or the beacon's own image, and its file can be transiently held in use by a
+scanner/backup. The replace MUST therefore be resilient rather than fail hard: it MUST move any
+existing target ASIDE to a `.dig-updater-old` sibling and then rename the verified copy into place
+(a running image can be renamed away even where it cannot be overwritten in place). It MUST retry
+ONLY the file-in-use class — Windows `ERROR_SHARING_VIOLATION` (32) / `ERROR_LOCK_VIOLATION` (33),
+unix `ETXTBSY` (26) — with bounded backoff, and fail fast on any other (terminal) error. If the
+target stays locked through the retry budget the pass DEFERS to the next wake (§9.5, a benign
+outcome), and if the second rename fails the move-aside MUST be undone so the original target is
+left byte-intact — never a half-written or missing binary. This is the SAME running-target-safe swap
+the beacon's own self-update uses (§8.1); there is ONE implementation shared by every raw-binary
+component and the self-update.
+
 ---
 
 ## 10. The feed + signing (CI)

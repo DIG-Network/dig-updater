@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.1] - 2026-07-15
+
+### Bug Fixes
+- **beacon:** Resilient replace-a-running-binary path — move-aside swap + file-in-use (Windows 32/33, unix ETXTBSY) retry/defer with no half-write, shared with self-update (#558)
+
 ## [0.10.0] - 2026-07-15
 
 ### Features
