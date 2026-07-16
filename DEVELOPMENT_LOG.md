@@ -389,3 +389,22 @@ one and it still fails on the next:
   <derived-unit>` / `launchctl bootout`, absolute-path tools) BEFORE the replace and restarted after;
   the stop is a hard precondition (a failed stop defers, leaving the service running), and once
   stopped it is restarted in EVERY branch (success/defer/rollback) so it is never left down.
+- **A "stop service → replace → restart" fix has three easy-to-miss availability holes (#666
+  adversarial + loop-security gates).** (1) Restart must fire even when the ROLLBACK itself errors:
+  a `finish_apply(...)?` that `?`-propagates a rollback error (corrupt/unreadable LKG, re-verify
+  mismatch, reinstate-write fail) returns BEFORE the restart → node left down. Capture the inner
+  Result, restart, THEN propagate (`restart_after`). (2) Rollback must cover the WHOLE binary set:
+  the alias refresh writes NEW bytes to the aliases too, so snapshotting/rolling back only the
+  primary leaves primary-old / alias-new = the same split-state the fix targets — snapshot + roll
+  back every binary (distinct cache keys). And enumeration must key Install/Skip on the whole set,
+  else a primary that's current with a stale alias (a prior deferred alias replace) is Skipped
+  forever. (3) `sc stop` (Windows) + `launchctl bootout` (macOS) return NON-ZERO when the service is
+  already stopped/not-loaded; treating every non-zero stop as "refused → defer + leave running" pins
+  a down node down permanently — classify the platform's already-stopped signal as success and
+  proceed (Linux systemd already exits 0 for an inactive unit).
+- **dig-node's `dign` alias can only be refreshed by the beacon, not the package.** dig-node installs
+  via a native package (MSI/pkg/deb), so the raw-binary replace path never runs for it — yet the
+  whole-set health gate hard-checks `dign`. Don't rest that on the package laying down a fresh `dign`
+  (unverified property → permanent rollback → un-updatable, incl. security updates). Unify the alias
+  refresh across raw AND package methods: after ANY successful primary install, copy the installed
+  primary → each alias. Then the health gate reliably passes.

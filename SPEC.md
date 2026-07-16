@@ -548,33 +548,57 @@ reinstates an older cached build. Across every branch the target is NEVER left h
 the beacon's own self-update uses (§8.1); there is ONE implementation shared by every raw-binary
 component and the self-update.
 
-**A component is a binary SET — the primary AND its byte-identical aliases.** A tracked component
-owns not just its primary executable but every byte-identical ALIAS it ships under (`digs ≡ digstore`,
-`digd ≡ dig-dns`, `dign ≡ dig-node` — siblings of the primary, `.exe` on Windows). The applier MUST
-replace AND health-check the WHOLE set in the same pass: after the primary raw-binary replace lands,
-each alias is refreshed by COPYING the just-verified primary bytes (never a re-download, never an
-extra feed asset — the feed signs only the primary) through the same resilient move-aside, and the
-health gate re-probes EVERY binary in the set. A component whose alias is left stale — the primary
-advanced while the alias froze at its install-time version — MUST fail the health gate and roll back,
-NEVER report `Installed`. If the primary replace defers or fails, the aliases are left untouched and
-that outcome propagates unchanged.
+**A component is a binary SET — the primary AND its byte-identical aliases — all-or-nothing at the
+target version.** A tracked component owns not just its primary executable but every byte-identical
+ALIAS it ships under (`digs ≡ digstore`, `digd ≡ dig-dns`, `dign ≡ dig-node` — siblings of the
+primary, `.exe` on Windows). The applier MUST treat the set as a unit across enumeration, replace,
+health, AND rollback:
 
-**A service-backed component is stopped before its replace and restarted after.** A component whose
-binary runs as an OS service (dig-node → `net.dignetwork.dig-node`) holds its executable open while
-the service runs, so a replace attempted against the running service is deferred (a `/norestart` MSI
-over the locked file) or fails (unix `ETXTBSY`), the install falsely "succeeds", and the post-install
-`--version` probe reads the still-old binary → the health gate rolls it back. The applier MUST
-therefore, for a service-backed component: **stop the service → replace → restart → health-probe**,
-using the platform service manager resolved by its ABSOLUTE, trusted path (Windows `sc.exe stop/start
-<id>`, Linux `systemctl stop/start <unit>` where the systemd unit name is derived from the reverse-DNS
-id by dropping the `net.` qualifier + hyphen-joining — `net.dignetwork.dig-node` → `dignetwork-dig-node`,
-macOS `launchctl bootout system/<id>` / `bootstrap system <plist>`), never a bare name resolved through
-`PATH`. If the service cannot be STOPPED, the replace MUST NOT be attempted (the binary is still
-locked) and the service is left RUNNING — the pass defers. Once the service HAS been stopped, it MUST
-be restarted in EVERY subsequent branch — a successful update, a benign deferral, OR a rollback — so a
-stopped service is never left down; a restart failure is surfaced as a warning but never turns an
-otherwise-correct on-disk state into a hard failure (the next scheduled wake + the service manager's
-own boot recovery bring it back).
+- **Replace the whole set from the verified primary.** After the primary lands (a raw-binary
+  move-aside OR a native-package install), each alias is refreshed by COPYING the just-installed
+  primary bytes — never a re-download, never an extra feed asset (the feed signs only the primary) —
+  through the same resilient move-aside. This alias refresh runs for BOTH the raw-binary AND the
+  native-package methods, so a package component's alias (dig-node's `dign`) is ALWAYS refreshed
+  regardless of what the package itself lays down.
+- **Health-check EVERY binary in the set.** A component whose alias is left stale — the primary
+  advanced while the alias froze at its install-time version — MUST fail the health gate, NEVER
+  report `Installed`.
+- **Roll back the WHOLE set together.** The pre-pass snapshot MUST cover the primary AND every alias
+  (each cached under a distinct key), so a failed health gate reverts the entire set — never leaving
+  a split primary-new / alias-old (or vice-versa) state, which is the very drift this fixes.
+- **Enumeration keys on the whole set.** The Install/Update/Skip decision MUST consider every binary
+  in the set, not just the primary: if the primary looks current but ANY alias is missing or on a
+  different version (e.g. a prior pass's alias replace deferred on a transient lock), the component
+  MUST be re-driven as an Update so the stale alias is re-refreshed + re-health-checked on the next
+  pass. Keying only on the primary would strand a stale alias forever.
+
+If the primary replace defers or fails, the aliases are left untouched and that outcome propagates
+unchanged.
+
+**A service-backed component is stopped before its replace and restarted after — unconditionally.** A
+component whose binary runs as an OS service (dig-node → `net.dignetwork.dig-node`) holds its
+executable open while the service runs, so a replace attempted against the running service is deferred
+(a `/norestart` MSI over the locked file) or fails (unix `ETXTBSY`), the install falsely "succeeds",
+and the post-install `--version` probe reads the still-old binary → the health gate rolls it back. The
+applier MUST therefore, for a service-backed component: **stop the service → replace → restart →
+health-probe**, using the platform service manager resolved by its ABSOLUTE, trusted path (Windows
+`sc.exe stop/start <id>`, Linux `systemctl stop/start <unit>` where the systemd unit name is derived
+from the reverse-DNS id by dropping the `net.` qualifier + hyphen-joining — `net.dignetwork.dig-node`
+→ `dignetwork-dig-node`, macOS `launchctl bootout system/<id>` / `bootstrap system <plist>`), never a
+bare name resolved through `PATH`. Availability invariants:
+
+- **An already-stopped / not-loaded service is NOT a stop failure.** `sc stop` (Windows) and
+  `launchctl bootout` (macOS) exit non-zero when the service is already down; the applier MUST
+  classify that (the platform's not-active / not-loaded signal) as a successful stop and PROCEED,
+  so a node that is already down for any reason is not pinned down by a misread "refused to stop"
+  (Linux `systemctl` already exits 0 for an inactive unit). Only a genuine refusal (e.g. access
+  denied) leaves the service running and defers the pass.
+- **Once stopped, the service MUST be restarted on EVERY subsequent path** — a successful update, a
+  benign deferral, a rollback, OR a propagated rollback ERROR (an unreadable/corrupt last-known-good
+  cache, a re-verify mismatch, a reinstate-write failure). The restart MUST run BEFORE any such error
+  propagates, so a stopped node is never left down. A restart failure is surfaced as a warning but
+  never turns an otherwise-correct on-disk state into a hard failure (the next scheduled wake + the
+  service manager's own boot recovery bring it back).
 
 ---
 

@@ -334,6 +334,20 @@ impl Plan {
                 DetectedVersion::Absent => None,
             };
             let decision = decide(&detected, &component.version);
+            // #666 F3: the enumeration decision must key on the WHOLE binary set, not just the
+            // primary `dest`. A prior pass may have advanced the primary but left an alias stale
+            // (a transient alias lock → the component reported `Deferred` with primary-new/alias-old,
+            // no rollback). If we keyed only on the primary here, we would see it current → `Skip` →
+            // the stale alias would NEVER be re-refreshed and Bug A would recur. So: when the primary
+            // says `Skip` but ANY alias is missing or reports a different version, re-drive the
+            // component as an `Update` so the applier refreshes + health-checks the whole set.
+            let (action, summary) = redrive_for_stale_alias(
+                target,
+                &component.version,
+                decision.action,
+                decision.summary,
+                detect,
+            );
             components.push(PlannedComponent {
                 name: component.name.clone(),
                 method: target.method,
@@ -343,8 +357,8 @@ impl Plan {
                 build: component.build,
                 expected_digest: artifact.sha256.clone(),
                 staged_path,
-                action: decision.action,
-                summary: decision.summary,
+                action,
+                summary,
                 installed_build,
             });
         }
@@ -358,6 +372,38 @@ impl Plan {
             .iter()
             .filter(|c| c.action != UpdateAction::Skip)
     }
+}
+
+/// Re-drive an aliased component as an `Update` when the PRIMARY looks current (`Skip`) but ANY of
+/// its byte-identical aliases is missing or on a different version (#666 F3).
+///
+/// Enumeration must treat a component as a binary SET: keying the Install/Skip decision on the
+/// primary alone would let a stale alias — left behind by a prior pass whose alias replace deferred
+/// — go unnoticed forever (primary current → `Skip` → the alias is never re-refreshed). When the
+/// primary is already actionable (`Install`/`Update`), the applier refreshes the whole set anyway,
+/// so the primary decision is returned unchanged; only a `Skip` primary is escalated.
+fn redrive_for_stale_alias(
+    target: &ComponentTarget,
+    version: &str,
+    primary_action: UpdateAction,
+    primary_summary: String,
+    detect: &dyn Fn(&Path) -> DetectedVersion,
+) -> (UpdateAction, String) {
+    if primary_action != UpdateAction::Skip {
+        return (primary_action, primary_summary);
+    }
+    for alias in &target.aliases {
+        if decide(&detect(alias), version).action != UpdateAction::Skip {
+            return (
+                UpdateAction::Update,
+                format!(
+                    "v{version} (primary current, but alias {} is out of date — refreshing the set)",
+                    alias.display()
+                ),
+            );
+        }
+    }
+    (primary_action, primary_summary)
 }
 
 /// Resolve the install root — the directory the beacon installs components INTO — from the running
@@ -544,6 +590,45 @@ mod tests {
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Update);
         assert_eq!(plan.components[0].installed_build, Some(14_000));
+    }
+
+    #[test]
+    fn a_stale_alias_redrives_a_current_primary_as_an_update_666f3() {
+        // #666 F3: the primary `digstore` is already at 0.15.0 (Skip on its own), but its alias
+        // `digs` still reports 0.14.0. Keying only on the primary would Skip and leave the alias
+        // stale forever; enumeration must re-drive the whole set as an Update.
+        let m = manifest_one("digstore", "0.15.0", 15_000, "deadbeef");
+        let plan = Plan::build(
+            &m,
+            &[staged("digstore", "/staging/digstore")],
+            &catalog(),
+            &platform(),
+            &|p: &Path| {
+                if p.ends_with("digs") {
+                    DetectedVersion::Present("digstore 0.14.0".into()) // stale alias
+                } else {
+                    DetectedVersion::Present("digstore 0.15.0".into()) // current primary
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.components[0].action, UpdateAction::Update);
+        assert_eq!(plan.actionable().count(), 1);
+    }
+
+    #[test]
+    fn a_current_primary_and_current_alias_still_skips() {
+        // The whole set is current → genuinely Skip (no spurious re-drive).
+        let m = manifest_one("digstore", "0.15.0", 15_000, "deadbeef");
+        let plan = Plan::build(
+            &m,
+            &[staged("digstore", "/staging/digstore")],
+            &catalog(),
+            &platform(),
+            &|_| DetectedVersion::Present("digstore 0.15.0".into()),
+        )
+        .unwrap();
+        assert_eq!(plan.components[0].action, UpdateAction::Skip);
     }
 
     #[test]

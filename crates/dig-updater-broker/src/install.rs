@@ -229,36 +229,38 @@ pub fn install_from_private(
     private: &Path,
     policy: &RetryPolicy,
 ) -> InstallOutcome {
-    match pc.method {
-        InstallMethod::RawBinary => install_raw_binary_set(pc, private, policy),
+    // Install the PRIMARY per its method, then — for EITHER a raw binary OR a native package —
+    // re-derive every byte-identical alias from the just-installed primary (#666 Bug A / Bug 3).
+    // Unifying the alias refresh across both methods is what makes dig-node's `dign` alias reliably
+    // fresh: dig-node is a package, so without this the raw-only path never ran for it and the
+    // health gate — which hard-checks every binary in the set — would fail every dig-node update.
+    let primary = match pc.method {
+        InstallMethod::RawBinary => rename_into_place(private, &pc.dest, policy),
         InstallMethod::WindowsMsi => run_native_installer(private, msiexec_argv(private)),
         InstallMethod::MacosPkg => run_native_installer(private, installer_argv(private)),
         InstallMethod::LinuxDeb => run_native_installer(private, dpkg_argv(private)),
-    }
-}
-
-/// Replace the primary raw binary AND re-derive every byte-identical alias in the component's set
-/// (#666 Bug A). The primary is renamed into place from the verified private copy; then each alias
-/// is refreshed by COPYING the just-placed VERIFIED bytes (now at `pc.dest`) into the alias through
-/// the SAME resilient move-aside — never a re-download or a re-fetch, so an alias can never diverge
-/// from the verified primary and no extra feed asset is needed.
-///
-/// If the PRIMARY replace does not land (`Deferred`/`Failed`), the aliases are left untouched and
-/// that outcome is returned as-is — the component is not `Installed`, so the health gate (which
-/// checks every binary in the set) will see the stale alias and the pass declines to advance. If an
-/// ALIAS replace does not land, the whole component is reported non-`Installed` for the same reason.
-fn install_raw_binary_set(
-    pc: &PlannedComponent,
-    private: &Path,
-    policy: &RetryPolicy,
-) -> InstallOutcome {
-    let primary = rename_into_place(private, &pc.dest, policy);
+    };
     if primary != InstallOutcome::Installed {
+        // The primary did not land (`Deferred`/`Failed`): leave the aliases untouched and propagate
+        // that outcome — the component is not `Installed`, so the pass will not advance the set.
         return primary;
     }
+    refresh_aliases(pc, policy)
+}
+
+/// Re-derive every byte-identical alias in a component's set from the just-installed PRIMARY at
+/// `pc.dest` (#666 Bug A / Bug 3). Each alias is refreshed by COPYING the primary bytes — never a
+/// re-download or a re-fetch (the feed signs only the primary), so an alias can never diverge from
+/// the verified primary and no extra feed asset is needed — through the SAME resilient move-aside
+/// swap the primary raw replace uses ([`rename_into_place`]). Shared by the raw-binary AND the
+/// native-package paths so `dign`/`digs`/`digd` are refreshed regardless of how the primary landed.
+///
+/// If an ALIAS replace does not land (`Deferred`/`Failed`), the whole component is reported
+/// non-`Installed` so the health gate sees the stale alias and the set is not advanced.
+fn refresh_aliases(pc: &PlannedComponent, policy: &RetryPolicy) -> InstallOutcome {
     for alias in &pc.aliases {
-        // Stage the alias's own verified copy beside it from the bytes just verified-and-placed at
-        // the primary dest, then move it into place with the same running-target-safe swap.
+        // Stage the alias's own verified copy beside it from the bytes just installed at the primary
+        // dest, then move it into place with the same running-target-safe swap.
         let alias_private = alias.with_extension(VERIFIED_RAW_EXT);
         if let Err(e) = copy_verified_bytes(&pc.dest, &alias_private) {
             return InstallOutcome::Failed {
@@ -779,6 +781,35 @@ mod tests {
         for p in [&primary, &alias_a, &alias_b] {
             assert_eq!(std::fs::read(p).unwrap(), new_bytes, "{p:?} refreshed");
         }
+    }
+
+    /// #666 Bug 3: alias refresh is shared by the raw AND the package paths — `refresh_aliases`
+    /// re-derives an alias from the just-installed PRIMARY bytes regardless of how the primary got
+    /// there. dig-node is a native PACKAGE, so this is the ONLY thing that keeps its `dign` alias
+    /// fresh (the raw replace never runs for it) and lets the whole-set health gate pass.
+    #[test]
+    fn refresh_aliases_derives_a_package_components_alias_from_the_installed_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // The native installer has just laid down the fresh primary (e.g. the MSI wrote dig-node).
+        let primary = bin.join("dig-node");
+        let alias = bin.join("dign");
+        std::fs::write(&primary, b"fresh-dig-node-0.33.0").unwrap();
+        std::fs::write(&alias, b"stale-dign-0.32.0").unwrap();
+
+        let mut pc = planned(primary.clone(), InstallMethod::LinuxDeb, "unused");
+        pc.aliases = vec![alias.clone()];
+
+        assert_eq!(
+            refresh_aliases(&pc, &RetryPolicy::default()),
+            InstallOutcome::Installed
+        );
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            b"fresh-dig-node-0.33.0",
+            "the package component's alias is refreshed from the installed primary bytes"
+        );
     }
 
     #[test]
