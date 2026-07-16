@@ -50,6 +50,7 @@
 pub mod config;
 pub mod elevation;
 mod error;
+pub mod ext_forcelist;
 mod hashing;
 pub mod health;
 pub mod install;
@@ -82,6 +83,9 @@ use config::{Channel, ConfigStore, UpdaterConfig};
 use status::{StatusContext, StatusSnapshot, StatusStore};
 
 pub use error::BrokerError;
+pub use ext_forcelist::{
+    follow_channel_change, ExtFollow, ForcelistCommander, InstalledDigInstaller,
+};
 pub use health::VersionProbe;
 pub use install::RetryPolicy;
 pub use pass::{ComponentOutcome, ComponentResult, Installer, PassReport};
