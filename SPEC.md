@@ -503,8 +503,11 @@ existing target ASIDE to a `.dig-updater-old` sibling and then rename the verifi
 ONLY the file-in-use class — Windows `ERROR_SHARING_VIOLATION` (32) / `ERROR_LOCK_VIOLATION` (33),
 unix `ETXTBSY` (26) — with bounded backoff, and fail fast on any other (terminal) error. If the
 target stays locked through the retry budget the pass DEFERS to the next wake (§9.5, a benign
-outcome), and if the second rename fails the move-aside MUST be undone so the original target is
-left byte-intact — never a half-written or missing binary. This is the SAME running-target-safe swap
+outcome), and if the second rename fails the move-aside MUST be undone — through the SAME retried
+rename, not a best-effort one-shot — so the original target is left byte-intact. If that undo ALSO
+fails (a double fault that would otherwise leave the target MISSING), the replace MUST report a
+FAILED (not deferred) outcome so the caller's last-known-good rollback (§9.5) reinstates the target.
+Across every branch the target is NEVER left half-written or missing. This is the SAME running-target-safe swap
 the beacon's own self-update uses (§8.1); there is ONE implementation shared by every raw-binary
 component and the self-update.
 
