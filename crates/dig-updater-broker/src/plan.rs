@@ -91,8 +91,10 @@ pub enum InstallMethod {
     /// Replace a single executable in place with the staged bytes (digstore, dig-dns, and the
     /// beacon itself). The broker owns the swap + retry-on-lock (SPEC §9.5).
     RawBinary,
-    /// A Windows MSI, installed silently: `msiexec /i <pkg> /qn /norestart`. The package
-    /// self-manages the service stop/start.
+    /// A Windows MSI, installed silently: `msiexec /i <pkg> /qn /norestart`. A service-backed
+    /// component (dig-node) does NOT self-manage its service stop/start across an update — the
+    /// applier stops the service before this runs and restarts it after, so the `/norestart` MSI
+    /// swaps an UNLOCKED file rather than deferring the swap over a running, locked binary (#666).
     WindowsMsi,
     /// A macOS flat package, installed silently: `installer -pkg <pkg> -target /`.
     MacosPkg,
@@ -101,6 +103,12 @@ pub enum InstallMethod {
 }
 
 /// Where + how one tracked component installs on THIS host.
+///
+/// A component is a *binary SET*, not a single file (#666 Bug A): its [`Self::dest`] primary PLUS
+/// every byte-identical ALIAS it ships under ([`Self::aliases`] — `digs≡digstore`, `digd≡dig-dns`,
+/// `dign≡dig-node`, canonical skill). Every binary in the set MUST be replaced + health-checked in
+/// the same pass, or a beacon that advances the primary while leaving an alias frozen at its
+/// install-time version silently reports the update as applied when it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentTarget {
     /// The manifest component name (e.g. `"digstore"`).
@@ -110,6 +118,30 @@ pub struct ComponentTarget {
     /// The installed executable's path — probed for the installed version and, for a
     /// [`InstallMethod::RawBinary`], the file that is replaced.
     pub dest: PathBuf,
+    /// The byte-identical alias binaries this component also owns on disk (siblings of `dest`,
+    /// `.exe` on Windows). Empty for a component with no alias. Each is refreshed from the SAME
+    /// verified bytes as the primary and version-checked alongside it (#666 Bug A).
+    pub aliases: Vec<PathBuf>,
+    /// The OS service this component's binary belongs to, as its reverse-DNS id (e.g.
+    /// `net.dignetwork.dig-node`), when the component runs as a service whose executable is held
+    /// open while it runs. `None` for a component that is not service-backed. A service-backed
+    /// component's binary is file-locked while the service runs, so the applier MUST stop the
+    /// service before replacing it and restart it after (#666 Bug B).
+    pub service: Option<String>,
+}
+
+impl ComponentTarget {
+    /// Every on-disk binary this component owns — the primary [`Self::dest`] FIRST, then each
+    /// byte-identical alias. The applier replaces + health-checks the whole set (#666 Bug A).
+    pub fn binaries(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.dest.as_path()).chain(self.aliases.iter().map(PathBuf::as_path))
+    }
+
+    /// The OS service id this component's binary belongs to, if it is service-backed (#666 Bug B).
+    #[must_use]
+    pub fn service_id(&self) -> Option<&str> {
+        self.service.as_deref()
+    }
 }
 
 /// The install catalog: the tracked components' targets on this host. Overridable so tests and the
@@ -128,8 +160,9 @@ impl Catalog {
 
     /// The default tracked-component catalog on `platform` (SPEC §10.3) — channel-agnostic, since
     /// both channels track the SAME component set, differing only in which release each resolves.
-    /// dig-node installs as a native package (MSI/pkg/deb) that self-manages its service; digstore,
-    /// dig-dns and the beacon itself are raw-binary replaces.
+    /// dig-node installs as a native package (MSI/pkg/deb) and runs as an OS service the applier
+    /// stops before + restarts after its replace (#666 Bug B); digstore, dig-dns and the beacon
+    /// itself are raw-binary replaces. Each aliased component (digs/digd/dign) owns its alias too.
     ///
     /// Destinations are resolved from the RUNNING beacon's own location (#581): the universal
     /// installer places every DIG binary — including `dig-updater` — in one install bin dir, so the
@@ -171,21 +204,34 @@ impl Catalog {
                 name: "dig-node".into(),
                 method: package_method,
                 dest: exe("dig-node"),
+                // dig-node ships the byte-identical alias `dign` (v0.31.0, #548) and runs as the
+                // OS service `net.dignetwork.dig-node`, whose executable is held open while it runs.
+                aliases: vec![exe("dign")],
+                service: Some("net.dignetwork.dig-node".into()),
             },
             ComponentTarget {
                 name: "digstore".into(),
                 method: InstallMethod::RawBinary,
                 dest: exe("digstore"),
+                // digstore ships the byte-identical alias `digs` (#434).
+                aliases: vec![exe("digs")],
+                service: None,
             },
             ComponentTarget {
                 name: "dig-dns".into(),
                 method: InstallMethod::RawBinary,
                 dest: exe("dig-dns"),
+                // dig-dns ships the byte-identical alias `digd` (v0.12.0, #548) — the #666 Bug A
+                // binary a pre-fix beacon left frozen at its install-time version.
+                aliases: vec![exe("digd")],
+                service: None,
             },
             ComponentTarget {
                 name: BEACON_COMPONENT_NAME.into(),
                 method: InstallMethod::RawBinary,
                 dest: exe(BEACON_COMPONENT_NAME),
+                aliases: vec![],
+                service: None,
             },
         ])
     }
@@ -206,6 +252,10 @@ pub struct PlannedComponent {
     pub method: InstallMethod,
     /// The installed executable path (probe + raw-binary replace target).
     pub dest: PathBuf,
+    /// The byte-identical alias binaries refreshed from the SAME verified bytes as `dest` and
+    /// version-checked alongside it (#666 Bug A) — copied from the component's
+    /// [`ComponentTarget::aliases`].
+    pub aliases: Vec<PathBuf>,
     /// The manifest's human version for this build.
     pub version: String,
     /// The manifest's monotonic build number.
@@ -284,16 +334,31 @@ impl Plan {
                 DetectedVersion::Absent => None,
             };
             let decision = decide(&detected, &component.version);
+            // #666 F3: the enumeration decision must key on the WHOLE binary set, not just the
+            // primary `dest`. A prior pass may have advanced the primary but left an alias stale
+            // (a transient alias lock → the component reported `Deferred` with primary-new/alias-old,
+            // no rollback). If we keyed only on the primary here, we would see it current → `Skip` →
+            // the stale alias would NEVER be re-refreshed and Bug A would recur. So: when the primary
+            // says `Skip` but ANY alias is missing or reports a different version, re-drive the
+            // component as an `Update` so the applier refreshes + health-checks the whole set.
+            let (action, summary) = redrive_for_stale_alias(
+                target,
+                &component.version,
+                decision.action,
+                decision.summary,
+                detect,
+            );
             components.push(PlannedComponent {
                 name: component.name.clone(),
                 method: target.method,
                 dest: target.dest.clone(),
+                aliases: target.aliases.clone(),
                 version: component.version.clone(),
                 build: component.build,
                 expected_digest: artifact.sha256.clone(),
                 staged_path,
-                action: decision.action,
-                summary: decision.summary,
+                action,
+                summary,
                 installed_build,
             });
         }
@@ -307,6 +372,38 @@ impl Plan {
             .iter()
             .filter(|c| c.action != UpdateAction::Skip)
     }
+}
+
+/// Re-drive an aliased component as an `Update` when the PRIMARY looks current (`Skip`) but ANY of
+/// its byte-identical aliases is missing or on a different version (#666 F3).
+///
+/// Enumeration must treat a component as a binary SET: keying the Install/Skip decision on the
+/// primary alone would let a stale alias — left behind by a prior pass whose alias replace deferred
+/// — go unnoticed forever (primary current → `Skip` → the alias is never re-refreshed). When the
+/// primary is already actionable (`Install`/`Update`), the applier refreshes the whole set anyway,
+/// so the primary decision is returned unchanged; only a `Skip` primary is escalated.
+fn redrive_for_stale_alias(
+    target: &ComponentTarget,
+    version: &str,
+    primary_action: UpdateAction,
+    primary_summary: String,
+    detect: &dyn Fn(&Path) -> DetectedVersion,
+) -> (UpdateAction, String) {
+    if primary_action != UpdateAction::Skip {
+        return (primary_action, primary_summary);
+    }
+    for alias in &target.aliases {
+        if decide(&detect(alias), version).action != UpdateAction::Skip {
+            return (
+                UpdateAction::Update,
+                format!(
+                    "v{version} (primary current, but alias {} is out of date — refreshing the set)",
+                    alias.display()
+                ),
+            );
+        }
+    }
+    (primary_action, primary_summary)
 }
 
 /// Resolve the install root — the directory the beacon installs components INTO — from the running
@@ -394,6 +491,8 @@ mod tests {
             name: "digstore".into(),
             method: InstallMethod::RawBinary,
             dest: PathBuf::from("/opt/dig/digstore"),
+            aliases: vec![PathBuf::from("/opt/dig/digs")],
+            service: None,
         }])
     }
 
@@ -491,6 +590,45 @@ mod tests {
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Update);
         assert_eq!(plan.components[0].installed_build, Some(14_000));
+    }
+
+    #[test]
+    fn a_stale_alias_redrives_a_current_primary_as_an_update_666f3() {
+        // #666 F3: the primary `digstore` is already at 0.15.0 (Skip on its own), but its alias
+        // `digs` still reports 0.14.0. Keying only on the primary would Skip and leave the alias
+        // stale forever; enumeration must re-drive the whole set as an Update.
+        let m = manifest_one("digstore", "0.15.0", 15_000, "deadbeef");
+        let plan = Plan::build(
+            &m,
+            &[staged("digstore", "/staging/digstore")],
+            &catalog(),
+            &platform(),
+            &|p: &Path| {
+                if p.ends_with("digs") {
+                    DetectedVersion::Present("digstore 0.14.0".into()) // stale alias
+                } else {
+                    DetectedVersion::Present("digstore 0.15.0".into()) // current primary
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.components[0].action, UpdateAction::Update);
+        assert_eq!(plan.actionable().count(), 1);
+    }
+
+    #[test]
+    fn a_current_primary_and_current_alias_still_skips() {
+        // The whole set is current → genuinely Skip (no spurious re-drive).
+        let m = manifest_one("digstore", "0.15.0", 15_000, "deadbeef");
+        let plan = Plan::build(
+            &m,
+            &[staged("digstore", "/staging/digstore")],
+            &catalog(),
+            &platform(),
+            &|_| DetectedVersion::Present("digstore 0.15.0".into()),
+        )
+        .unwrap();
+        assert_eq!(plan.components[0].action, UpdateAction::Skip);
     }
 
     #[test]
@@ -610,6 +748,47 @@ mod tests {
                 exe_dir.display(),
                 dest.display()
             );
+        }
+    }
+
+    #[test]
+    fn each_aliased_component_enumerates_its_alias_as_a_dest_sibling() {
+        // #666 Bug A: the applier replaces + health-checks the whole binary SET. The canonical
+        // aliases (digs≡digstore, digd≡dig-dns, dign≡dig-node) are siblings of each primary.
+        let bin = Path::new("/opt/dig/bin");
+        let cat = Catalog::alpha_defaults_in(bin, &platform());
+        for (component, alias) in [
+            ("digstore", "digs"),
+            ("dig-dns", "digd"),
+            ("dig-node", "dign"),
+        ] {
+            let target = cat.target(component).unwrap();
+            let binaries: Vec<PathBuf> = target.binaries().map(Path::to_path_buf).collect();
+            assert!(
+                binaries.contains(&bin.join(alias)),
+                "{component} must enumerate its `{alias}` alias in its binary set"
+            );
+            assert_eq!(binaries[0], target.dest, "the primary binary comes first");
+        }
+        // The beacon itself ships no alias.
+        assert!(cat
+            .target(BEACON_COMPONENT_NAME)
+            .unwrap()
+            .aliases
+            .is_empty());
+    }
+
+    #[test]
+    fn only_dig_node_declares_a_managed_service() {
+        // #666 Bug B: dig-node runs as the OS service `net.dignetwork.dig-node`; no other tracked
+        // component is service-backed, so only it triggers the stop→replace→restart path.
+        let cat = Catalog::alpha_defaults(&platform());
+        assert_eq!(
+            cat.target("dig-node").unwrap().service_id(),
+            Some("net.dignetwork.dig-node")
+        );
+        for component in ["digstore", "dig-dns", BEACON_COMPONENT_NAME] {
+            assert_eq!(cat.target(component).unwrap().service_id(), None);
         }
     }
 

@@ -49,6 +49,7 @@ use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONE
 use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
 use crate::selfupdate::apply_self_update;
+use crate::service::{ServiceAction, ServiceControl};
 use crate::state::{LoadedState, TrustStateStore};
 
 /// What one component's apply produced.
@@ -190,6 +191,10 @@ pub struct Installer<'a> {
     pub detect: &'a VersionProbe<'a>,
     /// Probe for the HEALTH step (what version is installed AFTER install).
     pub health: &'a VersionProbe<'a>,
+    /// Stop/start a service-backed component's OS service around its replace (#666 Bug B).
+    /// Production wires [`crate::service::control`]; tests inject a recording fake so the
+    /// stop→replace→restart ordering + failure handling are exercised without a real service.
+    pub service_ctl: &'a ServiceControl<'a>,
 }
 
 impl Installer<'_> {
@@ -348,11 +353,61 @@ impl Installer<'_> {
         let executable = pc.method == InstallMethod::RawBinary;
         stage_and_verify_private(&staged, &private, &pc.expected_digest, &pc.name, executable)?;
 
-        // Snapshot the currently-installed binary so a failed health gate can revert to it.
-        let snapshot = self.lkg.snapshot(&pc.name, &pc.dest, pc.installed_build)?;
+        // Snapshot the WHOLE binary set (primary + every alias) so a failed health gate reverts the
+        // ENTIRE set together (#666 F2). `install_from_private` refreshes the aliases to the new
+        // bytes too, so snapshotting only the primary would let a rollback leave primary-OLD /
+        // alias-NEW — the exact #666 split-state. Snapshots are read-only, so taking them BEFORE the
+        // service stop is safe and keeps the stop→replace window as short as possible.
+        let snapshots = self.snapshot_set(pc)?;
 
-        match install_step(&private, &self.retry) {
-            InstallOutcome::Installed => match check_health(&pc.dest, &pc.version, self.health) {
+        // #666 Bug B: a service-backed component holds its binary open while it runs, so STOP the
+        // service first (releasing the lock) — else the replace defers/fails and the post-install
+        // probe reads the still-running old binary. The service id is looked up from the catalog by
+        // component name (the applier authority for WHERE/HOW), not carried on the plan.
+        let service = self
+            .catalog
+            .target(&pc.name)
+            .and_then(|t| t.service_id())
+            .map(str::to_string);
+        if let Some(service) = &service {
+            if let Err(detail) = (self.service_ctl)(service, ServiceAction::Stop) {
+                // The service could not be stopped, so its binary is still locked — do NOT attempt
+                // a replace that would defer anyway, and leave the service RUNNING (the stop failed,
+                // so nothing was taken down; an already-stopped service is classified as a
+                // successful stop by `service::control`, not routed here). Defer to the next pass,
+                // cleaning up the private copy.
+                let _ = std::fs::remove_file(&private);
+                return Ok(ComponentOutcome::from(
+                    pc,
+                    ComponentResult::Deferred,
+                    format!("could not stop service {service} before replace: {detail}"),
+                ));
+            }
+        }
+
+        // Run the install → health → rollback core, then GUARANTEE the service is restarted on EVERY
+        // post-stop path — success, deferral, rollback, OR a propagated rollback ERROR (an
+        // unreadable/corrupt LKG, a re-verify mismatch, a reinstate-write failure). `restart_after`
+        // does NOT `?` the inner result before restarting, so a stopped service is never left down
+        // even when the rollback itself errors out (#666 F1).
+        let outcome = install_step(&private, &self.retry);
+        let install_result = self.finish_apply(pc, floor, snapshots, outcome);
+        restart_after(service.as_deref(), self.service_ctl, install_result)
+    }
+
+    /// Turn one component's [`InstallOutcome`] into its [`ComponentOutcome`], running the health gate
+    /// over the WHOLE binary set (primary + aliases, #666 Bug A) on a successful install and rolling
+    /// the whole set back on any failure. Split out from [`Self::apply_component`] so the service
+    /// stop/restart can wrap this shared install→health→rollback core.
+    fn finish_apply(
+        &self,
+        pc: &PlannedComponent,
+        floor: u64,
+        snapshots: Vec<BinarySnapshot>,
+        outcome: InstallOutcome,
+    ) -> Result<ComponentOutcome, BrokerError> {
+        match outcome {
+            InstallOutcome::Installed => match self.check_binary_set(pc) {
                 // `pc.summary` is the PLAN's pre-install prediction ("v0.14.0 -> v0.15.0") — once
                 // the install has actually happened, that prediction is stale. Report what the
                 // health gate just re-observed on disk instead (#582), so a later `status` read
@@ -363,7 +418,7 @@ impl Installer<'_> {
                     verified_install_detail(&pc.name, &detected),
                 )),
                 Err(detail) => {
-                    self.rollback(snapshot, &pc.dest, floor)?;
+                    self.rollback_set(snapshots, floor)?;
                     Ok(ComponentOutcome::from(
                         pc,
                         ComponentResult::RolledBack,
@@ -377,7 +432,7 @@ impl Installer<'_> {
                 reason,
             )),
             InstallOutcome::Failed { detail } => {
-                self.rollback(snapshot, &pc.dest, floor)?;
+                self.rollback_set(snapshots, floor)?;
                 Ok(ComponentOutcome::from(
                     pc,
                     ComponentResult::RolledBack,
@@ -387,30 +442,69 @@ impl Installer<'_> {
         }
     }
 
-    /// Revert a component: restore its last-known-good snapshot (re-verified, floor-bounded), or —
-    /// for a fresh install that had no prior build — remove what was just placed.
-    fn rollback(
-        &self,
-        snapshot: Option<LkgEntry>,
-        dest: &Path,
-        floor: u64,
-    ) -> Result<(), BrokerError> {
-        match snapshot {
-            // This is the IN-PASS rollback: `entry` holds the bytes captured at `dest` moments ago
-            // (pass step "snapshot the currently-installed binary"), so restoring them is a
-            // restore-in-place — floor-EXEMPT so it never leaves dest missing even when the prior
-            // build was un-ageable (#558, the double-rename-fault branch).
-            Some(entry) => self.lkg.restore(&entry, floor, RestoreKind::InPlace),
-            None => {
-                if dest.exists() {
-                    std::fs::remove_file(dest).map_err(|e| BrokerError::RollbackFailed {
-                        component: dest.display().to_string(),
-                        detail: format!("could not remove freshly-installed binary: {e}"),
-                    })?;
+    /// Snapshot EVERY binary in a component's set (primary + each byte-identical alias) so a rollback
+    /// reverts the whole set together and never leaves a split primary-new/alias-old state (#666 F2).
+    /// Each binary is cached under a distinct, filename-safe key (the primary under the component
+    /// name — preserving the manual cross-pass rollback contract — each alias under
+    /// `{component}--{alias-file-name}`). A binary absent at snapshot time yields a `None` entry (a
+    /// fresh placement to be removed, not restored, on rollback).
+    fn snapshot_set(&self, pc: &PlannedComponent) -> Result<Vec<BinarySnapshot>, BrokerError> {
+        let mut snapshots = Vec::with_capacity(1 + pc.aliases.len());
+        snapshots.push(BinarySnapshot {
+            dest: pc.dest.clone(),
+            entry: self.lkg.snapshot(&pc.name, &pc.dest, pc.installed_build)?,
+        });
+        for alias in &pc.aliases {
+            let key = alias_cache_key(&pc.name, alias);
+            snapshots.push(BinarySnapshot {
+                dest: alias.clone(),
+                entry: self.lkg.snapshot(&key, alias, pc.installed_build)?,
+            });
+        }
+        Ok(snapshots)
+    }
+
+    /// Roll back the WHOLE binary set to its pre-pass state (#666 F2): restore each snapshotted
+    /// binary in place (floor-exempt — the just-captured current bytes), or remove a binary that was
+    /// freshly placed with no prior version. All-or-nothing so no failure path leaves a split set.
+    fn rollback_set(&self, snapshots: Vec<BinarySnapshot>, floor: u64) -> Result<(), BrokerError> {
+        for snapshot in snapshots {
+            match snapshot.entry {
+                // The IN-PASS restore of the bytes captured at this destination moments ago — a
+                // restore-in-place, floor-EXEMPT so it never leaves the target missing even for an
+                // un-ageable prior build (#558).
+                Some(entry) => self.lkg.restore(&entry, floor, RestoreKind::InPlace)?,
+                None => {
+                    if snapshot.dest.exists() {
+                        std::fs::remove_file(&snapshot.dest).map_err(|e| {
+                            BrokerError::RollbackFailed {
+                                component: snapshot.dest.display().to_string(),
+                                detail: format!("could not remove freshly-installed binary: {e}"),
+                            }
+                        })?;
+                    }
                 }
-                Ok(())
             }
         }
+        Ok(())
+    }
+
+    /// Health-gate EVERY binary in a component's set — the primary AND each byte-identical alias
+    /// (#666 Bug A) — each must now report the manifest's version. A stale/missing alias fails the
+    /// gate exactly like a stale primary, so a component whose alias was left un-refreshed is
+    /// rolled back rather than falsely reported Installed. Returns the PRIMARY's observed version
+    /// (what a later `status` read states, #582).
+    fn check_binary_set(&self, pc: &PlannedComponent) -> Result<DetectedVersion, String> {
+        let primary = check_health(&pc.dest, &pc.version, self.health)?;
+        for alias in &pc.aliases {
+            check_health(alias, &pc.version, self.health).map_err(|detail| {
+                format!(
+                    "alias {} failed the version check: {detail}",
+                    alias.display()
+                )
+            })?;
+        }
+        Ok(primary)
     }
 
     /// Fold the accepted manifest's marks into the trust state and persist it — hardening the state
@@ -424,6 +518,54 @@ impl Installer<'_> {
         advanced.advance(manifest);
         self.store.save(&advanced, loaded)
     }
+}
+
+/// One binary in a component's set paired with its pre-pass snapshot — the unit
+/// [`Installer::rollback_set`] reverts. `entry` is `None` when the binary was absent at snapshot
+/// time (a fresh placement to REMOVE on rollback, not restore).
+struct BinarySnapshot {
+    /// The install destination this binary lives at.
+    dest: std::path::PathBuf,
+    /// Its last-known-good snapshot, or `None` if it did not exist before this pass.
+    entry: Option<LkgEntry>,
+}
+
+/// The filename-safe LKG cache key for a component's ALIAS binary — distinct from the primary's key
+/// (the bare component name) so snapshotting the whole set never collides. Uses the alias file name
+/// (never a path with separators or a Windows-illegal `:`), so `dig-node` + `…/dign` →
+/// `dig-node--dign`.
+fn alias_cache_key(component: &str, alias: &Path) -> String {
+    let leaf = alias
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{component}--{leaf}")
+}
+
+/// Restart a stopped service AFTER the install→health→rollback core has run, on EVERY path — a
+/// success, a deferral, a rollback, OR a propagated rollback ERROR — so a service that was stopped
+/// for its replace is NEVER left down (#666 F1). The inner `result` is deliberately NOT `?`-ed
+/// before the restart: a rollback that itself errors (unreadable/corrupt LKG, re-verify mismatch,
+/// reinstate-write failure) still restarts the service, then the error propagates. A restart failure
+/// is folded into the outcome detail as a warning but never turns an otherwise-correct on-disk state
+/// into a hard failure (the daily wake + the service manager's own boot recovery bring it back).
+fn restart_after(
+    service: Option<&str>,
+    service_ctl: &ServiceControl,
+    result: Result<ComponentOutcome, BrokerError>,
+) -> Result<ComponentOutcome, BrokerError> {
+    let restart_warning = match service {
+        Some(service) => service_ctl(service, ServiceAction::Start)
+            .err()
+            .map(|detail| format!(" (warning: could not restart {service}: {detail})")),
+        None => None,
+    };
+    // Propagate the install/rollback error ONLY after the restart above has already run.
+    let mut outcome = result?;
+    if let Some(warning) = restart_warning {
+        outcome.detail.push_str(&warning);
+    }
+    Ok(outcome)
 }
 
 /// The production enumeration/health probe: spawn `<path> --version`.
@@ -451,6 +593,76 @@ fn reverify_err(e: TrustError) -> BrokerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// #666 F1 (the BLOCKER): a stopped service MUST be restarted even when the inner
+    /// install/rollback result is an ERROR (a corrupt/unreadable LKG, a re-verify mismatch, a
+    /// reinstate-write failure). `restart_after` restarts BEFORE propagating, so the node is never
+    /// left down — the property the earlier `?`-first ordering silently violated.
+    #[test]
+    fn restart_fires_even_when_the_rollback_itself_errors_666f1() {
+        let calls = RefCell::new(Vec::new());
+        let ctl = |_: &str, action: ServiceAction| {
+            calls.borrow_mut().push(action);
+            Ok(())
+        };
+        let rollback_error = Err(BrokerError::RollbackFailed {
+            component: "dig-node".into(),
+            detail: "cached bytes unreadable".into(),
+        });
+        let out = restart_after(Some("net.dignetwork.dig-node"), &ctl, rollback_error);
+        assert!(
+            out.is_err(),
+            "the rollback error still propagates to the caller"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![ServiceAction::Start],
+            "the service was restarted before the error propagated — never left down"
+        );
+    }
+
+    #[test]
+    fn restart_after_folds_a_restart_failure_into_the_detail_without_failing_the_pass() {
+        let ctl = |_: &str, _: ServiceAction| Err("boot failed".to_string());
+        let ok = Ok(ComponentOutcome {
+            component: "dig-node".into(),
+            action: "update".into(),
+            result: ComponentResult::Installed,
+            detail: "dig-node now reports 0.33.0".into(),
+        });
+        let out = restart_after(Some("net.dignetwork.dig-node"), &ctl, ok).unwrap();
+        assert_eq!(
+            out.result,
+            ComponentResult::Installed,
+            "a restart failure never downgrades a good install"
+        );
+        assert!(
+            out.detail.contains("warning: could not restart"),
+            "the warning is surfaced: {}",
+            out.detail
+        );
+    }
+
+    #[test]
+    fn restart_after_is_a_no_op_for_a_non_service_component() {
+        let ctl =
+            |_: &str, _: ServiceAction| panic!("must not be called for a service-less component");
+        let ok = Ok(ComponentOutcome {
+            component: "digstore".into(),
+            action: "update".into(),
+            result: ComponentResult::Installed,
+            detail: "ok".into(),
+        });
+        assert!(restart_after(None, &ctl, ok).is_ok());
+    }
+
+    #[test]
+    fn alias_cache_key_is_filename_safe_and_distinct_from_the_primary() {
+        let key = alias_cache_key("dig-node", Path::new("/opt/dig/bin/dign"));
+        assert_eq!(key, "dig-node--dign");
+        assert!(!key.contains('/') && !key.contains('\\') && !key.contains(':'));
+    }
 
     #[test]
     fn component_result_as_str_matches_its_serde_snake_case_rename() {
