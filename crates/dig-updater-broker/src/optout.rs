@@ -130,10 +130,20 @@ mod tests {
     #[test]
     fn a_non_privileged_owned_marker_is_not_honored() {
         // THE forgery guard (loop-security HIGH): a marker that EXISTS but was created by an
-        // ordinary (non-privileged) identity — i.e. this test process, which is NOT SYSTEM/root and
-        // owns files under its own SID/uid — must NOT be honored, or an unprivileged local user
+        // ordinary (non-privileged) identity must NOT be honored, or an unprivileged local user
         // could plant `schedule-optout` in the state dir to permanently suppress auto-updates. We
-        // write the file WITHOUT `set_opted_out`'s privileged-ownership claim, mimicking a plant.
+        // simulate the plant by writing the file WITHOUT `set_opted_out`'s privileged-ownership
+        // claim.
+        //
+        // This is only meaningful when the TEST PROCESS is itself non-privileged: a file created by
+        // a root/Administrator process is owned by root / the Administrators group (on the Windows CI
+        // runner an elevated process's default owner IS `S-1-5-32-544`), which would legitimately be
+        // privileged-owned and correctly honored — so there is no way to forge a non-privileged plant
+        // from an elevated context. When elevated we skip; the positive (privileged-owned => honored)
+        // side is covered by `a_privileged_owned_marker_is_honored` in the elevated CI job.
+        if crate::elevation::is_elevated() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(marker_path(dir.path()), b"planted").expect("plant a marker");
         assert!(
