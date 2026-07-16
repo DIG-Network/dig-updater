@@ -104,26 +104,41 @@ pub enum EnsureAction {
     LeftUnknown,
     /// Provably absent — (re-)registered this pass.
     Reregistered,
+    /// The daily schedule was DELIBERATELY removed (an Admin-owned opt-out sentinel is present, see
+    /// [`crate::optout`]) — the self-heal honored that choice and did NOT re-register (#584).
+    SuppressedByOptOut,
 }
 
-/// Register the daily scheduler artifact that invokes `<exe> run`.
+/// Register the daily scheduler artifact that invokes `<exe> run`, CLEARING any prior opt-out.
+///
+/// Clearing the opt-out sentinel ([`crate::optout`]) is what re-enables the self-heal / always-on
+/// re-arm after a previous `uninstall`: an explicit `install` is the operator saying "I want the
+/// schedule again". The clear happens only AFTER a successful registration, so a failed install
+/// never silently re-arms a deliberate opt-out.
 ///
 /// # Errors
 ///
 /// [`BrokerError::Io`] if the caller lacks the privilege to register a SYSTEM/root-run schedule,
-/// or if the underlying OS scheduler call fails.
-pub fn install(exe: &Path) -> Result<(), BrokerError> {
-    imp::install(exe)
+/// if the underlying OS scheduler call fails, or if the opt-out sentinel could not be cleared.
+pub fn install(exe: &Path, state_dir: &Path) -> Result<(), BrokerError> {
+    imp::install(exe)?;
+    crate::optout::clear_opted_out(state_dir)
 }
 
-/// Remove the daily scheduler artifact. Idempotent: removing an already-absent schedule succeeds.
+/// Remove the daily scheduler artifact and RECORD a deliberate opt-out. Idempotent: removing an
+/// already-absent schedule succeeds.
+///
+/// The opt-out sentinel ([`crate::optout`]) is written only AFTER a successful removal, so an
+/// always-on driver (dig-node) never re-arms a schedule the operator DELIBERATELY removed — the
+/// distinction between an accidental deletion (re-arm) and this deliberate uninstall (respect).
 ///
 /// # Errors
 ///
-/// [`BrokerError::Io`] if the caller lacks privilege, or the underlying OS call fails for a reason
-/// other than "already absent".
-pub fn uninstall() -> Result<(), BrokerError> {
-    imp::uninstall()
+/// [`BrokerError::Io`] if the caller lacks privilege, the underlying OS call fails for a reason
+/// other than "already absent", or the opt-out sentinel could not be written.
+pub fn uninstall(state_dir: &Path) -> Result<(), BrokerError> {
+    imp::uninstall()?;
+    crate::optout::set_opted_out(state_dir)
 }
 
 /// Report whether the daily schedule is currently registered.
@@ -143,6 +158,9 @@ pub fn status() -> Result<ScheduleStatus, BrokerError> {
 /// this, so a beacon that runs (elevated) for ANY reason resurrects its own daily wake.
 ///
 /// Idempotent and conservative:
+/// - a deliberate OPT-OUT ([`crate::optout`]) → left untouched ([`EnsureAction::SuppressedByOptOut`]):
+///   an operator who ran `schedule uninstall` is never fought (#584). Checked FIRST, so an opted-out
+///   ensure never even probes the OS scheduler.
 /// - [`SchedulePresence::Registered`] → left untouched ([`EnsureAction::AlreadyRegistered`]).
 /// - [`SchedulePresence::Unknown`] → left untouched ([`EnsureAction::LeftUnknown`]): a task whose
 ///   presence can't be read (e.g. access-denied) is NEVER recreated, or we'd risk clobbering a
@@ -155,7 +173,10 @@ pub fn status() -> Result<ScheduleStatus, BrokerError> {
 /// registration fails (e.g. the caller is not elevated: registering a SYSTEM/root schedule is a
 /// privileged act, §8.4). The caller (`Broker::run_once_with_feed`) treats such a failure as
 /// best-effort and non-fatal.
-pub fn ensure(exe: &Path) -> Result<EnsureAction, BrokerError> {
+pub fn ensure(exe: &Path, state_dir: &Path) -> Result<EnsureAction, BrokerError> {
+    if crate::optout::is_opted_out(state_dir) {
+        return Ok(EnsureAction::SuppressedByOptOut);
+    }
     let action = ensure_decision(imp::status()?.presence);
     if action == EnsureAction::Reregistered {
         imp::install(exe)?;
@@ -163,8 +184,8 @@ pub fn ensure(exe: &Path) -> Result<EnsureAction, BrokerError> {
     Ok(action)
 }
 
-/// The pure decision [`ensure`] makes from a presence reading — split out so every branch is
-/// exercised deterministically without touching the OS.
+/// The pure decision [`ensure`] makes from a presence reading (AFTER the opt-out short-circuit) —
+/// split out so every branch is exercised deterministically without touching the OS.
 #[must_use]
 fn ensure_decision(presence: SchedulePresence) -> EnsureAction {
     match presence {
@@ -680,6 +701,20 @@ mod tests {
         assert_eq!(
             ensure_decision(SchedulePresence::Unknown),
             EnsureAction::LeftUnknown,
+        );
+    }
+
+    #[test]
+    fn ensure_short_circuits_to_suppressed_when_an_opt_out_marker_is_present() {
+        // #584: a DELIBERATE `schedule uninstall` writes an Admin-owned opt-out marker; `ensure`
+        // must honor it and return WITHOUT touching the OS scheduler (the short-circuit is what
+        // makes this test cross-platform — no schtasks/systemctl/launchctl is spawned).
+        let state_dir = tempfile::tempdir().expect("state dir");
+        crate::optout::set_opted_out(state_dir.path()).expect("write the opt-out marker");
+        let exe = std::env::current_exe().expect("test exe");
+        assert_eq!(
+            ensure(&exe, state_dir.path()).expect("ensure honors the opt-out without an OS probe"),
+            EnsureAction::SuppressedByOptOut
         );
     }
 

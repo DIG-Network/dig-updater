@@ -13,7 +13,8 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use dig_updater_broker::scheduler;
+use dig_updater_broker::{optout, scheduler};
+use tempfile::TempDir;
 
 /// Every test in this file targets the SAME machine-global artifact (one Scheduled Task path /
 /// one systemd unit pair / one launchd label — there is no per-test name to isolate on, unlike
@@ -41,21 +42,28 @@ fn fake_exe() -> PathBuf {
     std::env::current_exe().expect("current test binary path")
 }
 
+/// A per-test, throwaway state directory the opt-out sentinel (#584) lives in — isolated from the
+/// real Admin-only default so these tests never touch machine-global beacon state.
+fn state_dir() -> TempDir {
+    tempfile::tempdir().expect("throwaway state dir")
+}
+
 #[test]
 #[ignore = "mutates real OS scheduler state; requires Administrator/root — run via `-- --ignored` \
             in the elevated scheduler CI job"]
 fn install_then_status_then_uninstall_round_trips_cleanly() {
     let _guard = serialize();
     let exe = fake_exe();
+    let state = state_dir();
 
     // Start from a clean slate in case a prior run in this environment left something behind.
-    let _ = scheduler::uninstall();
+    let _ = scheduler::uninstall(state.path());
     assert!(
         !scheduler::status().expect("status").installed(),
         "must start absent"
     );
 
-    scheduler::install(&exe).expect("install must succeed when run elevated");
+    scheduler::install(&exe, state.path()).expect("install must succeed when run elevated");
     let status = scheduler::status().expect("status");
     assert!(
         status.installed(),
@@ -63,7 +71,7 @@ fn install_then_status_then_uninstall_round_trips_cleanly() {
         status.detail
     );
 
-    scheduler::uninstall().expect("uninstall must succeed");
+    scheduler::uninstall(state.path()).expect("uninstall must succeed");
     let status = scheduler::status().expect("status");
     assert!(
         !status.installed(),
@@ -78,14 +86,17 @@ fn install_then_status_then_uninstall_round_trips_cleanly() {
 fn install_is_idempotent_and_uninstall_of_an_absent_schedule_succeeds() {
     let _guard = serialize();
     let exe = fake_exe();
-    let _ = scheduler::uninstall();
+    let state = state_dir();
+    let _ = scheduler::uninstall(state.path());
 
-    scheduler::install(&exe).expect("first install");
-    scheduler::install(&exe).expect("re-install (e.g. a re-run installer) must not error");
+    scheduler::install(&exe, state.path()).expect("first install");
+    scheduler::install(&exe, state.path())
+        .expect("re-install (e.g. a re-run installer) must not error");
     assert!(scheduler::status().expect("status").installed());
 
-    scheduler::uninstall().expect("uninstall");
-    scheduler::uninstall().expect("uninstalling an already-absent schedule must succeed");
+    scheduler::uninstall(state.path()).expect("uninstall");
+    scheduler::uninstall(state.path())
+        .expect("uninstalling an already-absent schedule must succeed");
 }
 
 #[cfg(windows)]
@@ -97,8 +108,9 @@ fn windows_task_definition_file_grants_only_admin_system_and_owner() {
 
     let _guard = serialize();
     let exe = fake_exe();
-    let _ = scheduler::uninstall();
-    scheduler::install(&exe).expect("install");
+    let state = state_dir();
+    let _ = scheduler::uninstall(state.path());
+    scheduler::install(&exe, state.path()).expect("install");
 
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     let definition = std::path::Path::new(&system_root)
@@ -130,7 +142,7 @@ fn windows_task_definition_file_grants_only_admin_system_and_owner() {
         "must grant SYSTEM: {listing}"
     );
 
-    scheduler::uninstall().expect("uninstall");
+    scheduler::uninstall(state.path()).expect("uninstall");
 }
 
 #[test]
@@ -144,15 +156,21 @@ fn ensure_self_heals_an_absent_schedule_and_is_idempotent() {
 
     let _guard = serialize();
     let exe = fake_exe();
-    let _ = scheduler::uninstall();
+    let state = state_dir();
+    let _ = scheduler::uninstall(state.path());
+    // The clean-slate uninstall above records a DELIBERATE opt-out (#584); this test models an
+    // ACCIDENTAL deletion (a task removed by something other than `schedule uninstall`), so clear
+    // the sentinel before exercising the self-heal.
+    optout::clear_opted_out(state.path())
+        .expect("clear the opt-out to model an accidental deletion");
     assert!(
         !scheduler::status().expect("status").installed(),
         "must start absent"
     );
 
-    // Absent -> re-registered.
+    // Absent + no opt-out -> re-registered.
     assert_eq!(
-        scheduler::ensure(&exe).expect("ensure must self-heal an absent schedule"),
+        scheduler::ensure(&exe, state.path()).expect("ensure must self-heal an absent schedule"),
         EnsureAction::Reregistered
     );
     assert!(
@@ -162,11 +180,50 @@ fn ensure_self_heals_an_absent_schedule_and_is_idempotent() {
 
     // Already registered -> left untouched (idempotent).
     assert_eq!(
-        scheduler::ensure(&exe).expect("ensure on a present schedule must not error"),
+        scheduler::ensure(&exe, state.path()).expect("ensure on a present schedule must not error"),
         EnsureAction::AlreadyRegistered
     );
 
-    scheduler::uninstall().expect("uninstall");
+    scheduler::uninstall(state.path()).expect("uninstall");
+}
+
+#[test]
+#[ignore = "mutates real OS scheduler state; requires Administrator/root — run via `-- --ignored` \
+            in the elevated scheduler CI job"]
+fn ensure_respects_a_deliberate_uninstall_and_install_re_enables() {
+    // #584 acceptance: a DELIBERATE `schedule uninstall` must NOT be re-armed by the self-heal, and
+    // a later `schedule install` must clear the opt-out so the self-heal works again.
+    use dig_updater_broker::scheduler::EnsureAction;
+
+    let _guard = serialize();
+    let exe = fake_exe();
+    let state = state_dir();
+
+    // Deliberate uninstall records the opt-out; ensure must honor it even with the task absent.
+    scheduler::uninstall(state.path()).expect("deliberate uninstall");
+    assert_eq!(
+        scheduler::ensure(&exe, state.path()).expect("ensure must honor a deliberate opt-out"),
+        EnsureAction::SuppressedByOptOut,
+        "an always-on driver must never fight a deliberate `schedule uninstall`"
+    );
+    assert!(
+        !scheduler::status().expect("status").installed(),
+        "the schedule must stay removed while opted out"
+    );
+
+    // An explicit install clears the opt-out (re-enabling the self-heal) and registers the task.
+    scheduler::install(&exe, state.path()).expect("install re-enables");
+    assert!(
+        !optout::is_opted_out(state.path()),
+        "`schedule install` must clear the opt-out sentinel"
+    );
+    assert_eq!(
+        scheduler::ensure(&exe, state.path()).expect("ensure after re-enable"),
+        EnsureAction::AlreadyRegistered,
+        "with the opt-out cleared and the task present, ensure is a no-op — the self-heal is live again"
+    );
+
+    scheduler::uninstall(state.path()).expect("cleanup");
 }
 
 #[cfg(windows)]
@@ -178,8 +235,9 @@ fn windows_uninstall_removes_the_orphan_dig_folder() {
     // masquerade as a partial install.
     let _guard = serialize();
     let exe = fake_exe();
-    let _ = scheduler::uninstall();
-    scheduler::install(&exe).expect("install");
+    let state = state_dir();
+    let _ = scheduler::uninstall(state.path());
+    scheduler::install(&exe, state.path()).expect("install");
 
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     let dig_folder = std::path::Path::new(&system_root)
@@ -187,7 +245,7 @@ fn windows_uninstall_removes_the_orphan_dig_folder() {
         .join("Tasks")
         .join("DIG");
 
-    scheduler::uninstall().expect("uninstall");
+    scheduler::uninstall(state.path()).expect("uninstall");
     assert!(
         !dig_folder.exists(),
         "the empty \\DIG task folder must be removed on uninstall: {}",
@@ -204,8 +262,9 @@ fn linux_units_are_root_owned_mode_0644() {
 
     let _guard = serialize();
     let exe = fake_exe();
-    let _ = scheduler::uninstall();
-    scheduler::install(&exe).expect("install");
+    let state = state_dir();
+    let _ = scheduler::uninstall(state.path());
+    scheduler::install(&exe, state.path()).expect("install");
 
     for unit in ["dig-updater.service", "dig-updater.timer"] {
         let path = std::path::Path::new("/etc/systemd/system").join(unit);
@@ -214,7 +273,7 @@ fn linux_units_are_root_owned_mode_0644() {
         assert_eq!(meta.mode() & 0o777, 0o644, "{unit} must be mode 0644");
     }
 
-    scheduler::uninstall().expect("uninstall");
+    scheduler::uninstall(state.path()).expect("uninstall");
 }
 
 #[cfg(target_os = "macos")]
@@ -226,13 +285,14 @@ fn macos_plist_is_root_owned_mode_0644() {
 
     let _guard = serialize();
     let exe = fake_exe();
-    let _ = scheduler::uninstall();
-    scheduler::install(&exe).expect("install");
+    let state = state_dir();
+    let _ = scheduler::uninstall(state.path());
+    scheduler::install(&exe, state.path()).expect("install");
 
     let path = std::path::Path::new("/Library/LaunchDaemons/net.dignetwork.dig-updater.plist");
     let meta = std::fs::metadata(path).expect("plist exists");
     assert_eq!(meta.uid(), 0, "the plist must be root-owned");
     assert_eq!(meta.mode() & 0o777, 0o644, "the plist must be mode 0644");
 
-    scheduler::uninstall().expect("uninstall");
+    scheduler::uninstall(state.path()).expect("uninstall");
 }

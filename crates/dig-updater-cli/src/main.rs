@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use dig_updater_broker::config::{Channel, UpdaterConfig};
+use dig_updater_broker::paths::default_state_dir;
 use dig_updater_broker::status::StatusSnapshot;
 use dig_updater_broker::{elevation, scheduler, Broker, BrokerError, PassReport};
 use dig_updater_broker::{follow_channel_change, ExtFollow, InstalledDigInstaller};
@@ -58,8 +59,12 @@ COMMANDS:
     resume               Resume auto-updates (requires Administrator/root).
     schedule install     Register the daily scheduler artifact that runs `dig-updater run`
                          (requires Administrator/root).
-    schedule uninstall   Remove the daily scheduler artifact (requires Administrator/root).
+    schedule uninstall   Remove the daily scheduler artifact + record a deliberate opt-out so an
+                         always-on driver won't re-arm it (requires Administrator/root).
     schedule status      Report whether the daily scheduler artifact is registered.
+    schedule ensure      Re-register a provably-ABSENT schedule (the self-heal), unless it was
+                         deliberately uninstalled. Lightweight (no feed/install pass) — for an
+                         always-on re-arm driver (requires Administrator/root to re-register).
     status               Report the beacon's unprivileged status mirror — no elevation required.
     help                 Show this help.
 
@@ -132,6 +137,10 @@ enum ScheduleAction {
     Install,
     Uninstall,
     Status,
+    /// Re-register a provably-ABSENT daily schedule (the self-heal), honoring a deliberate opt-out.
+    /// A LIGHTWEIGHT verb — no feed fetch, no install pass — cheap enough for an always-on driver
+    /// (dig-node) to kick on startup + a periodic tick (#584).
+    Ensure,
     Unknown(String),
 }
 
@@ -226,6 +235,7 @@ fn parse_schedule_action(action: Option<&str>) -> ScheduleAction {
         Some("install") => ScheduleAction::Install,
         Some("uninstall") => ScheduleAction::Uninstall,
         Some("status") => ScheduleAction::Status,
+        Some("ensure") => ScheduleAction::Ensure,
         Some(other) => ScheduleAction::Unknown(other.to_string()),
         None => ScheduleAction::Unknown(String::new()),
     }
@@ -461,21 +471,25 @@ fn report_usage_error(message: &str, json: bool) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Register, remove, or report the daily scheduler artifact that runs `dig-updater run`.
+/// Register, remove, report, or ensure the daily scheduler artifact that runs `dig-updater run`.
 fn run_schedule(action: ScheduleAction, json: bool) -> ExitCode {
     let exe = match current_exe_for_schedule() {
         Ok(p) => p,
         Err(e) => return fail(&e, json),
     };
+    // The opt-out sentinel lives in the Admin-only state dir — never the dry-check-relocatable one
+    // (`for_dry_check`), so a non-privileged process can never forge it to suppress auto-updates
+    // (#584 security lens). `default_state_dir` is the same directory `Broker::new` uses.
+    let state_dir = default_state_dir();
     match action {
-        ScheduleAction::Install => match scheduler::install(&exe) {
+        ScheduleAction::Install => match scheduler::install(&exe, &state_dir) {
             Ok(()) => {
                 print_schedule_outcome("installed", true, json);
                 ExitCode::SUCCESS
             }
             Err(e) => fail(&e, json),
         },
-        ScheduleAction::Uninstall => match scheduler::uninstall() {
+        ScheduleAction::Uninstall => match scheduler::uninstall(&state_dir) {
             Ok(()) => {
                 print_schedule_outcome("uninstalled", false, json);
                 ExitCode::SUCCESS
@@ -493,10 +507,48 @@ fn run_schedule(action: ScheduleAction, json: bool) -> ExitCode {
             }
             Err(e) => fail(&e, json),
         },
+        ScheduleAction::Ensure => match scheduler::ensure(&exe, &state_dir) {
+            Ok(action) => {
+                println!("{}", render_ensure_action(action, json));
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e, json),
+        },
         ScheduleAction::Unknown(action) => {
             eprintln!("unknown schedule action: {action}\n\n{USAGE}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Render the outcome of `schedule ensure` as JSON or a human line. Pure.
+///
+/// The `action` names which branch ran (#584): `already_registered`, `left_unknown` (presence
+/// couldn't be read), `reregistered` (the self-heal fired), or `suppressed_by_opt_out` (a
+/// deliberate `schedule uninstall` is being honored).
+fn render_ensure_action(action: scheduler::EnsureAction, json: bool) -> String {
+    use scheduler::EnsureAction::{
+        AlreadyRegistered, LeftUnknown, Reregistered, SuppressedByOptOut,
+    };
+    let (code, human) = match action {
+        AlreadyRegistered => ("already_registered", "already registered — nothing to do"),
+        LeftUnknown => (
+            "left_unknown",
+            "presence could not be determined — left untouched",
+        ),
+        Reregistered => (
+            "reregistered",
+            "was absent — re-registered the daily schedule",
+        ),
+        SuppressedByOptOut => (
+            "suppressed_by_opt_out",
+            "deliberately uninstalled — left removed (run `schedule install` to re-enable)",
+        ),
+    };
+    if json {
+        serde_json::json!({ "command": "schedule ensure", "action": code }).to_string()
+    } else {
+        format!("dig-updater: schedule ensure: {human}")
     }
 }
 
@@ -832,6 +884,13 @@ mod tests {
                 json: false
             }
         );
+        assert_eq!(
+            parse(&v(&["schedule", "ensure", "--json"])),
+            Cmd::Schedule {
+                action: ScheduleAction::Ensure,
+                json: true
+            }
+        );
     }
 
     #[test]
@@ -1152,5 +1211,33 @@ mod tests {
         let unknown_json: serde_json::Value =
             serde_json::from_str(&render_schedule_status(&unknown, true)).unwrap();
         assert_eq!(unknown_json["installed"], false);
+    }
+
+    #[test]
+    fn render_ensure_action_maps_each_branch_to_a_stable_code() {
+        use scheduler::EnsureAction::{
+            AlreadyRegistered, LeftUnknown, Reregistered, SuppressedByOptOut,
+        };
+        for (action, code) in [
+            (AlreadyRegistered, "already_registered"),
+            (LeftUnknown, "left_unknown"),
+            (Reregistered, "reregistered"),
+            (SuppressedByOptOut, "suppressed_by_opt_out"),
+        ] {
+            let json: serde_json::Value =
+                serde_json::from_str(&render_ensure_action(action, true)).unwrap();
+            assert_eq!(
+                json["action"], code,
+                "the machine code must be stable (#584)"
+            );
+            // The human line always names the command; the opt-out case must point the user at the
+            // recovery verb so a deliberate opt-out is never a dead end.
+            let human = render_ensure_action(action, false);
+            assert!(human.contains("schedule ensure"));
+        }
+        assert!(
+            render_ensure_action(SuppressedByOptOut, false).contains("schedule install"),
+            "the suppressed case must tell the user how to re-enable"
+        );
     }
 }

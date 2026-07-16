@@ -431,6 +431,35 @@ unreadable task), and `schedule status` MUST NOT tell a user "NOT REGISTERED" wh
 not read the task. Removing the artifact (`schedule uninstall`) MUST also remove the now-empty
 containing folder (Windows `\DIG`) so an empty folder cannot masquerade as a partial install.
 
+**External re-arm — the `schedule ensure` verb + the opt-out sentinel (MANDATORY).** The per-pass
+self-heal above only fires when the beacon RUNS — but a *dead schedule cannot run itself to re-arm*
+(the chicken-and-egg). An always-on privileged component (the `dig-node` OS service) therefore
+re-asserts the schedule on its own startup + a periodic tick by invoking a dedicated LIGHTWEIGHT
+verb, `dig-updater schedule ensure`. `ensure` runs ONLY the self-heal — the tristate presence probe
+plus a re-register of a *provably absent* artifact — with NO feed fetch, install, or self-update, so
+it is cheap enough to kick frequently. It reports which branch ran as a stable machine code:
+`already_registered`, `left_unknown`, `reregistered`, or `suppressed_by_opt_out`.
+
+To keep an always-on re-arm from FIGHTING a user who removed the schedule ON PURPOSE, the beacon
+distinguishes an accidental deletion from a deliberate one with an **opt-out sentinel** — a marker
+file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
+
+- `schedule uninstall` WRITES the sentinel (after removing the artifact) and re-hardens it
+  Admin/SYSTEM-only; `schedule install` CLEARS it (after registering).
+- Both the `ensure` verb AND the per-pass self-heal MUST check the sentinel FIRST: when present,
+  they leave the schedule removed (`suppressed_by_opt_out`) and MUST NOT re-register it.
+- The check is **fail-OPEN toward availability**: only a marker that *provably exists* suppresses
+  the self-heal; a missing OR unreadable/ambiguous marker is treated as "not opted out" (re-arm).
+- The sentinel MUST live in the Admin/SYSTEM-only state dir (never the dry-check-relocatable one) so
+  a non-privileged process cannot FORGE it to suppress auto-updates — an update-suppression /
+  stale-pin vector. Its mere presence is the entire signal; its contents carry no trust.
+
+The always-on driver kicks `schedule ensure` but NEVER touches the OS scheduler directly and NEVER
+decides opt-out — the beacon remains the sole authority over the schedule artifact and honors the
+sentinel. (The driver MUST resolve the beacon binary only from an Admin-only install root — a
+user-writable beacon re-armed as a SYSTEM task would be a local-privilege-escalation vector; that
+constraint lives on the `dig-node` side.)
+
 ---
 
 ## 9. Verification algorithm (normative)
@@ -898,6 +927,10 @@ Administrator/root.
   "next_wake":  1731076400,               // a best-effort ESTIMATE (now + 24h) if the daily
                                            // schedule is registered, else null — not a parse of
                                            // the OS scheduler's own next-run time
+  "schedule_opted_out": false,            // ADDITIVE (§8.4): true iff the Admin-only opt-out
+                                           // sentinel is present (a deliberate `schedule
+                                           // uninstall`), so the self-heal leaves it removed.
+                                           // Defaults to false when absent (a pre-#584 mirror)
   "trust_state": {                        // an INFORMATIONAL mirror of the persisted trust marks
     "root_version": 1, "sequence": 42, "generated": 1730990000, "rollback_floor_build": 20
   }
@@ -947,7 +980,7 @@ Administrator/root.
 | `pause [--until <ts>]` | `config.json` | `config.json`, `status.json` | Yes | |
 | `resume` | `config.json` | `config.json`, `status.json` | Yes | |
 | `status` | `status.json` | — | No | Always answerable (§13.2). |
-| `schedule install\|uninstall\|status` | OS scheduler state | OS scheduler state | `install`/`uninstall`: yes | Unchanged from §8.4. |
+| `schedule install\|uninstall\|status\|ensure` | OS scheduler state, opt-out sentinel (`state_dir`) | OS scheduler state, opt-out sentinel | `install`/`uninstall`/`ensure` (re-register branch): yes | §8.4. `install` clears the opt-out sentinel; `uninstall` writes it; `ensure` is the LIGHTWEIGHT self-heal an always-on driver kicks (no feed/install), honoring the sentinel. |
 
 Every command MUST offer both a human-readable line and a `--json` machine-readable object (§6.2).
 The feed base is overridable per `--feed-base <url>`/`$DIG_UPDATER_FEED_BASE` on `check` and `run`
@@ -1129,5 +1162,3 @@ tags/releases.
 | `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the STABLE GitHub Release for a `vX.Y.Z` tag. |
 | `build-binaries.yml` | `workflow_call` | The reusable cross-OS build both channels invoke. |
 | `feed.yml` | `schedule` (every 6h) + dispatch | UNRELATED to this repo's release — signs the update FEED the beacon reads for OTHER components (§10). |
-
-<!-- WIP #584: schedule ensure verb + Admin-only opt-out sentinel + self_heal opt-out retrofit -->
