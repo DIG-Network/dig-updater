@@ -78,7 +78,9 @@ pub enum AssetKind {
     #[default]
     RawBinary,
     /// A native OS installer package handed to the platform installer: Windows `.msi`, macOS
-    /// `.pkg`, Linux `.deb`. dig-node ships this way (it self-manages its service stop/start).
+    /// `.pkg`, Linux `.deb`. dig-node ships this way; its OS service does NOT self-manage the
+    /// stop/start across an update — the broker stops it before the replace and restarts it after
+    /// (#666 Bug B), so the package installs against an unlocked file.
     NativePackage,
 }
 

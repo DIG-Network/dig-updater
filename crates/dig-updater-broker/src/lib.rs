@@ -68,6 +68,7 @@ pub mod sandbox;
 pub mod scheduler;
 pub mod secure;
 mod selfupdate;
+pub mod service;
 mod spawn;
 pub mod state;
 pub mod status;
@@ -98,6 +99,7 @@ pub use plan::{
 pub use rollback::{LkgCache, RestoreKind};
 pub use sandbox::Sandbox;
 pub use secure::Repair;
+pub use service::{control as control_service, ServiceAction, ServiceControl};
 pub use spawn::spawn_worker;
 pub use state::{LoadedState, TrustStateStore};
 
@@ -461,6 +463,7 @@ impl Broker {
             now: now_unix_secs(),
             detect,
             health,
+            service_ctl: &service::control,
         };
         installer.apply(root, &report, loaded)
     }

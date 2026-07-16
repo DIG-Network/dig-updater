@@ -190,6 +190,8 @@ fn apply(
         name: "digstore".into(),
         method: InstallMethod::RawBinary,
         dest: dest.to_path_buf(),
+        aliases: vec![],
+        service: None,
     }]);
     let platform = Platform::current();
     let installer = Installer {
@@ -206,6 +208,7 @@ fn apply(
         now: NOW,
         detect,
         health,
+        service_ctl: &|_, _| Ok(()),
     };
     installer.apply(root, report, loaded)
 }
@@ -556,11 +559,15 @@ fn apply_self_and_other(
             name: "dig-updater".into(),
             method: InstallMethod::RawBinary,
             dest: self_dest.to_path_buf(),
+            aliases: vec![],
+            service: None,
         },
         ComponentTarget {
             name: "digstore".into(),
             method: InstallMethod::RawBinary,
             dest: other_dest.to_path_buf(),
+            aliases: vec![],
+            service: None,
         },
     ]);
     let platform = Platform::current();
@@ -586,6 +593,7 @@ fn apply_self_and_other(
         now: NOW,
         detect: &detect,
         health: &health,
+        service_ctl: &|_, _| Ok(()),
     };
     installer
         .apply(&test_root().verifying_key(), report, loaded)
@@ -717,4 +725,187 @@ fn assert_state_dir_hardened(dir: &Path) {
             "state dir must be owner-only after a state-advancing pass"
         );
     }
+}
+
+// =============================== #666 Bug B — service stop → replace → restart ===============================
+
+use std::sync::Mutex;
+
+use dig_updater_broker::{ServiceAction, ServiceControl};
+
+/// Drive one apply pass with a service-backed "digstore" component (its OS service id set to
+/// `service_id`) and a RECORDING service controller, so the stop→replace→restart ORDERING + the
+/// failure handling are observable without touching a real service manager (#666 Bug B).
+fn apply_with_service(
+    report: &WorkerReport,
+    home: &Path,
+    dest: &Path,
+    service_id: &str,
+    detect: &dyn Fn(&Path) -> DetectedVersion,
+    health: &dyn Fn(&Path) -> DetectedVersion,
+    service_ctl: &ServiceControl,
+) -> PassReport {
+    let store = TrustStateStore::for_channel(home, Channel::Stable);
+    let loaded = store.load().expect("load state");
+    let lkg = LkgCache::at(home.join("lkg"));
+    let staging_dir = home.join("staging");
+    let apply_dir = home.join("apply");
+    std::fs::create_dir_all(&apply_dir).expect("apply dir");
+    let catalog = Catalog::new(vec![ComponentTarget {
+        name: "digstore".into(),
+        method: InstallMethod::RawBinary,
+        dest: dest.to_path_buf(),
+        aliases: vec![],
+        service: Some(service_id.to_string()),
+    }]);
+    let platform = Platform::current();
+    let installer = Installer {
+        store: &store,
+        catalog: &catalog,
+        platform: &platform,
+        lkg: &lkg,
+        staging_dir: &staging_dir,
+        apply_dir: &apply_dir,
+        retry: RetryPolicy {
+            attempts: 2,
+            backoff: Duration::ZERO,
+        },
+        now: NOW,
+        detect,
+        health,
+        service_ctl,
+    };
+    installer
+        .apply(&test_root().verifying_key(), report, loaded)
+        .expect("apply completes")
+}
+
+#[test]
+fn a_service_backed_component_is_stopped_before_replace_and_restarted_after_666b() {
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("dig-node");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(&dest, b"OLD-0.32.0").unwrap();
+
+    let artifact = b"the-new-0.33.0-binary";
+    let srv = Server::bind();
+    let m = manifest(&srv.base, "0.33.0", 33_000, 0, artifact);
+    let _guard = srv.serve(routes(&m, artifact));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let calls: Mutex<Vec<ServiceAction>> = Mutex::new(Vec::new());
+    let ctl = |_: &str, action: ServiceAction| {
+        calls.lock().unwrap().push(action);
+        Ok(())
+    };
+    let detect = |_: &Path| DetectedVersion::Present("dig-node 0.32.0".to_string());
+    let health = |_: &Path| DetectedVersion::Present("dig-node 0.33.0".to_string());
+    let result = apply_with_service(
+        &report,
+        home.path(),
+        &dest,
+        "net.dignetwork.dig-node",
+        &detect,
+        &health,
+        &ctl,
+    );
+
+    assert_eq!(result.components[0].result, ComponentResult::Installed);
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        artifact,
+        "the new bytes landed"
+    );
+    // The lock was released BEFORE the replace and the service brought back AFTER — in that order.
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![ServiceAction::Stop, ServiceAction::Start],
+        "the service is stopped before the replace and restarted after it"
+    );
+}
+
+#[test]
+fn a_service_is_restarted_even_when_the_replace_rolls_back_666b() {
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("dig-node");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(&dest, b"OLD-0.32.0").unwrap();
+
+    let artifact = b"the-new-0.33.0-binary";
+    let srv = Server::bind();
+    let m = manifest(&srv.base, "0.33.0", 33_000, 0, artifact);
+    let _guard = srv.serve(routes(&m, artifact));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let calls: Mutex<Vec<ServiceAction>> = Mutex::new(Vec::new());
+    let ctl = |_: &str, action: ServiceAction| {
+        calls.lock().unwrap().push(action);
+        Ok(())
+    };
+    // The post-install probe reports the OLD version → the health gate fails → rollback.
+    let detect = |_: &Path| DetectedVersion::Present("dig-node 0.32.0".to_string());
+    let health = |_: &Path| DetectedVersion::Present("dig-node 0.32.0".to_string());
+    let result = apply_with_service(
+        &report,
+        home.path(),
+        &dest,
+        "net.dignetwork.dig-node",
+        &detect,
+        &health,
+        &ctl,
+    );
+
+    assert_eq!(result.components[0].result, ComponentResult::RolledBack);
+    assert!(
+        calls.lock().unwrap().contains(&ServiceAction::Start),
+        "a stopped service must be restarted even on a failed/rolled-back replace — never left down"
+    );
+}
+
+#[test]
+fn a_service_that_cannot_be_stopped_defers_and_is_left_running_666b() {
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("dig-node");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(&dest, b"OLD-0.32.0").unwrap();
+
+    let artifact = b"the-new-0.33.0-binary";
+    let srv = Server::bind();
+    let m = manifest(&srv.base, "0.33.0", 33_000, 0, artifact);
+    let _guard = srv.serve(routes(&m, artifact));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let calls: Mutex<Vec<ServiceAction>> = Mutex::new(Vec::new());
+    let ctl = |_: &str, action: ServiceAction| {
+        calls.lock().unwrap().push(action);
+        match action {
+            ServiceAction::Stop => Err("service refused to stop".to_string()),
+            ServiceAction::Start => Ok(()),
+        }
+    };
+    let detect = |_: &Path| DetectedVersion::Present("dig-node 0.32.0".to_string());
+    let health = |_: &Path| DetectedVersion::Present("dig-node 0.33.0".to_string());
+    let result = apply_with_service(
+        &report,
+        home.path(),
+        &dest,
+        "net.dignetwork.dig-node",
+        &detect,
+        &health,
+        &ctl,
+    );
+
+    // The stop failed, so the binary is still locked: defer the replace, and NEVER issue a Start
+    // (the service was never taken down) — the old bytes stay in place, byte-intact.
+    assert_eq!(result.components[0].result, ComponentResult::Deferred);
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"OLD-0.32.0",
+        "the replace was not attempted"
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![ServiceAction::Stop],
+        "a failed stop is never followed by a start — the service was left running"
+    );
 }

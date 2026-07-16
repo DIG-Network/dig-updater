@@ -230,11 +230,62 @@ pub fn install_from_private(
     policy: &RetryPolicy,
 ) -> InstallOutcome {
     match pc.method {
-        InstallMethod::RawBinary => rename_into_place(private, &pc.dest, policy),
+        InstallMethod::RawBinary => install_raw_binary_set(pc, private, policy),
         InstallMethod::WindowsMsi => run_native_installer(private, msiexec_argv(private)),
         InstallMethod::MacosPkg => run_native_installer(private, installer_argv(private)),
         InstallMethod::LinuxDeb => run_native_installer(private, dpkg_argv(private)),
     }
+}
+
+/// Replace the primary raw binary AND re-derive every byte-identical alias in the component's set
+/// (#666 Bug A). The primary is renamed into place from the verified private copy; then each alias
+/// is refreshed by COPYING the just-placed VERIFIED bytes (now at `pc.dest`) into the alias through
+/// the SAME resilient move-aside — never a re-download or a re-fetch, so an alias can never diverge
+/// from the verified primary and no extra feed asset is needed.
+///
+/// If the PRIMARY replace does not land (`Deferred`/`Failed`), the aliases are left untouched and
+/// that outcome is returned as-is — the component is not `Installed`, so the health gate (which
+/// checks every binary in the set) will see the stale alias and the pass declines to advance. If an
+/// ALIAS replace does not land, the whole component is reported non-`Installed` for the same reason.
+fn install_raw_binary_set(
+    pc: &PlannedComponent,
+    private: &Path,
+    policy: &RetryPolicy,
+) -> InstallOutcome {
+    let primary = rename_into_place(private, &pc.dest, policy);
+    if primary != InstallOutcome::Installed {
+        return primary;
+    }
+    for alias in &pc.aliases {
+        // Stage the alias's own verified copy beside it from the bytes just verified-and-placed at
+        // the primary dest, then move it into place with the same running-target-safe swap.
+        let alias_private = alias.with_extension(VERIFIED_RAW_EXT);
+        if let Err(e) = copy_verified_bytes(&pc.dest, &alias_private) {
+            return InstallOutcome::Failed {
+                detail: format!(
+                    "could not derive alias {} from the verified primary {}: {e}",
+                    alias.display(),
+                    pc.dest.display()
+                ),
+            };
+        }
+        match rename_into_place(&alias_private, alias, policy) {
+            InstallOutcome::Installed => {}
+            other => return other,
+        }
+    }
+    InstallOutcome::Installed
+}
+
+/// Copy the verified bytes at `source` into the broker-private `dest_private` file (a sibling of an
+/// alias destination), marking it executable. The source is the primary binary the caller has just
+/// verified-and-installed, so the copied bytes are the verified bytes by construction.
+fn copy_verified_bytes(source: &Path, dest_private: &Path) -> Result<(), BrokerError> {
+    if let Some(parent) = dest_private.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| BrokerError::Io(e.to_string()))?;
+    }
+    std::fs::copy(source, dest_private).map_err(|e| BrokerError::Io(e.to_string()))?;
+    set_executable(dest_private)
 }
 
 /// Resiliently replace `dest` with the verified private copy, safe against a RUNNING/locked target
@@ -562,6 +613,7 @@ mod tests {
             name: "digstore".into(),
             method,
             dest,
+            aliases: vec![],
             version: "0.15.0".into(),
             build: 15_000,
             expected_digest: digest.into(),
@@ -698,6 +750,35 @@ mod tests {
             !private.exists(),
             "the private copy is renamed away, not left behind"
         );
+    }
+
+    /// #666 Bug A: a raw-binary component with aliases refreshes EVERY alias from the VERIFIED
+    /// bytes just placed at the primary — never a re-fetch — so an alias can never diverge.
+    #[test]
+    fn install_refreshes_every_alias_from_the_verified_primary_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let primary = bin.join("dig-dns");
+        let alias_a = bin.join("digd");
+        let alias_b = bin.join("digd2");
+        std::fs::write(&primary, b"old").unwrap();
+        std::fs::write(&alias_a, b"old").unwrap();
+        std::fs::write(&alias_b, b"old").unwrap();
+
+        let new_bytes = b"new-verified-0.14.0";
+        let mut pc = planned(primary.clone(), InstallMethod::RawBinary, "unused");
+        pc.aliases = vec![alias_a.clone(), alias_b.clone()];
+        let private = private_target(&pc, dir.path());
+        std::fs::write(&private, new_bytes).unwrap();
+
+        assert_eq!(
+            install_from_private(&pc, &private, &RetryPolicy::default()),
+            InstallOutcome::Installed
+        );
+        for p in [&primary, &alias_a, &alias_b] {
+            assert_eq!(std::fs::read(p).unwrap(), new_bytes, "{p:?} refreshed");
+        }
     }
 
     #[test]

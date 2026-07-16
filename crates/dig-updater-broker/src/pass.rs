@@ -49,6 +49,7 @@ use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONE
 use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
 use crate::selfupdate::apply_self_update;
+use crate::service::{ServiceAction, ServiceControl};
 use crate::state::{LoadedState, TrustStateStore};
 
 /// What one component's apply produced.
@@ -190,6 +191,10 @@ pub struct Installer<'a> {
     pub detect: &'a VersionProbe<'a>,
     /// Probe for the HEALTH step (what version is installed AFTER install).
     pub health: &'a VersionProbe<'a>,
+    /// Stop/start a service-backed component's OS service around its replace (#666 Bug B).
+    /// Production wires [`crate::service::control`]; tests inject a recording fake so the
+    /// stop→replace→restart ordering + failure handling are exercised without a real service.
+    pub service_ctl: &'a ServiceControl<'a>,
 }
 
 impl Installer<'_> {
@@ -351,8 +356,64 @@ impl Installer<'_> {
         // Snapshot the currently-installed binary so a failed health gate can revert to it.
         let snapshot = self.lkg.snapshot(&pc.name, &pc.dest, pc.installed_build)?;
 
-        match install_step(&private, &self.retry) {
-            InstallOutcome::Installed => match check_health(&pc.dest, &pc.version, self.health) {
+        // #666 Bug B: a service-backed component holds its binary open while it runs, so STOP the
+        // service first (releasing the lock) — else the replace defers/fails and the post-install
+        // probe reads the still-running old binary. The service id is looked up from the catalog by
+        // component name (the applier authority for WHERE/HOW), not carried on the plan.
+        let service = self
+            .catalog
+            .target(&pc.name)
+            .and_then(|t| t.service_id())
+            .map(str::to_string);
+        if let Some(service) = &service {
+            if let Err(detail) = (self.service_ctl)(service, ServiceAction::Stop) {
+                // The service could not be stopped, so its binary is still locked — do NOT attempt
+                // a replace that would defer anyway, and leave the service RUNNING (the stop failed,
+                // so nothing was taken down). Defer to the next pass, cleaning up the private copy.
+                let _ = std::fs::remove_file(&private);
+                return Ok(ComponentOutcome::from(
+                    pc,
+                    ComponentResult::Deferred,
+                    format!("could not stop service {service} before replace: {detail}"),
+                ));
+            }
+        }
+
+        let outcome = install_step(&private, &self.retry);
+        let result = self.finish_apply(pc, floor, snapshot, outcome)?;
+
+        // Restart the service in EVERY post-stop branch — a successful update, a benign deferral,
+        // OR a rollback — so a stopped service is never left down (#666 Bug B). Best-effort: a
+        // restart failure is surfaced in the detail but never turns an otherwise-correct on-disk
+        // state into a hard failure (the daily wake + the service manager's own boot recovery will
+        // bring it back), and it must not mask the real install result.
+        if let Some(service) = &service {
+            if let Err(detail) = (self.service_ctl)(service, ServiceAction::Start) {
+                return Ok(ComponentOutcome {
+                    detail: format!(
+                        "{} (warning: could not restart {service}: {detail})",
+                        result.detail
+                    ),
+                    ..result
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    /// Turn one component's [`InstallOutcome`] into its [`ComponentOutcome`], running the health gate
+    /// over the WHOLE binary set (primary + aliases, #666 Bug A) on a successful install and rolling
+    /// back on any failure. Split out from [`Self::apply_component`] so the service stop/restart can
+    /// wrap this shared install→health→rollback core.
+    fn finish_apply(
+        &self,
+        pc: &PlannedComponent,
+        floor: u64,
+        snapshot: Option<LkgEntry>,
+        outcome: InstallOutcome,
+    ) -> Result<ComponentOutcome, BrokerError> {
+        match outcome {
+            InstallOutcome::Installed => match self.check_binary_set(pc) {
                 // `pc.summary` is the PLAN's pre-install prediction ("v0.14.0 -> v0.15.0") — once
                 // the install has actually happened, that prediction is stale. Report what the
                 // health gate just re-observed on disk instead (#582), so a later `status` read
@@ -385,6 +446,24 @@ impl Installer<'_> {
                 ))
             }
         }
+    }
+
+    /// Health-gate EVERY binary in a component's set — the primary AND each byte-identical alias
+    /// (#666 Bug A) — each must now report the manifest's version. A stale/missing alias fails the
+    /// gate exactly like a stale primary, so a component whose alias was left un-refreshed is
+    /// rolled back rather than falsely reported Installed. Returns the PRIMARY's observed version
+    /// (what a later `status` read states, #582).
+    fn check_binary_set(&self, pc: &PlannedComponent) -> Result<DetectedVersion, String> {
+        let primary = check_health(&pc.dest, &pc.version, self.health)?;
+        for alias in &pc.aliases {
+            check_health(alias, &pc.version, self.health).map_err(|detail| {
+                format!(
+                    "alias {} failed the version check: {detail}",
+                    alias.display()
+                )
+            })?;
+        }
+        Ok(primary)
     }
 
     /// Revert a component: restore its last-known-good snapshot (re-verified, floor-bounded), or —

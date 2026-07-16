@@ -15,8 +15,10 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use dig_updater_broker::install::{install_from_private, private_target, InstallOutcome, RetryPolicy};
-use dig_updater_broker::plan::{Catalog, ComponentTarget, InstallMethod, PlannedComponent};
+use dig_updater_broker::install::{
+    install_from_private, private_target, InstallOutcome, RetryPolicy,
+};
+use dig_updater_broker::plan::{Catalog, InstallMethod, PlannedComponent};
 use dig_updater_worker::Platform;
 
 fn hex(bytes: &[u8]) -> String {
@@ -42,10 +44,15 @@ fn linux() -> Platform {
 #[test]
 fn dig_dns_component_enumerates_its_digd_alias_666a() {
     let cat = Catalog::alpha_defaults(&linux());
-    let target = cat.target("dig-dns").expect("dig-dns is a tracked component");
+    let target = cat
+        .target("dig-dns")
+        .expect("dig-dns is a tracked component");
 
     // The full set of binaries this component owns on disk — primary first, then every alias.
-    let binaries: Vec<PathBuf> = target.binaries().map(std::path::Path::to_path_buf).collect();
+    let binaries: Vec<PathBuf> = target
+        .binaries()
+        .map(std::path::Path::to_path_buf)
+        .collect();
 
     let bin_dir = target.dest.parent().expect("dest has a parent bin dir");
     assert!(
@@ -101,7 +108,11 @@ fn applying_dig_dns_also_refreshes_its_digd_alias_666a() {
         },
     );
     assert_eq!(outcome, InstallOutcome::Installed);
-    assert_eq!(std::fs::read(&primary).unwrap(), new_bytes, "primary updated");
+    assert_eq!(
+        std::fs::read(&primary).unwrap(),
+        new_bytes,
+        "primary updated"
+    );
     assert_eq!(
         std::fs::read(&alias).unwrap(),
         new_bytes,
@@ -124,7 +135,9 @@ fn applying_dig_dns_also_refreshes_its_digd_alias_666a() {
 #[test]
 fn dig_node_declares_its_managed_service_for_stop_replace_restart_666b() {
     let cat = Catalog::alpha_defaults(&linux());
-    let target = cat.target("dig-node").expect("dig-node is a tracked component");
+    let target = cat
+        .target("dig-node")
+        .expect("dig-node is a tracked component");
 
     assert_eq!(
         target.service_id(),
@@ -143,8 +156,9 @@ fn dig_node_declares_its_managed_service_for_stop_replace_restart_666b() {
 #[cfg(unix)]
 #[test]
 fn a_service_backed_replace_lands_new_bytes_on_disk_before_health_666b() {
-    use dig_updater_broker::health::check_health;
     use dig_release_resolver::DetectedVersion;
+    use dig_updater_broker::health::check_health;
+    use dig_updater_broker::plan::ComponentTarget;
 
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -194,7 +208,8 @@ fn a_service_backed_replace_lands_new_bytes_on_disk_before_health_666b() {
     );
 
     // The health probe reads the binary ON DISK. After a real replace it must be the new version.
-    let probe = |p: &std::path::Path| DetectedVersion::Present(format!("dig-node {}", contents_version(p)));
+    let probe =
+        |p: &std::path::Path| DetectedVersion::Present(format!("dig-node {}", contents_version(p)));
     let observed = check_health(&dest, "0.33.0", &probe)
         .expect("#666 Bug B: post-install probe must see the newly-written 0.33.0 binary");
     assert!(matches!(observed, DetectedVersion::Present(_)));
