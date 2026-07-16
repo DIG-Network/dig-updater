@@ -60,6 +60,9 @@ pub struct StatusContext<'a> {
     pub next_wake: Option<u64>,
     /// The persisted trust state to mirror (informational only — see the module doc).
     pub trust_state: TrustState,
+    /// Whether the operator has DELIBERATELY opted out of the daily schedule (#584): an Admin-owned
+    /// opt-out sentinel is present, so the self-heal / re-arm driver will NOT re-register it.
+    pub schedule_opted_out: bool,
 }
 
 /// The beacon's unprivileged, world-readable status (SPEC §13.2).
@@ -95,6 +98,13 @@ pub struct StatusSnapshot {
     pub next_wake: Option<u64>,
     /// A mirror of the persisted trust marks — informational only (see the module doc).
     pub trust_state: TrustState,
+    /// Whether the daily schedule was DELIBERATELY opted out (#584) — an Admin-owned opt-out
+    /// sentinel is present, so the self-heal / always-on re-arm driver leaves it removed.
+    ///
+    /// ADDITIVE (SPEC §5.1 / §13.2): defaults to `false` so a `status.json` written by a pre-#584
+    /// beacon still deserializes — an older mirror simply reports "not opted out".
+    #[serde(default)]
+    pub schedule_opted_out: bool,
 }
 
 fn current_status_schema() -> u32 {
@@ -120,6 +130,7 @@ impl StatusSnapshot {
             components: Vec::new(),
             next_wake: None,
             trust_state: TrustState::initial(),
+            schedule_opted_out: false,
         }
     }
 
@@ -207,6 +218,7 @@ impl StatusSnapshot {
             components,
             next_wake: ctx.next_wake,
             trust_state: ctx.trust_state,
+            schedule_opted_out: ctx.schedule_opted_out,
         }
     }
 }
@@ -273,6 +285,7 @@ impl<'a> StatusContext<'a> {
             now: crate::now_unix_secs(),
             next_wake: None,
             trust_state: TrustState::initial(),
+            schedule_opted_out: false,
         }
     }
 }
@@ -397,6 +410,7 @@ mod tests {
             now: 100,
             next_wake: None,
             trust_state: TrustState::initial(),
+            schedule_opted_out: false,
         };
         let snapshot = PassReport::already_running();
         let status = StatusSnapshot::from_pass(&snapshot, &ctx);

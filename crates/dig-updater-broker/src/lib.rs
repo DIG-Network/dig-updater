@@ -44,8 +44,10 @@
 //! Windows restricted-token spawn). On Windows only, [`lock`] also uses `unsafe` for the
 //! DACL-restricted named mutex (`CreateMutexW`/`ReleaseMutex`/`LocalFree` have no safe wrapper);
 //! its Unix half is safe, built on the same `fs4` flock wrapper `dig-node-core` already uses, so
-//! the beacon never grows a second hand-rolled unsafe locking primitive. Every other module — and
-//! every other crate — is safe.
+//! the beacon never grows a second hand-rolled unsafe locking primitive. On Windows only, [`secure`]
+//! reads a file's OWNER SID via `GetNamedSecurityInfoW` (no safe wrapper) to verify the schedule
+//! opt-out sentinel is privileged-owned + un-forgeable ([`secure::path_is_privileged_owned`]). Every
+//! other module — and every other crate — is safe.
 
 pub mod config;
 pub mod elevation;
@@ -55,6 +57,7 @@ mod hashing;
 pub mod health;
 pub mod install;
 pub mod lock;
+pub mod optout;
 mod pass;
 pub mod paths;
 mod persist;
@@ -529,6 +532,7 @@ impl Broker {
             now,
             next_wake: self.estimate_next_wake(now),
             trust_state,
+            schedule_opted_out: optout::is_opted_out(&paths::default_state_dir()),
         };
         self.write_status_best_effort(&StatusSnapshot::from_dry_check(report, &ctx));
     }
@@ -545,6 +549,7 @@ impl Broker {
             now,
             next_wake: self.estimate_next_wake(now),
             trust_state,
+            schedule_opted_out: optout::is_opted_out(&paths::default_state_dir()),
         };
         self.write_status_best_effort(&StatusSnapshot::from_pass(report, &ctx));
     }
@@ -559,6 +564,10 @@ impl Broker {
         snapshot.channel = config.channel;
         snapshot.paused = config.is_paused_at(now_unix_secs());
         snapshot.paused_until = config.paused_until;
+        // Source the DISPLAYED opt-out from the Admin-only DEFAULT state dir, never `self.state_dir`
+        // — a dry check relocates the latter to a user-writable dir (#582), where a user could plant
+        // a marker to spoof `schedule_opted_out` in the world-readable status mirror (#584 finding 2).
+        snapshot.schedule_opted_out = optout::is_opted_out(&paths::default_state_dir());
         self.write_status_best_effort(&snapshot);
     }
 
@@ -588,8 +597,13 @@ impl Broker {
     /// absent, so a beacon whose task was deleted resurrects its own daily wake. Best-effort — see
     /// [`scheduler::ensure`] — resolving the beacon's own path and running the ensure; any failure
     /// (unprivileged caller, unreadable status) is logged, never propagated to fail the pass.
+    ///
+    /// It respects a deliberate opt-out (#584): `scheduler::ensure` reads the Admin-only opt-out
+    /// sentinel in this broker's `state_dir` FIRST, so a per-pass self-heal never re-arms a schedule
+    /// the operator DELIBERATELY removed via `schedule uninstall`.
     fn self_heal_schedule(&self) {
-        self.self_heal_schedule_with(scheduler::ensure);
+        let state_dir = self.state_dir.clone();
+        self.self_heal_schedule_with(|exe| scheduler::ensure(exe, &state_dir));
     }
 
     /// The injectable core of [`Self::self_heal_schedule`]: production passes [`scheduler::ensure`];
