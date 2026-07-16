@@ -19,9 +19,25 @@
 //!    always invoked by its ABSOLUTE, trusted path (never a bare name resolved through `PATH`).
 //!
 //! Silent + per-OS (SPEC §9.5): a native package installs quietly through the OS installer
-//! (`msiexec /qn`, `installer -pkg`, `dpkg -i`); a raw binary is replaced in place, retrying a
-//! locked target with backoff and DEFERRING to the next pass rather than failing hard (e.g. Windows
-//! holds the beacon's own image open).
+//! (`msiexec /qn`, `installer -pkg`, `dpkg -i`); a raw binary is replaced in place with the
+//! resilient, running-target-safe swap in [`rename_into_place`], DEFERRING to the next pass rather
+//! than failing hard if the target stays locked.
+//!
+//! **Replacing a RUNNING binary (#558, same os-error-32 class as #544).** A raw-binary component
+//! can be a currently-RUNNING service (e.g. dig-dns) or the beacon's own image, whose executable
+//! the OS holds open. On Windows a direct overwrite/rename ONTO that open image fails with
+//! ERROR_SHARING_VIOLATION (32) or ERROR_LOCK_VIOLATION (33); on unix an open-for-exec target can
+//! raise ETXTBSY (26). A naive rename therefore deferred forever and the running peer never
+//! updated. [`rename_into_place`] instead uses the move-aside swap the beacon's own self-update
+//! proved (SPEC §8.1): the running image is RENAMED aside to a `.dig-updater-old` sibling (permitted
+//! even while it executes — the loader shares delete/rename access), then the verified copy takes
+//! its name. If the second rename fails the swap is undone (retried, not best-effort) so the target is
+//! never left half-written — and if that undo ALSO fails, the outcome is `Failed` so the caller's
+//! last-known-good rollback restores the target rather than leaving it missing; if the target stays
+//! locked through the retry budget the pass DEFERS (SPEC §9.5). The new bytes
+//! take effect on the service's next restart; the health probe re-reads the on-disk version to
+//! confirm. This single resilient path is shared by every raw-binary component AND the self-update
+//! ([`crate::selfupdate`]), so there is one implementation of the running-replace, not two.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +53,11 @@ use crate::proc::HideConsole;
 /// The extension of the broker-private raw-binary copy that is renamed over `dest`. It lives in the
 /// (root-owned) destination directory so the final install is an atomic same-filesystem rename.
 const VERIFIED_RAW_EXT: &str = "dig-updater-verified";
+
+/// The extension of the `.old` sibling a running/locked raw binary is moved aside to, so the
+/// verified copy can take its name (#558). Distinct from [`VERIFIED_RAW_EXT`] so the move-aside and
+/// the verified-copy staging never collide on the same path.
+const SUPERSEDED_EXT: &str = "dig-updater-old";
 
 /// Read granularity while copying + hashing a (possibly large) staged artifact.
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -216,16 +237,34 @@ pub fn install_from_private(
     }
 }
 
-/// Atomically move the verified private copy over `dest`, retrying a locked rename with backoff and
-/// DEFERRING if the target stays locked (SPEC §9.5). On give-up the private copy is cleaned up.
+/// Resiliently replace `dest` with the verified private copy, safe against a RUNNING/locked target
+/// (#558, the same os-error-32/33 class as #544). This is the SINGLE raw-binary replace shared by
+/// every ordinary component AND the beacon's OWN self-update ([`crate::selfupdate`]).
 ///
-/// `pub(crate)`: [`crate::selfupdate`] reuses this verbatim for the beacon's OWN Unix self-update
-/// — on Unix there is nothing self-replace-specific to do, replacing a running executable's
-/// directory entry works exactly like any other raw-binary component (see that module's doc).
+/// A running executable holds its own image open, so a direct rename ONTO `dest` fails with a
+/// sharing/lock violation on Windows (32/33) and could hit ETXTBSY (26) on unix. The replace
+/// therefore MOVES the existing target aside to a `.dig-updater-old` sibling first — permitted even
+/// while it runs — then renames the verified copy into `dest`. Each rename retries the file-in-use
+/// class with backoff; if the target stays locked through the budget the pass DEFERS (SPEC §9.5).
+/// If the second rename fails, the moved-aside original is restored so `dest` is never left
+/// half-written; the private copy is cleaned up on any give-up.
 pub(crate) fn rename_into_place(
     private: &Path,
     dest: &Path,
     policy: &RetryPolicy,
+) -> InstallOutcome {
+    rename_into_place_with(private, dest, policy, retry_rename)
+}
+
+/// The [`rename_into_place`] body, with the rename primitive INJECTED so the rare double-rename-fault
+/// branch — where placing the verified copy fails AND undoing the move-aside also fails — is
+/// deterministically testable (a real filesystem makes that double fault practically impossible to
+/// stage). Production passes [`retry_rename`]; the behaviour is otherwise identical.
+fn rename_into_place_with(
+    private: &Path,
+    dest: &Path,
+    policy: &RetryPolicy,
+    rename: impl Fn(&RetryPolicy, &Path, &Path) -> std::io::Result<()>,
 ) -> InstallOutcome {
     if let Some(parent) = dest.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -235,15 +274,101 @@ pub(crate) fn rename_into_place(
             };
         }
     }
-    match retry(policy, || std::fs::rename(private, dest)) {
-        Ok(()) => InstallOutcome::Installed,
-        Err(e) => {
-            // The target stayed locked through the whole budget — leave it for the next pass.
+
+    let superseded = dest.with_extension(SUPERSEDED_EXT);
+    // Clear any `.old` a prior pass could not yet delete (it may have unlocked since); its lingering
+    // presence is harmless either way.
+    let _ = std::fs::remove_file(&superseded);
+
+    // Move the (possibly-running) existing target aside so the verified copy can take its name — a
+    // rename of a running image is allowed where an overwrite is not.
+    let moved_aside = dest.exists();
+    if moved_aside {
+        if let Err(e) = rename(policy, dest, &superseded) {
             let _ = std::fs::remove_file(private);
-            InstallOutcome::Deferred {
+            return InstallOutcome::Deferred {
                 reason: format!("target {} locked after retries: {e}", dest.display()),
+            };
+        }
+    }
+
+    match rename(policy, private, dest) {
+        Ok(()) => {
+            // The old bytes are now ordinary (non-executing) content under the `.old` name and
+            // usually delete cleanly; a still-locked one is left for a later pass to sweep.
+            let _ = std::fs::remove_file(&superseded);
+            InstallOutcome::Installed
+        }
+        Err(place_err) => {
+            let _ = std::fs::remove_file(private);
+            if !moved_aside {
+                // No target was moved aside (a fresh install with no prior binary): `dest` was never
+                // present, so there is nothing to leave missing — defer to the next pass.
+                return InstallOutcome::Deferred {
+                    reason: format!(
+                        "could not place the new binary at {}: {place_err}",
+                        dest.display()
+                    ),
+                };
+            }
+            // The move-aside DID happen, so `dest` is currently absent. Restore the original through
+            // the SAME retried rename (not a swallowed one-shot) so `dest` is left byte-intact.
+            match rename(policy, &superseded, dest) {
+                Ok(()) => InstallOutcome::Deferred {
+                    reason: format!(
+                        "could not place the new binary at {}: {place_err}",
+                        dest.display()
+                    ),
+                },
+                // Double fault: the restore ALSO failed, so `dest` is missing. Escalate to Failed so
+                // the caller's last-known-good rollback (SPEC §9.5) reinstates it — never a missing dest.
+                Err(undo_err) => InstallOutcome::Failed {
+                    detail: format!(
+                        "could not place the new binary at {} ({place_err}) and restoring the \
+                         original also failed ({undo_err}); dest left for the last-known-good rollback",
+                        dest.display()
+                    ),
+                },
             }
         }
+    }
+}
+
+/// Rename `from` → `to`, retrying ONLY the file-in-use class (Windows 32/33, unix ETXTBSY) with
+/// `policy`'s backoff. A non-file-in-use error (e.g. a missing source directory) is terminal and
+/// returns at once rather than burning the whole retry budget on an error that will never clear.
+fn retry_rename(policy: &RetryPolicy, from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..policy.attempts.max(1) {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_file_in_use(&e) => {
+                last = Some(e);
+                if attempt + 1 < policy.attempts && !policy.backoff.is_zero() {
+                    std::thread::sleep(policy.backoff * (attempt + 1));
+                }
+            }
+            // A non-lock error will not clear by waiting — surface it immediately.
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no attempts made")))
+}
+
+/// Is `e` the "target file is in use by a running process" class the resilient replace retries +
+/// defers on (#558)? Windows: ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33), or
+/// ERROR_USER_MAPPED_FILE (1224) — a loaded/memory-mapped image cannot be overwritten/renamed-onto
+/// while it runs, and a scanner/backup mapping the image raises 1224. Unix: ETXTBSY (26) — text file
+/// busy. Ambiguous access errors (Windows ERROR_ACCESS_DENIED 5, unix EACCES 13) are deliberately
+/// NOT in the class: they usually signal a permission/ownership fault that will not clear by waiting,
+/// so they stay terminal rather than burning the retry budget.
+fn is_file_in_use(e: &std::io::Error) -> bool {
+    match e.raw_os_error() {
+        #[cfg(windows)]
+        Some(32 | 33 | 1224) => true,
+        #[cfg(unix)]
+        Some(26) => true,
+        _ => false,
     }
 }
 
@@ -425,33 +550,11 @@ fn set_executable(path: &Path) -> Result<(), BrokerError> {
     }
 }
 
-/// Run `op`, retrying up to `policy.attempts` times with linear backoff. Returns the last error if
-/// every attempt fails.
-fn retry<T>(
-    policy: &RetryPolicy,
-    mut op: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    let mut last: Option<std::io::Error> = None;
-    for attempt in 0..policy.attempts.max(1) {
-        match op() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                last = Some(e);
-                if attempt + 1 < policy.attempts && !policy.backoff.is_zero() {
-                    std::thread::sleep(policy.backoff * (attempt + 1));
-                }
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| std::io::Error::other("no attempts made")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::plan::InstallMethod;
     use sha2::{Digest, Sha256};
-    use std::cell::Cell;
     use std::path::PathBuf;
 
     fn planned(dest: PathBuf, method: InstallMethod, digest: &str) -> PlannedComponent {
@@ -733,41 +836,47 @@ mod tests {
         assert!(argv.contains(&"-pkg".to_string()));
     }
 
-    // -- the retry loop (deterministic, zero backoff) -------------------------------------------
+    // -- retry_rename (deterministic, zero backoff) ---------------------------------------------
 
     #[test]
-    fn retry_succeeds_after_transient_failures() {
-        let policy = RetryPolicy {
-            attempts: 5,
-            backoff: Duration::ZERO,
-        };
-        let calls = Cell::new(0u32);
-        let result = retry(&policy, || {
-            let n = calls.get() + 1;
-            calls.set(n);
-            if n < 3 {
-                Err(std::io::Error::other("locked"))
-            } else {
-                Ok(n)
-            }
-        });
-        assert_eq!(result.unwrap(), 3);
-        assert_eq!(calls.get(), 3);
+    fn retry_rename_places_a_file_when_the_target_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        std::fs::write(&from, b"bytes").unwrap();
+        retry_rename(
+            &RetryPolicy {
+                attempts: 3,
+                backoff: Duration::ZERO,
+            },
+            &from,
+            &to,
+        )
+        .expect("a free target renames on the first try");
+        assert_eq!(std::fs::read(&to).unwrap(), b"bytes");
+        assert!(!from.exists());
     }
 
     #[test]
-    fn retry_gives_up_after_the_budget() {
-        let policy = RetryPolicy {
-            attempts: 3,
-            backoff: Duration::ZERO,
-        };
-        let calls = Cell::new(0u32);
-        let result: std::io::Result<()> = retry(&policy, || {
-            calls.set(calls.get() + 1);
-            Err(std::io::Error::other("always locked"))
-        });
-        assert!(result.is_err());
-        assert_eq!(calls.get(), 3, "exactly `attempts` tries");
+    fn retry_rename_fails_fast_on_a_terminal_non_lock_error() {
+        // A missing SOURCE is a terminal error (NotFound), not the file-in-use class — it must
+        // return at once, not burn the whole retry budget waiting for a lock that will never clear.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-source");
+        let to = dir.path().join("to");
+        let err = retry_rename(
+            &RetryPolicy {
+                attempts: 5,
+                backoff: Duration::from_secs(30), // would hang for minutes if it retried
+            },
+            &missing,
+            &to,
+        )
+        .expect_err("a missing source is terminal");
+        assert!(
+            !is_file_in_use(&err),
+            "a NotFound is not the file-in-use class"
+        );
     }
 
     #[test]
@@ -777,5 +886,226 @@ mod tests {
             "-x".to_string(),
         ]);
         assert!(matches!(outcome, InstallOutcome::Failed { .. }));
+    }
+
+    // -- #558: resilient replace-a-running-binary (os error 32/33 class, same as #544) ----------
+
+    /// #558: the file-in-use classification MUST cover BOTH Windows sharing-violation arms
+    /// (ERROR_SHARING_VIOLATION 32 AND ERROR_LOCK_VIOLATION 33) and the unix ETXTBSY (26) arm — the
+    /// error class a running/locked target raises, which the replace must retry + resiliently handle
+    /// rather than fail hard on.
+    #[test]
+    fn file_in_use_covers_both_windows_arms_and_unix_etxtbsy_558() {
+        #[cfg(windows)]
+        {
+            assert!(is_file_in_use(&std::io::Error::from_raw_os_error(32)));
+            assert!(is_file_in_use(&std::io::Error::from_raw_os_error(33)));
+            assert!(is_file_in_use(&std::io::Error::from_raw_os_error(1224))); // ERROR_USER_MAPPED_FILE
+            assert!(!is_file_in_use(&std::io::Error::from_raw_os_error(5))); // ACCESS_DENIED stays terminal
+        }
+        #[cfg(unix)]
+        {
+            assert!(is_file_in_use(&std::io::Error::from_raw_os_error(26))); // ETXTBSY
+            assert!(!is_file_in_use(&std::io::Error::from_raw_os_error(13))); // EACCES stays terminal
+        }
+    }
+
+    /// #558 (the bug repro, same os-error-32 class as #544): a locked/in-use target — a running
+    /// service (e.g. dig-dns) holding its own image — makes a rename onto it fail with the file-in-use
+    /// class (Windows ERROR_SHARING_VIOLATION 32 / ERROR_LOCK_VIOLATION 33). The resilient replace
+    /// MUST NOT fail hard on that class: it retries, then DEFERS to the next pass (SPEC §9.5),
+    /// leaving the ORIGINAL target byte-intact (never a half-write) and cleaning up the private copy.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_target_defers_cleanly_with_no_half_write_558() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dig-dns.exe");
+        std::fs::write(&dest, b"original-running-bytes").unwrap();
+        let private = dest.with_extension(VERIFIED_RAW_EXT);
+        std::fs::write(&private, b"new-verified-bytes").unwrap();
+
+        // Hold the target open FILE_SHARE_READ but WITHOUT share-delete — the way a scanner/backup
+        // (or an older loader) holds a file in use. Moving such a target aside fails with
+        // ERROR_SHARING_VIOLATION (32), the exact #544 class the resilient replace retries + defers.
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001) // FILE_SHARE_READ only
+            .open(&dest)
+            .expect("open the target held in use without share-delete");
+
+        // The resilient replace retries the lock, then defers — never a hard failure, never a
+        // half-write: the original is untouched and the private copy is cleaned up.
+        let outcome = rename_into_place(
+            &private,
+            &dest,
+            &RetryPolicy {
+                attempts: 3,
+                backoff: Duration::ZERO,
+            },
+        );
+        assert!(
+            matches!(outcome, InstallOutcome::Deferred { .. }),
+            "a locked target defers to the next pass, got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"original-running-bytes",
+            "a deferred replace leaves the original target byte-intact"
+        );
+        assert!(
+            !dest.with_extension(SUPERSEDED_EXT).exists(),
+            "no orphan .old sibling is left after a deferred swap"
+        );
+        assert!(!private.exists(), "the private copy is cleaned up on defer");
+    }
+
+    /// #558: the no-half-write invariant on the move-aside path — if the SECOND rename (placing the
+    /// verified copy) fails after the existing target was already moved aside, the swap MUST undo
+    /// itself so `dest` is left with its original bytes, never missing. Simulated by pointing
+    /// `private` at a non-existent source so the second rename cannot succeed. Cross-platform: the
+    /// move-aside runs on every OS.
+    #[test]
+    fn a_failed_second_rename_restores_the_original_target_no_half_write_558() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dig-dns");
+        std::fs::write(&dest, b"original-bytes").unwrap();
+        let private = dir
+            .path()
+            .join("no-such-dir")
+            .join("dig-dns.dig-updater-verified");
+
+        let outcome = rename_into_place(
+            &private,
+            &dest,
+            &RetryPolicy {
+                attempts: 2,
+                backoff: Duration::ZERO,
+            },
+        );
+        assert!(matches!(outcome, InstallOutcome::Deferred { .. }));
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"original-bytes",
+            "a failed second rename must restore the original target, never leave it missing"
+        );
+        assert!(
+            !dest.with_extension(SUPERSEDED_EXT).exists(),
+            "no orphan .old sibling is left after the swap is undone"
+        );
+    }
+
+    /// #558 (the adversarial double-fault gap): if the target was moved aside, the second rename
+    /// fails, AND the undo (restoring the original) ALSO fails, `dest` is genuinely left MISSING. The
+    /// replace MUST then return `Failed` (not `Deferred`) so the caller's last-known-good rollback
+    /// fires and restores `dest` — proving the SPEC §9.5 invariant "dest is never left missing" holds
+    /// on EVERY branch. The rename primitive is injected to stage the double fault deterministically:
+    /// the move-aside runs for real, then every rename whose TARGET is `dest` is forced to fail.
+    #[test]
+    fn a_double_rename_fault_escalates_to_failed_and_the_lkg_rollback_restores_dest_558() {
+        use crate::rollback::LkgCache;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("bin").join("dig-dns");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"original-running-bytes").unwrap();
+
+        // The pass snapshots the good original BEFORE the replace — this is the LKG rollback source.
+        let lkg = LkgCache::at(dir.path().join("lkg"));
+        let snapshot = lkg
+            .snapshot("dig-dns", &dest, Some(15_000))
+            .unwrap()
+            .expect("the original target is snapshotted");
+
+        let private = dest.with_extension(VERIFIED_RAW_EXT);
+        std::fs::write(&private, b"new-verified-bytes").unwrap();
+
+        // Move-aside (dest -> .old) runs for real; placing at dest AND the undo (.old -> dest) both
+        // fail — a double fault that leaves dest missing.
+        let policy = RetryPolicy {
+            attempts: 2,
+            backoff: Duration::ZERO,
+        };
+        let target = dest.clone();
+        let outcome = rename_into_place_with(&private, &dest, &policy, |_policy, from, to| {
+            if to == target.as_path() {
+                Err(std::io::Error::other("injected: cannot place at dest"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        });
+
+        assert!(
+            matches!(outcome, InstallOutcome::Failed { .. }),
+            "a double rename fault (place + undo both fail) must escalate to Failed, got {outcome:?}"
+        );
+        assert!(
+            !dest.exists(),
+            "the double fault genuinely leaves dest missing until the rollback runs"
+        );
+
+        // The caller's LKG rollback (fires on Failed) reinstates dest — so it is never left missing.
+        // The pass restores the just-captured snapshot in-place (floor-exempt, RestoreKind::InPlace).
+        lkg.restore(&snapshot, 0, crate::rollback::RestoreKind::InPlace)
+            .expect("the last-known-good rollback restores dest on Failed");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"original-running-bytes",
+            "dest is restored to its original bytes — never left missing on any branch"
+        );
+    }
+
+    /// #558 (round 2): the SAME double-rename fault when the prior build is UN-AGEABLE
+    /// (`installed_build == None` — a malformed-date nightly / unparseable core, `plan.rs::pack_build`
+    /// returns None). The in-pass rollback MUST still restore dest — the floor gate is bypassed for a
+    /// restore-in-place, so dest is never left missing regardless of ageability.
+    #[test]
+    fn a_double_rename_fault_with_an_unageable_build_still_rolls_back_dest_558() {
+        use crate::rollback::{LkgCache, RestoreKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("bin").join("dig-dns");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"original-running-bytes").unwrap();
+
+        // The prior build's version is un-ageable → snapshot records build = None.
+        let lkg = LkgCache::at(dir.path().join("lkg"));
+        let snapshot = lkg
+            .snapshot("dig-dns", &dest, None)
+            .unwrap()
+            .expect("the original target is snapshotted");
+
+        let private = dest.with_extension(VERIFIED_RAW_EXT);
+        std::fs::write(&private, b"new-verified-bytes").unwrap();
+
+        let policy = RetryPolicy {
+            attempts: 2,
+            backoff: Duration::ZERO,
+        };
+        let target = dest.clone();
+        let outcome = rename_into_place_with(&private, &dest, &policy, |_policy, from, to| {
+            if to == target.as_path() {
+                Err(std::io::Error::other("injected: cannot place at dest"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        });
+
+        assert!(
+            matches!(outcome, InstallOutcome::Failed { .. }),
+            "a double rename fault must escalate to Failed, got {outcome:?}"
+        );
+        assert!(!dest.exists(), "the double fault leaves dest missing");
+
+        // Even with an un-ageable prior build, the in-pass restore-in-place reinstates dest under a
+        // high floor — the round-1 gap where the None arm refused BEFORE writing dest is closed.
+        lkg.restore(&snapshot, 10_000, RestoreKind::InPlace)
+            .expect("an un-ageable in-pass snapshot is still restored (floor-exempt)");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"original-running-bytes",
+            "dest is restored even when the prior build was un-ageable — never left missing"
+        );
     }
 }

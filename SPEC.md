@@ -474,10 +474,13 @@ After installing verified artifacts, the broker MUST run a health check appropri
 component (e.g. the service starts and answers a liveness probe). If the health check fails,
 the broker MUST roll back to the last known-good build and MUST re-verify the rollback target
 against the trust chain before reinstating it (a rollback is an install and gets the same
-verification). A rollback MUST NOT downgrade below `rollback_floor_build`; a manual/out-of-band
-rollback MUST read that floor from the PERSISTED (Admin/SYSTEM-only) trust state, never a
-caller-supplied value, since the last-known-good record's digest is self-recorded beside the cached
-bytes. State migrations
+verification). A CROSS-PASS rollback (reinstating an older cached
+build) MUST NOT downgrade below `rollback_floor_build`; a manual/out-of-band rollback MUST read that
+floor from the PERSISTED (Admin/SYSTEM-only) trust state, never a caller-supplied value, since the
+last-known-good record's digest is self-recorded beside the cached bytes. The floor gate does NOT
+apply to an IN-PASS restore-in-place of the just-captured current snapshot (restoring bytes onto their
+own destination can never be a downgrade relative to itself — the exemption that keeps "never left
+missing" unconditional even for an un-ageable build). State migrations
 MUST be backward-compatible: a build's on-disk state MUST remain readable by the immediately
 prior build, so a rollback never bricks on unreadable state and never destroys data
 (no destructive down-migration).
@@ -494,6 +497,27 @@ installed version. This is the installer↔beacon contract: **the installer and 
 the install root because the beacon derives it from where the installer placed the beacon** (recorded
 in the superproject `SYSTEM.md`). Installing to a decoupled hardcoded directory — the prior bug —
 left the user's real binary un-updated while the beacon reported success against a phantom copy.
+
+**Resilient raw-binary replace — running/in-use targets.** A raw-binary component may be a running
+service (e.g. dig-dns) or the beacon's own image, and its file can be transiently held in use by a
+scanner/backup. The replace MUST therefore be resilient rather than fail hard: it MUST move any
+existing target ASIDE to a `.dig-updater-old` sibling and then rename the verified copy into place
+(a running image can be renamed away even where it cannot be overwritten in place). It MUST retry
+ONLY the file-in-use class — Windows `ERROR_SHARING_VIOLATION` (32) / `ERROR_LOCK_VIOLATION` (33),
+unix `ETXTBSY` (26) — with bounded backoff, and fail fast on any other (terminal) error. If the
+target stays locked through the retry budget the pass DEFERS to the next wake (§9.5, a benign
+outcome), and if the second rename fails the move-aside MUST be undone — through the SAME retried
+rename, not a best-effort one-shot — so the original target is left byte-intact. If that undo ALSO
+fails (a double fault that would otherwise leave the target MISSING), the replace MUST report a
+FAILED (not deferred) outcome so the caller's last-known-good rollback (§9.5) reinstates the target.
+That in-pass rollback restores the snapshot captured at the destination moments earlier in the SAME
+pass — a restore-in-place, NOT a downgrade — so it is EXEMPT from the anti-downgrade floor gate and
+MUST reinstate the target unconditionally, including when the prior build's version was un-ageable
+(unparseable → no build number). The floor gate still applies UNCHANGED to a CROSS-PASS rollback that
+reinstates an older cached build. Across every branch the target is NEVER left half-written or missing
+— an unconditional invariant, regardless of the installed build's ageability. This is the SAME running-target-safe swap
+the beacon's own self-update uses (§8.1); there is ONE implementation shared by every raw-binary
+component and the self-update.
 
 ---
 

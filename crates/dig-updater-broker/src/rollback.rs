@@ -49,6 +49,25 @@ pub struct LkgEntry {
     pub dest: PathBuf,
 }
 
+/// Which kind of rollback a [`LkgCache::restore`] is performing — this decides whether the
+/// anti-downgrade floor gate applies.
+///
+/// The floor gate (SPEC §9.5) exists to stop a rollback from REINSTATING an OLDER, below-floor build
+/// — re-opening a vulnerability the floor excludes. That risk only exists for a CROSS-PASS rollback,
+/// where the cached bytes are a genuinely older build than what is (or was) installed. An IN-PASS
+/// rollback restores the EXACT bytes snapshotted at the destination moments earlier in the SAME pass
+/// (before the failed replace); reinstating them is a restore-in-place, never a downgrade relative to
+/// itself, so it MUST bypass the floor gate — otherwise an un-ageable current build (`build == None`)
+/// would leave `dest` missing on the double-rename-fault branch (#558).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreKind {
+    /// Restore the just-captured current snapshot within the same pass — floor-EXEMPT (restoring the
+    /// current-original bytes can never be a downgrade relative to itself).
+    InPlace,
+    /// Restore an older cached last-known-good build across passes — floor-GATED (anti-downgrade).
+    CrossPass,
+}
+
 /// The Admin/SYSTEM-only last-known-good cache directory.
 #[derive(Debug, Clone)]
 pub struct LkgCache {
@@ -100,32 +119,49 @@ impl LkgCache {
         }))
     }
 
-    /// Restore a snapshot after a failed health gate: RE-VERIFY the cached bytes against the
-    /// recorded digest and the current `floor`, then reinstate them at the destination.
+    /// Restore a snapshot after a failed health gate or a failed replace: RE-VERIFY the cached bytes
+    /// against the recorded digest and — for a CROSS-PASS rollback only — the current `floor`, then
+    /// reinstate them at the destination.
+    ///
+    /// `kind` decides whether the anti-downgrade floor gate applies. An [`RestoreKind::InPlace`]
+    /// restore reinstates the current-original bytes captured earlier in the SAME pass, so it is
+    /// floor-EXEMPT (restoring bytes onto their own destination can never be a downgrade relative to
+    /// itself, and MUST succeed even when the prior build was un-ageable — #558, the double-rename
+    /// fault). A [`RestoreKind::CrossPass`] restore reinstates a possibly-older cached build and stays
+    /// floor-GATED (SPEC §9.5: a rollback MUST NOT downgrade below the floor).
     ///
     /// # Errors
     ///
     /// [`BrokerError::RollbackFailed`] if the cached bytes no longer match their recorded digest,
-    /// if the cached build is below `floor` (or its age is unknown), or if the reinstate write
-    /// fails — the worst case, needing operator attention.
-    pub fn restore(&self, entry: &LkgEntry, floor: u64) -> Result<(), BrokerError> {
-        // A rollback must not downgrade below the floor (SPEC §9.5).
-        match entry.build {
-            Some(build) if build >= floor => {}
-            Some(build) => {
-                return Err(BrokerError::RollbackFailed {
-                    component: entry.component.clone(),
-                    detail: format!(
-                        "cached build {build} is below the current rollback floor {floor}"
-                    ),
-                })
-            }
-            None => {
-                return Err(BrokerError::RollbackFailed {
-                    component: entry.component.clone(),
-                    detail: "cached build age is unknown; cannot prove it is at or above the floor"
-                        .to_string(),
-                })
+    /// if (cross-pass) the cached build is below `floor` or its age is unknown, or if the reinstate
+    /// write fails — the worst case, needing operator attention.
+    pub fn restore(
+        &self,
+        entry: &LkgEntry,
+        floor: u64,
+        kind: RestoreKind,
+    ) -> Result<(), BrokerError> {
+        // A cross-pass rollback must not downgrade below the floor (SPEC §9.5). An in-pass restore of
+        // the just-captured current bytes is exempt — it is a restore-in-place, not a downgrade.
+        if kind == RestoreKind::CrossPass {
+            match entry.build {
+                Some(build) if build >= floor => {}
+                Some(build) => {
+                    return Err(BrokerError::RollbackFailed {
+                        component: entry.component.clone(),
+                        detail: format!(
+                            "cached build {build} is below the current rollback floor {floor}"
+                        ),
+                    })
+                }
+                None => {
+                    return Err(BrokerError::RollbackFailed {
+                        component: entry.component.clone(),
+                        detail:
+                            "cached build age is unknown; cannot prove it is at or above the floor"
+                                .to_string(),
+                    })
+                }
             }
         }
         // Re-verify the cached bytes — a rollback is an install and gets the same digest gate.
@@ -252,7 +288,9 @@ mod tests {
         // Simulate a failed new install having overwritten the destination.
         std::fs::write(&dest, b"broken-new-binary").unwrap();
 
-        cache.restore(&entry, 10_000).expect("rollback restores");
+        cache
+            .restore(&entry, 10_000, RestoreKind::CrossPass)
+            .expect("rollback restores");
         assert_eq!(std::fs::read(&dest).unwrap(), b"good-old-binary");
     }
 
@@ -265,9 +303,10 @@ mod tests {
             .snapshot("digstore", &dest, Some(9_000))
             .unwrap()
             .unwrap();
-        // Current floor is 10_000; the cached build 9_000 is below it — refuse to reinstate it.
+        // Current floor is 10_000; the cached build 9_000 is below it — a CROSS-PASS rollback to an
+        // older cached build must refuse to reinstate it (anti-downgrade, SPEC §9.5).
         let err = cache
-            .restore(&entry, 10_000)
+            .restore(&entry, 10_000, RestoreKind::CrossPass)
             .expect_err("a below-floor rollback target must be refused");
         assert!(matches!(err, BrokerError::RollbackFailed { .. }));
     }
@@ -279,9 +318,37 @@ mod tests {
         std::fs::write(&dest, b"old").unwrap();
         let entry = cache.snapshot("digstore", &dest, None).unwrap().unwrap();
         let err = cache
-            .restore(&entry, 0)
+            .restore(&entry, 0, RestoreKind::CrossPass)
             .expect_err("an un-ageable cached build cannot be proven at/above the floor");
         assert!(matches!(err, BrokerError::RollbackFailed { .. }));
+    }
+
+    /// #558 (round 2): the IN-PASS restore of a just-captured snapshot is floor-EXEMPT, so an
+    /// un-ageable prior build (`build == None`) is still reinstated even when the double-rename fault
+    /// left `dest` MISSING. This is the narrow branch the round-1 fix missed: the cross-pass floor
+    /// gate must NOT block a restore-in-place of the current-original bytes.
+    #[test]
+    fn in_pass_restore_reinstates_an_unageable_snapshot_even_when_dest_is_missing() {
+        let (dir, cache) = cache();
+        let dest = dir.path().join("bin").join("dig-dns");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"original-running-bytes").unwrap();
+
+        // The prior build is un-ageable (a malformed-date nightly / unparseable core → build == None).
+        let entry = cache
+            .snapshot("dig-dns", &dest, None)
+            .unwrap()
+            .expect("the original target is snapshotted");
+
+        // The double-rename fault leaves dest genuinely missing before the rollback fires.
+        std::fs::remove_file(&dest).unwrap();
+        assert!(!dest.exists());
+
+        // The in-pass rollback restores it regardless of ageability — dest is never left missing.
+        cache
+            .restore(&entry, 10_000, RestoreKind::InPlace)
+            .expect("an in-pass restore-in-place is floor-exempt");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original-running-bytes");
     }
 
     #[test]
@@ -296,7 +363,7 @@ mod tests {
         // Corrupt the cached bytes after the snapshot recorded their digest.
         std::fs::write(&entry.cached_path, b"tampered-cache").unwrap();
         let err = cache
-            .restore(&entry, 0)
+            .restore(&entry, 0, RestoreKind::InPlace)
             .expect_err("corrupted cache must not be reinstated");
         assert!(matches!(err, BrokerError::RollbackFailed { .. }));
     }
