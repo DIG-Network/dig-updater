@@ -705,10 +705,14 @@ mod tests {
     }
 
     #[test]
-    fn ensure_short_circuits_to_suppressed_when_an_opt_out_marker_is_present() {
-        // #584: a DELIBERATE `schedule uninstall` writes an Admin-owned opt-out marker; `ensure`
-        // must honor it and return WITHOUT touching the OS scheduler (the short-circuit is what
-        // makes this test cross-platform — no schtasks/systemctl/launchctl is spawned).
+    #[ignore = "requires Administrator/root to write a privileged-owned opt-out marker — run via \
+                `-- --ignored` in the elevated scheduler CI job"]
+    fn ensure_short_circuits_to_suppressed_when_a_privileged_opt_out_marker_is_present() {
+        // #584: a DELIBERATE `schedule uninstall` writes a PRIVILEGED-OWNED opt-out marker; `ensure`
+        // must honor it and return WITHOUT touching the OS scheduler. The short-circuit only fires
+        // for a privileged-owned marker (the loop-security un-forgeability fix), which requires
+        // being elevated to produce — so this runs in the elevated CI job (Windows Administrator /
+        // Unix sudo), alongside the scheduler integration tests.
         let state_dir = tempfile::tempdir().expect("state dir");
         crate::optout::set_opted_out(state_dir.path()).expect("write the opt-out marker");
         let exe = std::env::current_exe().expect("test exe");
