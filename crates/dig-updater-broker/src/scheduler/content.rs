@@ -23,6 +23,18 @@ fn escape_systemd_exec(s: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
+/// The human-readable, discoverable identity the beacon's scheduled task/timer/daemon presents,
+/// PARALLEL to the OS-service identities "DIG NETWORK: NODE" (dig-node) and "DIG NETWORK: DNS"
+/// (dig-dns) — SYSTEM.md → "Canonical OS-service identity" (#494, #546). A user browsing Task
+/// Scheduler / `systemctl` / `launchctl` sees the beacon under this name alongside the other DIG
+/// services, and `dig-updater status` echoes it so the beacon's identity + health are legible.
+///
+/// This is a DISPLAY label only; the machine identifiers stay canonical and unchanged — the Windows
+/// task path [`WINDOWS_TASK_PATH`], the systemd unit stem [`SYSTEMD_UNIT_NAME`], and the launchd
+/// label [`LAUNCHD_LABEL`]. Changing this string is a cross-repo contract change (SYSTEM.md +
+/// the `canonical` skill).
+pub const BEACON_DISPLAY_NAME: &str = "DIG NETWORK: BEACON";
+
 /// The Windows Task Scheduler path (folder + name) the daily pass registers under.
 pub const WINDOWS_TASK_PATH: &str = r"\DIG\dig-updater";
 
@@ -64,7 +76,8 @@ pub fn windows_task_xml(exe: &Path, random_delay: Duration) -> String {
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Runs the DIG auto-update beacon once daily (SPEC #504-F).</Description>
+    <URI>{WINDOWS_TASK_PATH}</URI>
+    <Description>{BEACON_DISPLAY_NAME} — runs the DIG auto-update beacon once daily (SPEC #504-F).</Description>
   </RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
@@ -109,7 +122,7 @@ pub fn systemd_service_unit(exe: &Path) -> String {
     let exe = escape_systemd_exec(&exe.display().to_string());
     format!(
         "[Unit]\n\
-         Description=DIG auto-update beacon (one pass)\n\
+         Description={BEACON_DISPLAY_NAME} — DIG auto-update beacon (one pass)\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
@@ -124,7 +137,7 @@ pub fn systemd_service_unit(exe: &Path) -> String {
 pub fn systemd_timer_unit(random_delay: Duration) -> String {
     format!(
         "[Unit]\n\
-         Description=Run the DIG auto-update beacon daily\n\
+         Description={BEACON_DISPLAY_NAME} — run the DIG auto-update beacon daily\n\
          \n\
          [Timer]\n\
          OnCalendar=daily\n\
@@ -202,6 +215,39 @@ mod tests {
 
     fn exe() -> PathBuf {
         PathBuf::from(r"C:\Program Files\DIG\dig-updater.exe")
+    }
+
+    #[test]
+    fn every_scheduler_artifact_carries_the_discoverable_beacon_identity() {
+        // #546: the beacon presents "DIG NETWORK: BEACON" wherever the OS surfaces it, PARALLEL to
+        // dig-node's "DIG NETWORK: NODE" + dig-dns's "DIG NETWORK: DNS" (SYSTEM.md OS-service
+        // identity contract). The machine identifiers stay canonical + unchanged.
+        assert_eq!(BEACON_DISPLAY_NAME, "DIG NETWORK: BEACON");
+
+        let win = windows_task_xml(&exe(), JITTER_WINDOW);
+        assert!(
+            win.contains(BEACON_DISPLAY_NAME),
+            "the Windows task Description surfaces the beacon identity"
+        );
+        assert!(
+            win.contains(&format!("<URI>{WINDOWS_TASK_PATH}</URI>")),
+            "the task declares its canonical registration path"
+        );
+
+        let svc = systemd_service_unit(Path::new("/usr/local/bin/dig-updater"));
+        assert!(
+            svc.contains(&format!("Description={BEACON_DISPLAY_NAME}")),
+            "the systemd service Description surfaces the beacon identity"
+        );
+        let timer = systemd_timer_unit(JITTER_WINDOW);
+        assert!(
+            timer.contains(&format!("Description={BEACON_DISPLAY_NAME}")),
+            "the systemd timer Description surfaces the beacon identity"
+        );
+
+        // launchd's identity IS its canonical reverse-DNS label (macOS surfaces no separate friendly
+        // name); the beacon's `status` line carries the display name on every OS.
+        assert_eq!(LAUNCHD_LABEL, "net.dignetwork.dig-updater");
     }
 
     #[test]

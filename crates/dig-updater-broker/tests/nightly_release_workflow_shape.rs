@@ -204,6 +204,22 @@ fn nightly_job_prunes_to_a_retention_window() {
 }
 
 #[test]
+fn dispatch_reachable_jobs_are_bound_to_the_main_ref() {
+    // #616 (mirrors feed.yml's H1, #540): the stable + nightly-meta jobs push tags + a changelog
+    // commit to main with RELEASE_TOKEN (past branch protection). Both are workflow_dispatch-
+    // reachable, so a dispatch selected against a non-main branch could push THAT branch's commits.
+    // Each dispatch-reachable job's `if:` must therefore bind to `github.ref == 'refs/heads/main'`,
+    // so an off-main dispatch is an inert no-op. The cron + the production dispatch both run on main.
+    let wf = nightly_release();
+    let guards = wf.matches("github.ref == 'refs/heads/main'").count();
+    assert!(
+        guards >= 2,
+        "both the `stable` and `nightly-meta` job `if:` conditions must bind to \
+         `github.ref == 'refs/heads/main'` (found {guards} occurrences)"
+    );
+}
+
+#[test]
 fn both_channels_no_op_without_release_token() {
     let wf = nightly_release();
     assert!(

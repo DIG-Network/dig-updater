@@ -195,6 +195,13 @@ pub struct Installer<'a> {
     /// Production wires [`crate::service::control`]; tests inject a recording fake so the
     /// stop→replace→restart ordering + failure handling are exercised without a real service.
     pub service_ctl: &'a ServiceControl<'a>,
+    /// Suppress advancing (and thus persisting) the tracked channel's trust state after an otherwise
+    /// fully-successful pass (#621 item 1). Set only when the feed ladder was overridden out-of-band
+    /// (`--feed-base`/`$DIG_UPDATER_FEED_BASE`): the fetched manifest's marks may be on a DIFFERENT
+    /// channel's version scale, so folding them into `config.channel`'s monotonic state would corrupt
+    /// its anti-rollback floor (a below-floor self-DoS). The binaries are still installed; only the
+    /// persisted state advance is withheld. A normal (non-overridden) pass leaves this `false`.
+    pub suppress_state_advance: bool,
 }
 
 impl Installer<'_> {
@@ -261,11 +268,13 @@ impl Installer<'_> {
         }
 
         // 4. Advance the trust state ONLY once every OTHER component fully succeeded (SPEC §9
-        // step 7). Deliberately independent of the self-update outcome below: the trust state
+        // step 7) AND the feed was not overridden (`suppress_state_advance` — #621 item 1, so an
+        // off-channel `--feed-base` pass never pollutes the tracked channel's monotonic floor).
+        // Deliberately independent of the self-update outcome below: the trust state
         // tracks MANIFEST freshness, not which binary the beacon itself currently is, so a merely
         // Deferred self-swap (a common, benign outcome — see `crate::selfupdate`) must never mask
         // an otherwise fully successful pass for everything else.
-        let state_advanced = if all_succeeded {
+        let state_advanced = if all_succeeded && !self.suppress_state_advance {
             self.advance_state(manifest, &loaded)?;
             true
         } else {

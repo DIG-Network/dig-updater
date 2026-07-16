@@ -92,5 +92,3 @@ Remaining follow-ups — the `updates.dig.net` feed origin, native packages + in
 registration, the `dig-node` updater RPC proxy (built on the `status.json` contract in `SPEC.md`
 §13), an Updates UI, and docs — are tracked under #504. Nothing is released to users yet.
 License: **GPL-2.0-only**.
-
-<!-- beacon-mopup WIP: #616 nightlies dispatch guard, #621 per-channel fail-safes, #546 beacon identity -->

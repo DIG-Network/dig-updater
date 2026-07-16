@@ -74,8 +74,17 @@ jobs:
     # `!startsWith(...chore(release):...)` guard is preserved from the on-merge era: it is INERT on
     # schedule/dispatch (there is no `head_commit`), but it keeps the release changelog commit
     # self-labelled so the loop stays safe even if a push trigger is ever re-introduced.
+    # #616 (mirrors feed.yml's H1, #540): the STABLE job does `git push origin HEAD:main` with
+    # RELEASE_TOKEN (past branch protection, `enforce_admins=false`) and cuts a fleet-reaching
+    # `vX.Y.Z`. Bind that capability to REVIEWED main code: a `workflow_dispatch(channel=stable)`
+    # selected against a NON-main branch would otherwise checkout that branch and push ITS commits to
+    # main. The cron always runs on main and the production dispatch is always against main, so this
+    # ref guard costs nothing legitimate — it closes the accident/abuse path. (The real boundary
+    # remains who-can-dispatch = write-access + a main-only environment-scoped RELEASE_TOKEN; this is
+    # defense-in-depth on top.)
     if: >-
       ${{
+        github.ref == 'refs/heads/main' &&
         !startsWith(github.event.head_commit.message, 'chore(release):') &&
         (github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both')
       }}
@@ -192,8 +201,11 @@ jobs:
   # 1) meta: gate on the token + synthesize the nightly version and tags (nothing is committed).
   nightly-meta:
     name: Nightly — resolve version
+    # #616: same main-ref bind as the stable job — the nightly channel also tags + publishes with
+    # RELEASE_TOKEN, so it too is restricted to reviewed main code (the downstream build/publish
+    # jobs gate on this job's outputs).
     if: >-
-      ${{ github.event_name == 'schedule' || inputs.channel == 'nightly' || inputs.channel == 'both' }}
+      ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || inputs.channel == 'nightly' || inputs.channel == 'both') }}
     runs-on: ubuntu-latest
     outputs:
       token_present: ${{ steps.token.outputs.present }}

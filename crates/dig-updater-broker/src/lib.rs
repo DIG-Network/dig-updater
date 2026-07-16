@@ -277,7 +277,10 @@ impl Broker {
         }
 
         // The channel selects BOTH which feed is fetched and which per-channel trust state is
-        // advanced — derived from config unless the caller overrode the transport.
+        // advanced — derived from config unless the caller overrode the transport. A supplied
+        // override is remembered so `run_pass` can decline to advance the tracked channel's state
+        // from off-channel marks (#621 item 1).
+        let feed_overridden = feed_override.is_some();
         let feed_sources =
             feed_override.unwrap_or_else(|| channel_feed_ladder(config.channel.as_str()));
         let root = beacon_root_verifying_key();
@@ -286,6 +289,7 @@ impl Broker {
             &root,
             config.channel,
             feed_sources,
+            feed_overridden,
             Sandbox::Restricted,
             &probe,
             &probe,
@@ -317,7 +321,12 @@ impl Broker {
             .load()?
             .state
             .rollback_floor_build;
-        let cache = LkgCache::at(self.lkg_dir());
+        // The cache is read from the SAME channel the floor came from (#621 item 3): a shared cache
+        // could hold a nightly-dated build (~2026_07_14) while the stable floor (~15_000) is being
+        // enforced, so `LkgCache::restore` would compare across scales and pass spuriously. Keeping
+        // the cache per-channel guarantees a cached build and the floor gating it are always on one
+        // version scale.
+        let cache = LkgCache::at(self.lkg_dir_for(channel));
         let mut restored = Vec::new();
         for component in cache.cached_components() {
             let entry = cache.load_entry(&component)?;
@@ -420,11 +429,13 @@ impl Broker {
     /// version `probe`s so the pinned-key entry point ([`run_once`](Self::run_once)) and future
     /// callers share one body. The `channel` selects which per-channel trust state
     /// ([`TrustStateStore::for_channel`]) this pass loads and advances (SPEC §6, #591 D5).
+    #[allow(clippy::too_many_arguments)]
     fn run_pass(
         &self,
         root: &ed25519_dalek::VerifyingKey,
         channel: Channel,
         feed_sources: Vec<FeedSource>,
+        feed_overridden: bool,
         sandbox: Sandbox,
         detect: &health::VersionProbe,
         health: &health::VersionProbe,
@@ -432,7 +443,7 @@ impl Broker {
         let store = TrustStateStore::for_channel(&self.state_dir, channel);
         let staging_dir = self.staging_dir();
         let apply_dir = self.apply_dir();
-        let lkg = LkgCache::at(self.lkg_dir());
+        let lkg = LkgCache::at(self.lkg_dir_for(channel));
 
         // ACL self-check FIRST, fail-closed: the state / last-known-good / apply directories are
         // created AND EXPLICITLY HARDENED, and the beacon binary is verified un-tamperable, BEFORE
@@ -441,7 +452,8 @@ impl Broker {
         // never triggers the repair-harden branch — the state / lkg / apply dirs would otherwise be
         // created but never `icacls`-locked. Snapshots land in the lkg dir BEFORE any state advance,
         // so it must be hardened up front (#504-E).
-        for dir in [&self.state_dir, &self.lkg_dir(), &apply_dir] {
+        let lkg_dir = self.lkg_dir_for(channel);
+        for dir in [&self.state_dir, &self.lkg_dir(), &lkg_dir, &apply_dir] {
             std::fs::create_dir_all(dir).map_err(|e| BrokerError::Io(e.to_string()))?;
             secure::harden_state_dir(dir)?;
         }
@@ -464,6 +476,10 @@ impl Broker {
             detect,
             health,
             service_ctl: &service::control,
+            // #621 item 1: when the feed ladder was overridden (`--feed-base`/`$DIG_UPDATER_FEED_BASE`)
+            // the fetched marks may be off the tracked channel's scale, so this pass installs but must
+            // NOT advance — and thus must not POLLUTE — the tracked channel's persisted trust state.
+            suppress_state_advance: feed_overridden,
         };
         installer.apply(root, &report, loaded)
     }
@@ -508,10 +524,24 @@ impl Broker {
         self.state_dir.join("staging")
     }
 
-    /// The Admin/SYSTEM-only last-known-good cache (`<state_dir>/lkg`) that rollback restores from.
+    /// The Admin/SYSTEM-only last-known-good cache ROOT (`<state_dir>/lkg`) — the hardened parent of
+    /// every per-channel cache. Rollback + a real pass read/write the CHANNEL-SCOPED subdirectory
+    /// ([`Self::lkg_dir_for`]); this root exists so the whole tree is created + hardened + ACL
+    /// self-checked as one unit.
     #[must_use]
     pub fn lkg_dir(&self) -> PathBuf {
         self.state_dir.join("lkg")
+    }
+
+    /// The Admin/SYSTEM-only last-known-good cache for a specific `channel`
+    /// (`<state_dir>/lkg/<channel>`). The cache is per-channel to mirror the per-channel trust state
+    /// (#591 D5): a channel's cached last-known-good build and the rollback floor gating it must
+    /// always be on the SAME version scale (`YYYYMMDD` nightly vs `vX.Y.Z` stable), so switching
+    /// channels can never leave a nightly-dated build cached under a stable floor where
+    /// [`LkgCache::restore`]'s numeric floor comparison would pass spuriously (#621 item 3).
+    #[must_use]
+    pub fn lkg_dir_for(&self, channel: Channel) -> PathBuf {
+        self.lkg_dir().join(channel.as_str())
     }
 
     /// The Admin/SYSTEM-only apply directory (`<state_dir>/apply`) a native-package artifact is
@@ -717,6 +747,7 @@ mod tests {
                 &root,
                 Channel::Stable,
                 vec![FeedSource::new("http://127.0.0.1:9/feed")],
+                false,
                 Sandbox::Inherit,
                 &probe,
                 &probe,
@@ -770,8 +801,9 @@ mod tests {
             .save(&persisted, &LoadedState::initial())
             .expect("persist state");
 
-        // Snapshot a cached build BELOW that persisted floor (build 9_000).
-        let cache = LkgCache::at(broker.lkg_dir());
+        // Snapshot a cached build BELOW that persisted floor (build 9_000) in the STABLE channel's
+        // own cache — the same per-channel cache `rollback()` reads (#621 item 3).
+        let cache = LkgCache::at(broker.lkg_dir_for(Channel::Stable));
         let dest = home.path().join("bin").join("digstore");
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::write(&dest, b"old-below-floor-binary").unwrap();
@@ -785,6 +817,44 @@ mod tests {
             .rollback()
             .expect_err("a below-persisted-floor cached build must be refused");
         assert!(matches!(err, BrokerError::RollbackFailed { .. }));
+    }
+
+    #[test]
+    fn the_last_known_good_cache_is_isolated_per_channel() {
+        // #621 item 3: each channel's last-known-good cache lives under its OWN subdirectory
+        // (`lkg/<channel>`), mirroring the per-channel trust state. A build cached while tracking
+        // nightly must therefore be INVISIBLE to a later stable-channel rollback — otherwise a
+        // nightly-dated build (~20260714) could survive a channel switch and be compared against the
+        // stable semver floor (~15000), passing spuriously.
+        let home = tempfile::tempdir().expect("home");
+        let broker = Broker::with_paths(home.path().to_path_buf(), home.path().join("worker"));
+
+        // The two channels resolve to DISTINCT cache directories.
+        assert_ne!(
+            broker.lkg_dir_for(Channel::Nightly),
+            broker.lkg_dir_for(Channel::Stable),
+            "each channel must own a distinct last-known-good cache directory"
+        );
+
+        // A build cached under nightly is not visible to the stable cache.
+        let nightly = LkgCache::at(broker.lkg_dir_for(Channel::Nightly));
+        let dest = home.path().join("bin").join("digstore");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"nightly-dated-binary").unwrap();
+        nightly
+            .snapshot("digstore", &dest, Some(20_260_714))
+            .expect("snapshot into the nightly cache");
+
+        let stable = LkgCache::at(broker.lkg_dir_for(Channel::Stable));
+        assert!(
+            stable.cached_components().is_empty(),
+            "the stable cache must not see the nightly channel's cached build"
+        );
+        assert_eq!(
+            nightly.cached_components(),
+            vec!["digstore".to_string()],
+            "the nightly cache retains its own build"
+        );
     }
 
     #[test]

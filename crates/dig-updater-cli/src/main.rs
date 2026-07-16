@@ -656,7 +656,11 @@ fn render_schedule_status(status: &scheduler::ScheduleStatus, json: bool) -> Str
             scheduler::SchedulePresence::Absent => "NOT REGISTERED",
             scheduler::SchedulePresence::Unknown => "UNKNOWN",
         };
-        format!("dig-updater: daily schedule {label} — {}", status.detail)
+        format!(
+            "{}: daily schedule {label} — {}",
+            scheduler::content::BEACON_DISPLAY_NAME,
+            status.detail
+        )
     }
 }
 
@@ -676,8 +680,11 @@ fn render_status(status: &StatusSnapshot, json: bool) -> String {
         _ => "never checked".to_string(),
     };
     let mut out = format!(
-        "dig-updater {} — channel={} paused={} — last check: {last_check}",
-        status.version, status.channel, status.paused
+        "{} — dig-updater {} — channel={} paused={} — last check: {last_check}",
+        scheduler::content::BEACON_DISPLAY_NAME,
+        status.version,
+        status.channel,
+        status.paused
     );
     for c in &status.components {
         out.push_str(&format!(
@@ -1038,6 +1045,12 @@ mod tests {
         assert!(human.contains("never checked"));
         assert!(human.contains("channel=stable"));
         assert!(human.contains("paused=false"));
+        // #546: the beacon's discoverable identity leads the human status line, parallel to the
+        // "DIG NETWORK: NODE"/"DIG NETWORK: DNS" OS services.
+        assert!(
+            human.contains(scheduler::content::BEACON_DISPLAY_NAME),
+            "status surfaces the discoverable beacon identity"
+        );
 
         let json: serde_json::Value = serde_json::from_str(&render_status(&status, true)).unwrap();
         assert_eq!(json["channel"], "stable");
@@ -1187,7 +1200,12 @@ mod tests {
             presence: SchedulePresence::Registered,
             detail: r"registered at \DIG\dig-updater".into(),
         };
-        assert!(render_schedule_status(&installed, false).contains("REGISTERED"));
+        let installed_human = render_schedule_status(&installed, false);
+        assert!(installed_human.contains("REGISTERED"));
+        assert!(
+            installed_human.contains(scheduler::content::BEACON_DISPLAY_NAME),
+            "#546: schedule status surfaces the discoverable beacon identity"
+        );
         let json: serde_json::Value =
             serde_json::from_str(&render_schedule_status(&installed, true)).unwrap();
         assert_eq!(json["installed"], true);
