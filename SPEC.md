@@ -943,7 +943,7 @@ Administrator/root.
 | `check --now` | — | everything a full pass writes | Whatever `run` requires | Identical to `run` — an on-demand trigger of the SAME `Broker::run_once_with_feed`. |
 | `run` | `config.json`, `trust-state-<channel>.json` | `trust-state-<channel>.json`, `status.json`, installed binaries | Whatever the per-OS install path requires | Pause-gated (§13.1); fetches the tracked channel's feed (§10.1) and advances THAT channel's state; this is what the scheduler artifact invokes. |
 | `channel get` | `status.json` | — | No | |
-| `channel set <nightly\|stable>` | `config.json` | `config.json`, `status.json` | Yes | Accepts `nightly`, `stable`, and the `alpha` alias (→ nightly); rejects any other token (§13.1). |
+| `channel set <nightly\|stable>` | `config.json` | `config.json`, `status.json`, each browser's `ExtensionInstallForcelist` (via `dig-installer`, on a CHANGE) | Yes | Accepts `nightly`, `stable`, and the `alpha` alias (→ nightly); rejects any other token (§13.1). On a channel CHANGE it drives the staged extension reinstall (§13.4) — best-effort, never rolls back the channel. |
 | `pause [--until <ts>]` | `config.json` | `config.json`, `status.json` | Yes | |
 | `resume` | `config.json` | `config.json`, `status.json` | Yes | |
 | `status` | `status.json` | — | No | Always answerable (§13.2). |
@@ -990,6 +990,43 @@ the `--json` rendering stays exactly the structured worker report (§9), unchang
 independent of whether `status.json` (§13.2) could be written. A failure to refresh the status mirror
 (a permission the unprivileged runner lacks) MUST warn and continue — it MUST NOT change the exit code
 or suppress the `--json` verdict.
+
+### 13.4 Force-installed extension channel follow — a channel switch is a staged REINSTALL
+
+The universal installer force-installs the DIG Chrome extension into every detected Chromium browser
+via each browser's `ExtensionInstallForcelist` managed policy, keyed by the ONE extension id
+`mlibddmbhlgogepnjdienclhnkfpkfah`, with only the policy `update_url` differing per channel. The
+beacon is the single channel authority (§13.1): when `channel set` CHANGES the tracked channel, the
+force-installed extension MUST FOLLOW so every browser ends up pulling from the newly-tracked
+channel's `update_url`.
+
+- **A channel switch is a REINSTALL, not a version bump.** The nightly extension version scheme
+  `X.Y.Z.N` (`N` = UTC days since 2020-01-01) numerically OUTRANKS the stable `X.Y.Z`, so a browser on
+  a nightly build is at a HIGHER version than any stable build and Chromium will NOT auto-downgrade it.
+  Rewriting the forcelist entry's `update_url` in place therefore CANNOT cross a nightly→stable switch —
+  it leaves the browser stranded on the old, higher-versioned build.
+- **The beacon owns only the STAGING; the policy write is single-sourced in `dig-installer`.** On a
+  channel change the beacon drives, in strict order, the two elevation-gated `dig-installer` forcelist
+  verbs — never re-implementing the per-browser policy write:
+  1. **REMOVE** — `dig-installer --uninstall-ext-forcelist` strips the DIG forcelist entry from every
+     detected browser, so each browser uninstalls the extension on its next managed-policy refresh.
+  2. **AWAIT** — nudge the OS to re-evaluate policy (Windows `gpupdate /target:computer /force`;
+     file-based managed policy on Unix is re-read by each browser on its own schedule) and wait a
+     bounded interval so the browsers OBSERVE the removal and uninstall the old build BEFORE the re-add.
+     Without this gap the re-add races the removal and the downgrade never crosses.
+  3. **RE-ADD** — `dig-installer --set-ext-forcelist-channel <channel>` re-adds the entry pointing at
+     the target channel's `update_url`. With no extension present this is a FRESH install of the target
+     channel, not a blocked downgrade.
+- **No-op when unchanged.** A `channel set` that does not change the tracked channel (a re-set to the
+  same value, or an unreadable prior channel) performs NO policy writes — the browsers' forcelist is
+  never churned needlessly.
+- **Best-effort, never fails the `channel set`.** The beacon config is the channel authority and is
+  persisted first; a follow failure (e.g. `dig-installer` not present, or a browser policy write error)
+  is reported to the operator and left to the deferred daily self-heal reconcile (#602 Piece B) to
+  re-assert — it MUST NOT roll back the persisted channel.
+- **Trust state is untouched.** This is additive to §6/§6.1: the per-channel monotonic trust state and
+  anti-rollback are unchanged. Crossing channels remains an authorized operator action (§6.1), of which
+  this forcelist reinstall is the extension-side execution.
 
 ---
 

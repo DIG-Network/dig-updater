@@ -36,6 +36,7 @@ use std::process::ExitCode;
 use dig_updater_broker::config::{Channel, UpdaterConfig};
 use dig_updater_broker::status::StatusSnapshot;
 use dig_updater_broker::{elevation, scheduler, Broker, BrokerError, PassReport};
+use dig_updater_broker::{follow_channel_change, ExtFollow, InstalledDigInstaller};
 use dig_updater_worker::{FeedSource, WorkerReport};
 
 const USAGE: &str = "\
@@ -325,18 +326,69 @@ fn run_channel(action: ChannelAction, json: bool) -> ExitCode {
             Err(e) => fail(&e, json),
         },
         ChannelAction::Set(token) => match parse_channel_token(&token) {
-            Ok(channel) => match broker.set_channel(channel, elevation::is_elevated) {
-                Ok(config) => {
-                    println!("{}", render_channel(config.channel, json));
-                    ExitCode::SUCCESS
+            Ok(channel) => {
+                // Capture the channel BEFORE the write so the ext-follow can tell a real switch from
+                // a no-op re-set (an unchanged channel must not churn the force-installed extension).
+                let previous = broker.channel().ok();
+                match broker.set_channel(channel, elevation::is_elevated) {
+                    Ok(config) => {
+                        println!("{}", render_channel(config.channel, json));
+                        follow_ext_channel(previous, config.channel);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => fail(&e, json),
                 }
-                Err(e) => fail(&e, json),
-            },
+            }
             Err(msg) => report_usage_error(&msg, json),
         },
         ChannelAction::Unknown(action) => {
             eprintln!("unknown channel action: {action}\n\n{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Make the force-installed extension follow a channel switch (#613): drive the `dig-installer`
+/// forcelist staged reinstall (remove → policy-refresh → re-add at the new channel) so the browsers
+/// end up pulling the extension from the newly-tracked channel's `update_url`.
+///
+/// A channel SWITCH is a reinstall, not a version bump: the nightly version outranks stable, so
+/// Chromium will not auto-downgrade nightly→stable — only the staged uninstall+reinstall crosses it
+/// (#607). This is best-effort and never fails the `channel set` itself: the beacon's config is the
+/// single channel authority and is already persisted; a follow failure (e.g. the installer isn't
+/// present) is reported for the operator and left to the deferred daily self-heal reconcile (#602).
+///
+/// No-op when the channel is unchanged, or when the previous channel could not be read (ambiguous
+/// state is left to the reconcile rather than churning every browser's forcelist).
+fn follow_ext_channel(previous: Option<Channel>, current: Channel) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if previous == current {
+        return;
+    }
+    let commander = match InstalledDigInstaller::resolve() {
+        Ok(commander) => commander,
+        Err(e) => {
+            eprintln!("channel set: could not locate dig-installer to follow the ext channel: {e}");
+            return;
+        }
+    };
+    match follow_channel_change(
+        previous,
+        current,
+        &commander,
+        InstalledDigInstaller::await_policy_refresh,
+    ) {
+        ExtFollow::Reinstalled(channel) => {
+            println!("channel set: force-installed extension reinstalled on the {channel} channel");
+        }
+        ExtFollow::Unchanged => {}
+        ExtFollow::Failed(detail) => {
+            eprintln!(
+                "channel set: extension channel-follow incomplete ({detail}); \
+                 the beacon will re-assert it on its next reconcile"
+            );
         }
     }
 }

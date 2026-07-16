@@ -171,6 +171,36 @@ pub fn worker_file_name() -> &'static str {
     }
 }
 
+/// Resolve the `dig-installer` binary that sits alongside the current executable.
+///
+/// The universal installer ships `dig-installer` into the SAME directory as the beacon (they are
+/// installed together as one stack), so — exactly like [`sibling_worker_binary`] — it is found next
+/// to `current_exe()`. The beacon shells this binary's elevation-gated forcelist verbs
+/// (`--uninstall-ext-forcelist` / `--set-ext-forcelist-channel`) to keep the force-installed
+/// extension on the tracked channel (#613); resolving it as a sibling of the beacon (never a bare
+/// name found on `PATH`) denies a `PATH`-planted `dig-installer` a privileged code path.
+///
+/// # Errors
+///
+/// [`BrokerError::Io`] if the current executable path cannot be determined.
+pub fn sibling_installer_binary() -> Result<PathBuf, BrokerError> {
+    let exe = std::env::current_exe().map_err(|e| BrokerError::Io(e.to_string()))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| BrokerError::Io("current executable has no parent directory".into()))?;
+    Ok(dir.join(installer_file_name()))
+}
+
+/// The platform file name of the universal installer binary.
+#[must_use]
+pub fn installer_file_name() -> &'static str {
+    if cfg!(windows) {
+        "dig-installer.exe"
+    } else {
+        "dig-installer"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +219,26 @@ mod tests {
     fn worker_file_name_has_exe_suffix_on_windows() {
         let name = worker_file_name();
         assert_eq!(name.ends_with(".exe"), cfg!(windows));
+    }
+
+    #[test]
+    fn installer_file_name_has_exe_suffix_on_windows() {
+        let name = installer_file_name();
+        assert_eq!(name.ends_with(".exe"), cfg!(windows));
+        assert!(name.starts_with("dig-installer"));
+    }
+
+    #[test]
+    fn sibling_installer_binary_is_next_to_the_current_exe() {
+        // The beacon and dig-installer are installed side by side; the resolver must name the
+        // installer in the SAME directory as the running beacon (never a bare `PATH` name).
+        let installer = sibling_installer_binary().expect("resolves alongside the test binary");
+        let exe = std::env::current_exe().expect("test exe path");
+        assert_eq!(installer.parent(), exe.parent());
+        assert_eq!(
+            installer.file_name().and_then(|n| n.to_str()),
+            Some(installer_file_name())
+        );
     }
 
     #[test]
