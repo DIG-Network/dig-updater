@@ -1129,3 +1129,5 @@ tags/releases.
 | `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the STABLE GitHub Release for a `vX.Y.Z` tag. |
 | `build-binaries.yml` | `workflow_call` | The reusable cross-OS build both channels invoke. |
 | `feed.yml` | `schedule` (every 6h) + dispatch | UNRELATED to this repo's release — signs the update FEED the beacon reads for OTHER components (§10). |
+
+<!-- WIP #584: schedule ensure verb + Admin-only opt-out sentinel + self_heal opt-out retrofit -->
