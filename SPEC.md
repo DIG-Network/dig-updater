@@ -1215,6 +1215,12 @@ already points at the commit being built — a legitimate "the build failed, re-
 retry) or a tag with no published release yet (repairing a bare/failed tag). A version that
 genuinely needs new code released MUST bump `Cargo.toml`, not force-move an existing tag.
 
+The "is a published release present?" lookup MUST FAIL CLOSED: a transient GitHub API error
+(network / 5xx) MUST NOT be interpreted as "no published release" and thus permission to move the
+tag. Only a DEFINITIVE "release not found" answer allows the bare/failed-tag repair path; any other
+lookup failure — after a bounded retry — is treated as "assume published", so the guard refuses the
+force-move.
+
 ### 14.3 Nightly channel
 
 Every night (and on demand) builds `main` HEAD for every OS/arch and publishes a GitHub

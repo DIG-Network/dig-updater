@@ -190,6 +190,30 @@ fn force_recut_refuses_to_move_a_published_release_onto_a_different_commit() {
 }
 
 #[test]
+fn force_guard_fails_closed_on_a_transient_gh_lookup_error() {
+    let wf = nightly_release();
+    // #699: the "is there a PUBLISHED release at this tag?" lookup must FAIL CLOSED. A transient
+    // GitHub API error (network / 5xx) must never be read as "no published release" and thus
+    // permission to force-move a shipped tag. The old `gh release view ... || echo "false"` did
+    // exactly that. The guard must (a) NOT default the published flag to false on ANY gh failure,
+    // and (b) on an unknown/transient failure assume PUBLISHED so the move is refused.
+    assert!(
+        !wf.contains(r#"IS_PUBLISHED_RELEASE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft == false' 2>/dev/null || echo "false")"#),
+        "the force guard must not fall back to `|| echo \"false\"` — a transient gh error would be \
+         read as 'no published release' and let the force-move through (fail-open)"
+    );
+    assert!(
+        wf.contains("fail-closed") || wf.contains("fail closed"),
+        "the force guard must document + implement a fail-CLOSED path for a gh lookup error"
+    );
+    assert!(
+        wf.contains(r#"IS_PUBLISHED_RELEASE="true""#),
+        "on an unknown/transient gh lookup failure the guard must set IS_PUBLISHED_RELEASE=true \
+         (assume published → refuse the force-move)"
+    );
+}
+
+#[test]
 fn nightly_job_publishes_a_dated_and_a_rolling_prerelease() {
     let wf = nightly_release();
     assert!(
