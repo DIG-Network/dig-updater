@@ -44,7 +44,7 @@ members = [
 # The RELEASE version of the beacon. The nightly-release orchestrator + version-increment CI read
 # this `[workspace.package].version` from the ROOT manifest (§3.6 / SPEC §14); the members inherit
 # it via `version.workspace = true`, so a release fires off this single value.
-version = "0.14.3"
+version = "0.14.4"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-updater"
@@ -80,7 +80,7 @@ tempfile = "3"
 fs4 = { version = "1.1.0", features = ["sync"] }
 
 [workspace.dependencies.windows]
-version = "0.58"
+version = "0.62"
 features = [
     "Win32_Foundation",
     "Win32_Security",
