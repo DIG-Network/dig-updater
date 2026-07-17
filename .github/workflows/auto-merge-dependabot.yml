@@ -1,0 +1,106 @@
+# Auto-merge Dependabot dependency-bump PRs once every required branch-protection check is green.
+#
+# Why this is more than a one-line `gh pr merge --auto`: every PR to `main` must pass the
+# required "Check version increment" gate (§2.4a), which a raw Dependabot PR fails because it
+# bumps a DEPENDENCY, not this repo's own [workspace.package].version. So for backwards-compatible
+# (patch/minor) updates this workflow bumps this repo's patch version on the Dependabot branch,
+# syncs Cargo.lock, and pushes with RELEASE_TOKEN — a PAT push (not GITHUB_TOKEN) so the required
+# checks re-run on the new commit — then enables auto-merge. The version bump is also what makes
+# the DIG-crate cascade (#681/#905) actually CUT a release for each dependency update.
+#
+# semver-MAJOR updates are NOT auto-merged: a comment flags them for human review, since a major
+# dependency bump can be breaking even when CI is green.
+#
+# GitHub performs the merge itself only after all required checks pass and every review thread is
+# resolved (branch protection, §3.6b), so a bump that fails CI never merges.
+name: Auto-merge Dependabot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Least-privilege at the top level (GHAS/CodeQL flags its absence, §2.4a); the job widens only
+# what it needs.
+permissions:
+  contents: read
+
+jobs:
+  auto-merge:
+    # Only act on Dependabot's own PRs. On the synchronize event our version-bump push fires (as
+    # the RELEASE_TOKEN owner, not dependabot[bot]), so this guard is false there — no bump loop.
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---- semver-MAJOR: flag for human review, do not auto-merge ----
+      - name: Flag major bump for human review
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "⚠️ **Major version bump — needs human review.** A semver-MAJOR dependency update can be breaking even when CI is green, so auto-merge is intentionally *not* enabled here. Please review and merge manually if appropriate."
+
+      # ---- patch/minor: bump this repo's version so the version gate passes, then auto-merge ----
+      - name: Checkout Dependabot branch
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          # RELEASE_TOKEN (a PAT), NOT GITHUB_TOKEN: a GITHUB_TOKEN push would not re-trigger the
+          # required PR checks on the new commit, leaving the PR stuck awaiting statuses.
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Install Rust
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump patch version + sync lockfile
+        id: bump
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: |
+          set -euo pipefail
+          # Read [workspace.package].version (falls back to [package].version) from the root manifest.
+          current="$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.toml","rb")); print(d.get("workspace",{}).get("package",{}).get("version") or d.get("package",{}).get("version"))')"
+          IFS=. read -r major minor patch <<< "$current"
+          next="${major}.${minor}.$((patch + 1))"
+          echo "Bumping version ${current} -> ${next}"
+          # Replace only the first `version = "x.y.z"` line (the workspace/package version), not
+          # dependency version pins further down the manifest.
+          python3 - "$current" "$next" <<'PY'
+          import re, sys
+          cur, nxt = sys.argv[1], sys.argv[2]
+          text = open("Cargo.toml", encoding="utf-8").read()
+          text, n = re.subn(r'(?m)^version = "%s"$' % re.escape(cur), 'version = "%s"' % nxt, text, count=1)
+          assert n == 1, "expected exactly one workspace/package version line to bump"
+          open("Cargo.toml", "w", encoding="utf-8").write(text)
+          PY
+          # Sync only workspace-member versions in Cargo.lock (leaves dependency resolution alone).
+          cargo update --workspace
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit + push version bump
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "build(deps): bump version to ${{ steps.bump.outputs.next }} for dependency update"
+          git push
+
+      - name: Enable auto-merge (squash)
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"

@@ -1,0 +1,35 @@
+# Dependabot keeps this repo's dependencies current so crate updates (and the DIG-crate
+# version cascade, #681/#905) land automatically instead of by hand. Runs on a DAILY schedule
+# (Dependabot has no per-release webhook — "auto-bump within a day", acceptable for the cascade).
+#
+# Update PRs are auto-merged once every branch-protection check is green — see
+# .github/workflows/auto-merge-dependabot.yml. That workflow bumps this repo's own
+# [workspace.package].version on each bump branch, so the required "Check version increment"
+# gate passes and a per-repo release is cut from the update.
+#
+# Minor + patch updates are GROUPED into a single PR to cut noise; semver-MAJOR updates come as
+# separate PRs and are NOT auto-merged (a human reviews the potential breaking change).
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "07:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    # `build(deps): …` / `build(deps-dev): …` — a valid Conventional Commit (commitlint-clean),
+    # and `build` maps to a patch bump for the release-gate SemVer decision (§2.4/§3.2).
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    groups:
+      # One PR for all backwards-compatible (minor + patch) version updates. semver-MAJOR is
+      # deliberately excluded so it arrives as its own PR for human review (not auto-merged).
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
