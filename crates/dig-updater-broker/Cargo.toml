@@ -13,8 +13,9 @@ dig-updater-worker = { path = "../dig-updater-worker" }
 # The SHARED, already-released component-resolution + Install/Update/Skip decision matrix
 # (factored out of dig-installer, #508). The broker consumes `detect_installed_version` + `decide`
 # so the enumeration decision is IDENTICAL to what the installer ships — never a second copy that
-# could drift (SPEC §12, CLAUDE.md §4.1 release-first). Pinned to the released tag.
-dig-release-resolver = { git = "https://github.com/DIG-Network/dig-release-resolver", tag = "v0.1.0" }
+# could drift (SPEC §12, CLAUDE.md §4.1 release-first). Consumed from crates.io by version
+# (NC-7: pull DIG crates from crates.io by version, never a bare git dep — epic #681).
+dig-release-resolver = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
