@@ -13,9 +13,14 @@ version: 2
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
+    # Run several hours BEFORE the 00:00 UTC nightly release (§3.6-A nightly-release.yml cron): the
+    # daily bump PRs must open -> CI runs -> auto-merge lands before the nightly picks them up, so the
+    # nightly ships the latest deps. 20:00 UTC leaves ~4h margin for CI (the coverage job runs ~13min)
+    # plus serialized auto-merges. A bump that FAILS CI simply doesn't auto-merge — the nightly then
+    # proceeds without it and never ships a broken bump. Widen the margin only if a repo's CI is slower.
     schedule:
       interval: "daily"
-      time: "07:00"
+      time: "20:00"
       timezone: "Etc/UTC"
     open-pull-requests-limit: 5
     # `build(deps): …` / `build(deps-dev): …` — a valid Conventional Commit (commitlint-clean),
