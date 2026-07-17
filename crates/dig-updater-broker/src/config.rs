@@ -50,6 +50,11 @@ pub enum Channel {
 }
 
 impl Channel {
+    /// Every channel variant, so callers that must act on ALL channels (e.g. hardening + ACL
+    /// self-checking every per-channel `lkg/<channel>` subdir, #699) enumerate them exhaustively
+    /// instead of hardcoding the token list.
+    pub const ALL: [Self; 2] = [Self::Nightly, Self::Stable];
+
     /// The wire/CLI token for this channel (`"nightly"` / `"stable"`) — the SAME token that appears
     /// on the feed path (`/v1/<token>`, SPEC §10.1) and in `config.json`/`status.json`.
     #[must_use]

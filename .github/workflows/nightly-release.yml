@@ -152,7 +152,34 @@ jobs:
                 TAG_COMMIT="$(git ls-remote origin "refs/tags/$TAG" 2>/dev/null | cut -f1)"
               fi
               HEAD_COMMIT="$(git rev-parse HEAD)"
-              IS_PUBLISHED_RELEASE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft == false' 2>/dev/null || echo "false")"
+              # Resolve whether a PUBLISHED release exists for this tag, FAIL-CLOSED on a transient
+              # gh error (#699): a network / 5xx blip must NEVER be read as "no published release"
+              # and thus permission to force-move a shipped tag. Only a DEFINITIVE "release not
+              # found" allows the bare-tag repair path; any other failure — after retries — is
+              # treated as "assume published" so the guard refuses the move.
+              IS_PUBLISHED_RELEASE="false"
+              gh_lookup_failed="true"
+              for attempt in 1 2 3; do
+                if view_out="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft == false' 2>gh_view_err)"; then
+                  IS_PUBLISHED_RELEASE="$view_out"
+                  gh_lookup_failed="false"
+                  break
+                fi
+                if grep -qi 'release not found\|not found\|no release' gh_view_err; then
+                  # Definitive: no release exists at this tag — a legitimate bare/failed-tag repair.
+                  IS_PUBLISHED_RELEASE="false"
+                  gh_lookup_failed="false"
+                  break
+                fi
+                echo "::warning::gh release view for $TAG failed (attempt $attempt): $(cat gh_view_err)"
+                sleep $((attempt * 3))
+              done
+              rm -f gh_view_err
+              if [ "$gh_lookup_failed" = "true" ]; then
+                # fail-closed: an unresolved/transient gh error → assume PUBLISHED → refuse the move.
+                IS_PUBLISHED_RELEASE="true"
+                echo "::warning::could not confirm release state for $TAG after retries — assuming PUBLISHED (fail-closed)."
+              fi
               if [ "$IS_PUBLISHED_RELEASE" = "true" ] && [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
                 echo "::error::refusing to force-move $TAG — a PUBLISHED release already exists for it and the tag points at a different commit ($TAG_COMMIT) than this run's target ($HEAD_COMMIT). force is only for re-cutting the SAME commit (a failed-build retry) or repairing a tag with no published release. Bump the version instead of overwriting a shipped release."
                 exit 1

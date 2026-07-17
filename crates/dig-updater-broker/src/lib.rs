@@ -511,6 +511,12 @@ impl Broker {
             (self.lkg_dir(), Repair::IfOwned),
             (self.apply_dir(), Repair::IfOwned),
         ];
+        // The per-channel `lkg/<channel>` subdirs are where snapshots actually land and are
+        // hardened every pass ([`Self::run_pass`]); guard them too so the ACL self-check covers
+        // exactly what it hardens (self-check symmetry, #699).
+        for channel in Channel::ALL {
+            paths.push((self.lkg_dir_for(channel), Repair::IfOwned));
+        }
         if let Ok(exe) = std::env::current_exe() {
             paths.push((exe, Repair::Never));
         }
@@ -728,6 +734,26 @@ mod tests {
         assert!(guarded
             .iter()
             .all(|(_, r)| *r == Repair::IfOwned || *r == Repair::Never));
+    }
+
+    #[test]
+    fn guarded_paths_cover_every_per_channel_lkg_subdir() {
+        // #699: snapshots land in the per-channel `lkg/<channel>` subdir, hardened every pass. The
+        // ACL self-check must classify+repair the SAME directories it hardens, so every channel's
+        // lkg subdir — not only the `lkg/` root — is in the guarded set (self-check symmetry).
+        let broker = Broker::with_paths(PathBuf::from("/var/lib/dig-updater"), PathBuf::from("x"));
+        let guarded = broker.guarded_paths();
+        for channel in Channel::ALL {
+            let subdir = broker.lkg_dir_for(channel);
+            assert!(
+                guarded
+                    .iter()
+                    .any(|(p, r)| p == &subdir && *r == Repair::IfOwned),
+                "guarded_paths omits the {} lkg subdir {}",
+                channel.as_str(),
+                subdir.display()
+            );
+        }
     }
 
     #[test]
