@@ -261,35 +261,67 @@ fn nightly_job_prunes_to_a_retention_window() {
 }
 
 #[test]
-fn dispatch_reachable_jobs_are_bound_to_the_main_ref() {
-    // #616 (mirrors feed.yml's H1, #540): the stable + nightly-meta jobs push tags + a changelog
-    // commit to main with RELEASE_TOKEN (past branch protection). Both are workflow_dispatch-
-    // reachable, so a dispatch selected against a non-main branch could push THAT branch's commits.
-    // Each dispatch-reachable job's `if:` must therefore bind to `github.ref == 'refs/heads/main'`,
-    // so an off-main dispatch is an inert no-op. The cron + the production dispatch both run on main.
+fn stable_is_cut_from_a_release_branch_nightly_stays_on_main() {
+    // Epic #1049: the stable line moved OFF main. The STABLE job now cuts from a `release/X.Y`
+    // branch (bound to `refs/heads/release/*`), while the NIGHTLY channel stays main-HEAD (the
+    // nightly-meta job stays bound to `refs/heads/main`). A dispatch selected against the wrong ref
+    // is an inert no-op for the wrong channel. This mirrors feed.yml's H1 ref-bind (#540/#616) —
+    // the fleet-reaching push capability is bound to a curated ref, not any branch.
     let wf = nightly_release();
-    let guards = wf.matches("github.ref == 'refs/heads/main'").count();
+    let stable_if = job_if_condition(&wf, "stable:");
     assert!(
-        guards >= 2,
-        "both the `stable` and `nightly-meta` job `if:` conditions must bind to \
-         `github.ref == 'refs/heads/main'` (found {guards} occurrences)"
+        stable_if.contains("startsWith(github.ref, 'refs/heads/release/')"),
+        "the STABLE job `if:` must bind to `startsWith(github.ref, 'refs/heads/release/')` — \
+         stable is cut from a release branch, never from main. stable `if:`:\n{stable_if}"
+    );
+    assert!(
+        !stable_if.contains("github.ref == 'refs/heads/main'"),
+        "the STABLE job must NOT be bound to main any more — it cuts from release/X.Y. \
+         stable `if:`:\n{stable_if}"
+    );
+    let nightly_meta_if = job_if_condition(&wf, "nightly-meta:");
+    assert!(
+        nightly_meta_if.contains("github.ref == 'refs/heads/main'"),
+        "the NIGHTLY channel must stay main-HEAD (nightly-meta bound to `refs/heads/main`) — \
+         only the stable line moved to release branches. nightly-meta `if:`:\n{nightly_meta_if}"
+    );
+}
+
+#[test]
+fn stable_checks_out_and_pushes_the_dispatched_release_branch() {
+    // The changelog commit + tag land on the CURATED release branch the dispatch selected, never on
+    // main. Both the checkout ref and the changelog push target must be `github.ref_name` (the
+    // dispatched `release/X.Y`), so main keeps moving independently.
+    let wf = nightly_release();
+    assert!(
+        wf.contains("ref: ${{ github.ref_name }}"),
+        "the stable job must check out the dispatched release branch (`ref: github.ref_name`), \
+         not a hardcoded `ref: main`"
+    );
+    assert!(
+        wf.contains("HEAD:${{ github.ref_name }}"),
+        "the stable changelog commit must be pushed to the dispatched release branch \
+         (`HEAD:github.ref_name`), not `HEAD:main`"
+    );
+    assert!(
+        !wf.contains("git push origin \"HEAD:main\""),
+        "the stable job must no longer push the changelog commit to main — it lands on release/X.Y"
     );
 }
 
 #[test]
 fn schedule_cuts_only_nightlies_stable_is_manual_dispatch_only() {
-    // CLAUDE.md §3.6-A (user 2026-07-16 policy clarification): in `modules/apps`, a stable
-    // `vX.Y.Z` tag is cut ONLY by a manual `workflow_dispatch(channel: stable|both)`. The
-    // midnight CRON cuts ONLY nightlies — the schedule MUST NOT reach the stable changelog+tag
-    // job. So the STABLE job's `if:` must gate on `workflow_dispatch` and MUST NOT contain a
-    // `github.event_name == 'schedule'` disjunct (a schedule run would otherwise `git push
-    // origin HEAD:main` a release without a human dispatching it).
+    // Epic #1049 / CLAUDE.md §3.6: a stable `vX.Y.Z` tag is cut ONLY by a manual
+    // `workflow_dispatch(channel: stable|both)` against a release branch. The midnight CRON runs on
+    // main and cuts ONLY nightlies — it MUST NOT reach the stable changelog+tag job (the release/*
+    // ref-bind already blocks it, but the workflow_dispatch gate is defense in depth). So the STABLE
+    // job's `if:` must gate on `workflow_dispatch` and MUST NOT contain a `schedule` disjunct.
     let wf = nightly_release();
     let stable_if = job_if_condition(&wf, "stable:");
     assert!(
         !stable_if.contains("github.event_name == 'schedule'"),
         "the STABLE job `if:` must NOT be reachable from a `schedule` event — the cron cuts \
-         nightlies only; stable is manual-dispatch-only (CLAUDE.md §3.6-A). stable `if:`:\n{stable_if}"
+         nightlies only; stable is manual-dispatch-only (epic #1049). stable `if:`:\n{stable_if}"
     );
     assert!(
         stable_if.contains("github.event_name == 'workflow_dispatch'"),

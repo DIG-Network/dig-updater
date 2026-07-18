@@ -679,10 +679,13 @@ For every configured component the signer resolves that channel's GitHub release
 per-OS/arch assets, downloads each, and records its SHA-256 + size. Which release, which version,
 and which `build` scale depend on the **channel**:
 
-- **stable** — the newest NON-prerelease release (`releases/latest`). The version is the release
-  tag with any leading `v` stripped (`v0.29.0` → `0.29.0`), and the `build` is the packed monotonic
-  number `major·10⁶ + minor·10³ + patch`, so a higher release always sorts higher (§5.3);
-  `minor`/`patch` MUST stay below 1000 to preserve that ordering.
+- **stable** — the newest NON-prerelease release (`releases/latest`). This resolution is
+  BRANCH-AGNOSTIC: a stable `vX.Y.Z` originates from a `release/X.Y` branch (§14.2), but is published
+  with `make_latest: true`, so it resolves here via `releases/latest` regardless of its origin branch
+  — the feed needs no knowledge of the release-branch model. The version is the release tag with any
+  leading `v` stripped (`v0.29.0` → `0.29.0`), and the `build` is the packed monotonic number
+  `major·10⁶ + minor·10³ + patch`, so a higher release always sorts higher (§5.3); `minor`/`patch`
+  MUST stay below 1000 to preserve that ordering.
 - **nightly** — the rolling `nightly` release (`releases/tags/nightly`, #590). Its tag carries no
   version, so the version (`X.Y.Z-nightly.YYYYMMDD.<sha>`) is RECOVERED from the asset file names,
   and the FULL prerelease string is recorded as the manifest `version` (so the beacon compares
@@ -1152,7 +1155,21 @@ This section governs how **the beacon itself** is built and released — distinc
 nightlies implementation** for a Rust-binary stack; the shape below is the template other releasing
 submodules copy.
 
-Releases are **batched to a nightly cron plus manual dispatch** — NOT cut on every merge to `main`.
+Releases follow the **release-branch model** (epic #1049): the **nightly** channel is cut from
+`main` HEAD (a nightly cron), and the **stable** channel is cut from deliberate `release/X.Y`
+branches — NOT from `main`, and NOT on merge. There are two independent version streams:
+
+- **`main`** — the leading DEV trunk. Its `[workspace.package].version` is always AHEAD of the newest
+  release line (`X.(Y+1).0` and up); per-PR bumps accumulate toward the NEXT stable line. Nightlies
+  cut here.
+- **`release/X.Y`** — a curated STABLE line, branched off `main` at a chosen good commit by
+  `cut-release-branch.yml` (§14.7). Its version starts at the deliberate `X.Y.0` set in the
+  release-prep commit and walks the patch on stabilization/hotfix (`X.Y.1`, `X.Y.2`, …). Stable
+  `vX.Y.Z` tags are cut FROM this branch.
+
+The stable version is DELIBERATE at branch-cut (release-prep), not the accidental sum of per-PR
+bumps on `main`.
+
 Two channels ship from one orchestrator (`.github/workflows/nightly-release.yml`):
 
 ### 14.1 Trigger
@@ -1164,22 +1181,28 @@ The orchestrator triggers ONLY on:
 - `workflow_dispatch` with two inputs: `channel` (`both` | `stable` | `nightly`, default `both`) and
   `force` (boolean, default `false`).
 
-It MUST NOT trigger on `push` to `main`. A schedule run cuts ONLY the nightly channel — the STABLE
-`vX.Y.Z` tag is cut solely by a manual `workflow_dispatch` (`channel: stable` or `both`), never by
-the cron (a scheduled `both` = nightly only). This is CLAUDE.md §3.6-A: in `modules/apps`, a stable
-release is manual-dispatch-only, so a fleet-reaching version tag is always a deliberate human act.
-A dispatch runs the selected channel(s).
+It MUST NOT trigger on `push`. The schedule runs on `main` and cuts ONLY the nightly channel — the
+STABLE `vX.Y.Z` tag is cut solely by a manual `workflow_dispatch` (`channel: stable` or `both`)
+selected against a `release/X.Y` branch, never by the cron. A fleet-reaching version tag is always a
+deliberate human act (CLAUDE.md §3.6).
 
-**Dispatch-reachable jobs are bound to `main` (defense-in-depth).** Every job that pushes a tag or a
-changelog commit with `RELEASE_TOKEN` (the `stable` job's `git push origin HEAD:main`; the
-`nightly-meta` job the nightly tag/publish gate on) MUST carry an `if: github.ref == 'refs/heads/main'`
-guard on its `if:` condition — mirroring `feed.yml`'s H1 signing guard. `workflow_dispatch` runs the
-workflow FROM the selected ref, so without this guard a dispatch (`channel=stable`) selected against a
-NON-main branch would checkout that branch and push ITS commits to `main` (past branch protection,
-since the release changelog commit rides `enforce_admins=false`) and cut a fleet-reaching `vX.Y.Z`.
-The cron always runs on `main` and the production dispatch is always against `main`, so the guard
-costs nothing legitimate. The true boundary remains who-can-dispatch (write access) + a main-only
-environment-scoped `RELEASE_TOKEN`; the ref guard is accident/abuse protection on top.
+**Each channel's push-capable job is bound to its curated ref (defense-in-depth).** Every job that
+pushes a tag or a changelog commit with `RELEASE_TOKEN` MUST bind its `if:` to the ref its channel is
+cut from — mirroring `feed.yml`'s H1 signing guard:
+
+- the `stable` job binds to `startsWith(github.ref, 'refs/heads/release/')` and pushes the changelog
+  commit to `github.ref_name` (the dispatched `release/X.Y`), so a dispatch selected against `main`
+  (or any non-release ref) is an inert no-op — the changelog + tag land ONLY on a curated release
+  line;
+- the `nightly-meta` job (the nightly tag/publish gate) stays bound to
+  `github.ref == 'refs/heads/main'`, so nightlies are always cut from reviewed `main` HEAD.
+
+`workflow_dispatch` runs the workflow FROM the selected ref, so without these guards a dispatch could
+checkout an arbitrary branch and push ITS commits (past protection, since the release changelog
+commit rides `enforce_admins=false`/the release ruleset bypass). The cron + production dispatches
+always run on the right ref, so the guards cost nothing legitimate. The true boundary remains
+who-can-dispatch (write access) + a scoped `RELEASE_TOKEN`; the ref guards are accident/abuse
+protection on top.
 
 **60-day auto-disable caveat.** GitHub auto-disables a `schedule:` trigger after 60 days with no
 repo activity on a public repo, with no auto-re-enable — and since this cron is the ONLY automatic
@@ -1191,19 +1214,28 @@ nightly-release.yml` (see `runbooks/release.md`). Any repo activity resets the 6
 
 ### 14.2 Stable channel
 
-Cuts a semver `vX.Y.Z` **stable** release when — and only when — the version in the root
+Cut from a `release/X.Y` branch (dispatch selected against that branch, `channel: stable|both`).
+Cuts a semver `vX.Y.Z` **stable** release when — and only when — the version in the branch's root
 `Cargo.toml` (`[workspace.package].version`) has advanced beyond the newest existing `vX.Y.Z` tag.
 The **skip-if-already-tagged** check IS the version-changed check: an unchanged version means the tag
 already exists, so the run is a no-op. Cutting a release means: `git-cliff` regenerates
-`CHANGELOG.md` from the Conventional-Commit history, commits it to `main` as `chore(release): vX.Y.Z`,
-tags THAT commit `vX.Y.Z` (so the changelog is inside the tag), and pushes commit + tag with
-`RELEASE_TOKEN`. The pushed `v*` tag fires `release.yml`, which builds every OS/arch and publishes a
-GitHub Release with `prerelease: false` + `make_latest: true` — the stable release is the ONLY one
-that moves `latest`.
+`CHANGELOG.md` from the Conventional-Commit history, commits it to the RELEASE BRANCH
+(`github.ref_name`) as `chore(release): vX.Y.Z`, tags THAT commit `vX.Y.Z` (so the changelog is
+inside the tag), and pushes commit + tag with `RELEASE_TOKEN`. The pushed `v*` tag fires
+`release.yml`, which builds every OS/arch and publishes a GitHub Release with `prerelease: false` +
+`make_latest: true` — the stable release is the ONLY one that moves `latest`.
+
+**Branch-agnostic to consumers (beacon coherence, load-bearing).** The tag's origin branch is
+invisible downstream: the feed resolves the stable channel via `releases/latest` (§10.3), and
+`release.yml` always publishes with `make_latest: true`, so a `vX.Y.Z` cut from `release/X.Y` is
+resolved and served identically to one cut from anywhere else — **no feed logic changes for the
+release-branch model** (`feed.yml` is untouched). INVARIANT: the stable cut MUST keep
+`make_latest: true` on the published release, or the `releases/latest` resolution would pick the
+wrong (or a stale) release.
 
 `force: true` on a manual dispatch bypasses the skip-if-tagged guard and re-cuts the current version
-(moving the existing tag onto a fresh changelog commit — `main` is never force-pushed). This is the
-manual "re-release this version" escape hatch (e.g. after a failed build).
+(moving the existing tag onto a fresh changelog commit — the release branch is never force-pushed).
+This is the manual "re-release this version" escape hatch (e.g. after a failed build).
 
 **Force is guarded against mutating a published release (supply-chain invariant).** A force re-cut
 MUST be refused — with a non-zero exit and a clear error — when BOTH: (a) a PUBLISHED (non-draft)
@@ -1261,7 +1293,33 @@ tags/releases.
 
 | Workflow | Trigger | Role |
 |---|---|---|
-| `nightly-release.yml` | `schedule` (midnight UTC) + `workflow_dispatch` | The orchestrator: stable channel (changelog + tag) and nightly channel (build + dated/rolling pre-release + prune). |
-| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the STABLE GitHub Release for a `vX.Y.Z` tag. |
+| `cut-release-branch.yml` | `workflow_dispatch` (on `main`) | Opens a stable line: branches `release/X.Y` off main + the `chore(release): prep vX.Y.0` commit + a "next dev cycle" PR bumping main to `X.(Y+1).0`. (§14.7) |
+| `nightly-release.yml` | `schedule` (midnight UTC) + `workflow_dispatch` | The orchestrator: stable channel (from `release/X.Y`, changelog + tag) and nightly channel (from `main` HEAD, build + dated/rolling pre-release + prune). |
+| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the STABLE GitHub Release for a `vX.Y.Z` tag (`make_latest: true`, branch-agnostic). |
 | `build-binaries.yml` | `workflow_call` | The reusable cross-OS build both channels invoke. |
 | `feed.yml` | `schedule` (every 6h) + dispatch | UNRELATED to this repo's release — signs the update FEED the beacon reads for OTHER components (§10). |
+
+### 14.7 Release-branch cut + `release/*` protection
+
+Opening a stable line is a deliberate act performed by `cut-release-branch.yml` (`workflow_dispatch`
+on `main`, inputs `version` = `X.Y.0` + `next_dev_version` = `X.(Y+1).0`). It MUST:
+
+- be bound to `github.ref == 'refs/heads/main'` (cut a line off reviewed `main` only);
+- REFUSE (non-zero exit, clear error) when the `release/X.Y` branch OR the `vX.Y.0` tag already
+  exists — no re-opening a line, no clobbering a shipped version;
+- branch `release/X.Y` off `main` HEAD, set `[workspace.package].version` = `X.Y.0`, sync
+  `Cargo.lock` with `cargo update --workspace`, and push the `chore(release): prep vX.Y.0` commit to
+  the new branch with `RELEASE_TOKEN`;
+- open a NORMAL PR (never a direct push) bumping `main` to `X.(Y+1).0`, so main's leading dev version
+  moves past the line and per-PR bumps accumulate toward the NEXT line;
+- no-op with a `::warning::` when `RELEASE_TOKEN` is absent (never a half-cut line).
+
+`release/*` branches are protected by a GitHub **ruleset** (`refs/heads/release/*`) carrying the SAME
+required-check set as `main` (fmt, clippy ×OS, test ×OS, coverage, build ×OS, scheduler ×OS,
+version-increment, commitlint) plus `required_conversation_resolution`, `strict` (up-to-date), and
+`required_linear_history`; the repo is squash-merge-only fleet-wide. The `RELEASE_TOKEN` identity is
+a scoped bypass actor so the `stable` job's changelog commit + the release-prep commit can land on
+the protected line (the same posture `main` uses via `enforce_admins=false`). The PR gates
+(`ci.yml`, `commitlint.yml`, `ensure-version-increment.yml`) trigger on `release/**` too, and the
+version-increment gate compares against the PR's actual base (`github.base_ref`) so a hotfix PR must
+increment vs the release line it targets.

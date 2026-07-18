@@ -8,6 +8,7 @@ on:
   pull_request:
     branches:
       - main
+      - 'release/**'
 
 concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
@@ -25,7 +26,9 @@ jobs:
       - name: Checkout base branch
         uses: actions/checkout@v4
         with:
-          ref: main
+          # Compare against the PR's ACTUAL base (main OR the release/X.Y line a hotfix targets),
+          # not a hardcoded main — a hotfix PR must increment vs the release branch it lands on.
+          ref: ${{ github.base_ref }}
           path: base-repo
       - name: Check version increment
         shell: bash

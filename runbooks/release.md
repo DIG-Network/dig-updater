@@ -1,19 +1,30 @@
-# Runbook — releasing dig-updater (nightly cron + manual dispatch)
+# Runbook — releasing dig-updater (nightly from main + stable from release/X.Y)
 
 How this repo's binaries (`dig-updater` + `dig-updater-worker`) are built and released. This is the
-ecosystem's **reference nightlies system** (#590); the normative contract is `SPEC.md` §14. It is
-distinct from the signed **feed** (`feed.yml`, `SPEC.md` §10), which is how the beacon reads updates
-for OTHER components — see `runbooks/` and `SPEC.md` §10 for the feed.
+ecosystem's **reference release-branch system** (epic #1049); the normative contract is `SPEC.md`
+§14. It is distinct from the signed **feed** (`feed.yml`, `SPEC.md` §10), which is how the beacon
+reads updates for OTHER components — see `SPEC.md` §10 for the feed.
+
+## The two version streams (read this first)
+
+There are TWO independent version streams, and they never collide:
+
+| Stream | Branch | Purpose | Version |
+|---|---|---|---|
+| **Leading dev / nightly** | `main` | The trunk. Nightlies cut here every night from HEAD. | `X.(Y+1).0` and up — always AHEAD of the newest release line; per-PR bumps accumulate toward the NEXT stable line. |
+| **Deliberate stable** | `release/X.Y` | A curated stable line, branched off main at a chosen good commit. Stable `vX.Y.Z` tags are cut FROM here; stabilized + hotfixed here. | `X.Y.0`, then `X.Y.1`, `X.Y.2` … (hotfixes walk the patch). |
+
+The stable version is **deliberate at branch-cut** (release-prep), not the accidental sum of per-PR
+bumps on main.
 
 ## TL;DR
 
-- Releases are **NOT cut on merge to `main`**. They are batched to a **nightly cron at midnight UTC**
-  plus **manual dispatch**.
-- **Stable** (`vX.Y.Z`): cut automatically when the `Cargo.toml` version was bumped (detected as
-  "the `vX.Y.Z` tag doesn't exist yet"), or on demand. `prerelease: false`, marked `latest`.
-- **Nightly**: built every night from `main` HEAD as a **pre-release** under a dated tag
-  `nightly-YYYYMMDD` + a rolling `nightly` tag. `prerelease: true`, never `latest`. Keeps the newest
-  14 dated nightlies.
+- Releases are **NOT cut on merge to `main`**.
+- **Nightly** (UNCHANGED): built every night from `main` HEAD at **midnight UTC** (+ manual
+  dispatch) as a **pre-release** under a dated tag `nightly-YYYYMMDD` + a rolling `nightly` tag.
+  `prerelease: true`, never `latest`. Keeps the newest 14 dated nightlies.
+- **Stable** (`vX.Y.Z`): cut from a `release/X.Y` BRANCH by a manual dispatch selected against that
+  branch — never from main, never by the cron. `prerelease: false`, `make_latest: true`.
 
 ## Prerequisites / credentials
 
@@ -43,25 +54,53 @@ its siblings.)
 
 ## Cut a STABLE release (the normal path)
 
-1. In your feature PR, bump `[workspace.package].version` in the root `Cargo.toml` per SemVer and run
-   `cargo update --workspace` so `Cargo.lock` matches (the version-increment CI gate requires the
-   bump; `--locked` builds require the lock in sync). Merge the PR (squash) as usual.
-2. Nothing releases on merge. At the next **midnight UTC** the `nightly-release.yml` cron runs its
-   **stable** job: it sees the new version has no `vX.Y.Z` tag, regenerates `CHANGELOG.md` with
-   git-cliff, commits `chore(release): vX.Y.Z` to `main`, tags it, and pushes with `RELEASE_TOKEN`.
-3. The pushed `v*` tag fires `release.yml`, which builds every OS/arch and publishes the stable
-   GitHub Release (with the changelog as notes).
+Stable is a two-step deliberate act: **(1) open the release line**, then **(2) cut `vX.Y.Z` from it**.
 
-### Cut a stable release NOW (don't wait for midnight)
+### Step 1 — open the release line (`cut-release-branch.yml`)
 
-Actions → **Nightly + stable release** → **Run workflow** → `channel: stable` (or `both`) → Run.
-Same logic as the cron, on demand.
+Actions → **Cut release branch** → **Run workflow** (against `main`) → inputs:
+
+- `version` = the deliberate first stable version for this line, e.g. `0.15.0` (must be `X.Y.0`).
+- `next_dev_version` = where main's leading dev version moves next, e.g. `0.16.0` (`X.(Y+1).0`).
+
+This branches `release/0.15` off main HEAD, sets `0.15.0` on it in a `chore(release): prep v0.15.0`
+commit, pushes the branch, and opens a **"next dev cycle" PR** bumping main to `0.16.0`. Review +
+merge that PR so main moves ahead. The workflow REFUSES if `release/0.15` or `v0.15.0` already
+exists.
+
+### Step 2 — cut `vX.Y.Z` from the release line
+
+Actions → **Nightly + stable release** → **Run workflow** → **set the branch/ref to `release/0.15`**
+→ `channel: stable` → Run. The stable job (bound to `refs/heads/release/*`) sees `v0.15.0` has no
+tag yet, regenerates `CHANGELOG.md` with git-cliff, commits `chore(release): v0.15.0` **to
+`release/0.15`**, tags it, and pushes with `RELEASE_TOKEN`. The pushed `v*` tag fires `release.yml`,
+which builds every OS/arch and publishes the stable GitHub Release with `make_latest: true`.
+
+> The tag's ORIGIN branch is invisible to consumers: the beacon feed resolves stable via
+> `releases/latest` (SPEC §10.3), and `release.yml` always publishes with `make_latest: true`, so a
+> `vX.Y.Z` cut from `release/X.Y` is served identically to one cut from anywhere. **Invariant: never
+> drop `make_latest: true` from the stable release** or the feed would resolve the wrong release.
+
+### Stabilize a release line (bugfixes before the first cut)
+
+Open PRs **against `release/X.Y`** (not main) with fixes; bump the patch (`X.Y.1`, …) in the PR. The
+same PR gates run (`ci.yml`, `commitlint.yml`, `ensure-version-increment.yml` all trigger on
+`release/**`; the version-increment gate compares against the release branch base). Then cut the
+patch via Step 2.
+
+### Hotfix a shipped release + forward-port
+
+1. PR the fix to `release/X.Y`, bumping the patch to `X.Y.(Z+1)`.
+2. Cut `vX.Y.(Z+1)` via Step 2 (dispatch stable against `release/X.Y`).
+3. **Forward-port** the fix to `main` (cherry-pick or a fresh PR) so the next release line carries
+   it — otherwise the fix regresses in the next `X.(Y+1)` line.
 
 ### Re-cut / re-release the current version (e.g. after a failed build)
 
-Actions → **Nightly + stable release** → **Run workflow** → `channel: stable`, **`force: true`** →
-Run. `force` bypasses the skip-if-tagged guard and moves the existing `vX.Y.Z` tag onto a fresh
-changelog commit (`main` is never force-pushed), re-firing `release.yml`.
+Actions → **Nightly + stable release** → **Run workflow** → ref `release/X.Y`, `channel: stable`,
+**`force: true`** → Run. `force` bypasses the skip-if-tagged guard and moves the existing `vX.Y.Z`
+tag onto a fresh changelog commit (the release branch is never force-pushed), re-firing
+`release.yml`.
 
 `force` is guarded, not a blanket override: it REFUSES (non-zero exit, clear error) when the tag
 already has a PUBLISHED release AND currently points at a different commit than this run would
@@ -99,10 +138,11 @@ builds `main` HEAD, publishes/refreshes today's `nightly-YYYYMMDD` pre-release, 
 
 | File | Trigger | Role |
 |---|---|---|
-| `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (changelog + tag) + nightly (build + pre-release + prune). |
-| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag. |
+| `cut-release-branch.yml` | `workflow_dispatch` (on main) | Opens a stable line: branch `release/X.Y` off main + prep commit + "next dev cycle" PR. |
+| `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (from `release/*`, changelog + tag) + nightly (from main HEAD, build + pre-release + prune). |
+| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag (`make_latest: true`). |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build (both channels call it). |
-| `ci.yml` | PR + push to main | The full fmt/clippy/test/coverage/build gate (pre-merge). |
+| `ci.yml` / `commitlint.yml` / `ensure-version-increment.yml` | PR + push to `main` **and** `release/**` | The full pre-merge gate set — runs on release-branch PRs too (hotfix/stabilize). |
 
 ## Local build (dev)
 
