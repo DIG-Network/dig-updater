@@ -60,7 +60,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 base64 = "0.22"
 hex = "0.4"
-thiserror = "1"
+thiserror = "2"
 # The worker's only network dependency: a small, blocking HTTP/HTTPS client (rustls). The
 # beacon is a transient single-pass process, so blocking I/O is the right model and avoids an
 # async runtime in the security-sensitive fetch path.
