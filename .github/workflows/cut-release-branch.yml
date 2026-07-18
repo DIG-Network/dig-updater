@@ -1,0 +1,199 @@
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# CUT A RELEASE BRANCH (#1051 / epic #1049). This is the deliberate start of a STABLE line.
+#
+# The ecosystem's two version streams (SPEC §14, runbooks/release.md):
+#   • main         — the leading DEV trunk. Nightlies cut here every night (main HEAD, UNCHANGED).
+#   • release/X.Y  — a deliberate STABLE line, branched off main at a chosen good commit. Stable
+#                    `vX.Y.Z` tags are cut FROM this branch (nightly-release.yml `channel: stable`),
+#                    stabilized with cherry-picked fixes, and hotfixed as `vX.Y.(Z+1)`.
+#
+# This workflow performs the ONE deliberate act that opens a stable line:
+#   1. branches `release/X.Y` off main HEAD,
+#   2. sets the deliberate stable version on that branch in a `chore(release): prep vX.Y.0` commit
+#      (so the very first stable cut off the branch is exactly the version chosen here), and
+#   3. opens a "next dev cycle" PR bumping main to `X.(Y+1).0` — so main's leading version moves
+#      ahead of the release line and per-PR bumps accumulate toward the NEXT stable line, never
+#      colliding with the one just cut.
+#
+# The stable version is DELIBERATE at branch-cut (release-prep), not the accidental sum of per-PR
+# bumps on main — that gap is exactly what epic #1049 fixes.
+#
+# RELEASE_TOKEN posture: pushing the new `release/X.Y` branch + its prep commit lands on a branch
+# protected by the `release/*` ruleset (SPEC §14.7), which GITHUB_TOKEN cannot do. The bump-main PR
+# is a NORMAL PR through main's gates. If RELEASE_TOKEN is absent this workflow NO-OPS with a clear
+# warning rather than half-cutting a line. Bound to `github.ref == 'refs/heads/main'` (defense in
+# depth, mirroring the release orchestrator): the branch is always cut off REVIEWED main.
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+name: Cut release branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The deliberate stable version to open this line at (X.Y.0)."
+        type: string
+        required: true
+      next_dev_version:
+        description: "The next leading dev version main moves to (X.(Y+1).0)."
+        type: string
+        required: true
+
+concurrency:
+  # Serialize with itself so two dispatches can never race on branch/PR creation.
+  group: cut-release-branch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cut:
+    name: Branch release/X.Y + open next-dev PR
+    # Cut the line off REVIEWED main only (defense in depth — mirrors the release orchestrator's H1
+    # ref bind). A dispatch selected against any other ref is an inert no-op.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require RELEASE_TOKEN (else no-op)
+        id: token
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::warning::RELEASE_TOKEN is not set on this repo. Cutting a release branch is a NO-OP until the org-level PAT secret is added (see runbooks/release.md + SPEC.md §14). Nothing was cut."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate inputs
+        if: steps.token.outputs.present == 'true'
+        id: inputs
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          NEXT_DEV: ${{ inputs.next_dev_version }}
+        run: |
+          set -euo pipefail
+          # A release line opens at a `.0` patch — X.Y.0 — so the line's first stable cut is X.Y.0
+          # and hotfixes walk the patch (X.Y.1, X.Y.2, …). Reject anything else up front.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.0$'; then
+            echo "::error::version '$VERSION' must be X.Y.0 (a release line opens at patch 0)."
+            exit 1
+          fi
+          if ! printf '%s' "$NEXT_DEV" | grep -Eq '^[0-9]+\.[0-9]+\.0$'; then
+            echo "::error::next_dev_version '$NEXT_DEV' must be X.(Y+1).0."
+            exit 1
+          fi
+          XY="$(printf '%s' "$VERSION" | cut -d. -f1,2)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "next_dev=$NEXT_DEV" >> "$GITHUB_OUTPUT"
+          echo "xy=$XY" >> "$GITHUB_OUTPUT"
+          echo "branch=release/$XY" >> "$GITHUB_OUTPUT"
+          echo "Cutting release/$XY at $VERSION; main advances to $NEXT_DEV."
+
+      - name: Checkout main
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Refuse if the line already exists
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.inputs.outputs.branch }}
+          TAG: v${{ steps.inputs.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Idempotency + safety: never re-open an existing line or clobber a shipped version. Both
+          # the branch and the first stable tag must be absent, checked against the remote (the
+          # source of truth) so a stale local checkout cannot wave a duplicate through.
+          if git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+            echo "::error::$BRANCH already exists — the line is already open. Hotfix it via a PR to $BRANCH instead."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG already exists — refusing to open a line whose first stable version is already shipped. Choose a higher X.Y.0."
+            exit 1
+          fi
+
+      - name: Install Rust (to sync Cargo.lock)
+        if: steps.token.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set the deliberate stable version + sync lock
+        if: steps.token.outputs.present == 'true'
+        id: setver
+        shell: bash
+        env:
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" <<'PY'
+          import re, sys
+          version = sys.argv[1]
+          text = open("Cargo.toml", encoding="utf-8").read()
+          # Set the single [workspace.package] version members inherit via version.workspace = true.
+          new, n = re.subn(r'(?m)^(version\s*=\s*")[^"]+(")', rf'\g<1>{version}\g<2>', text, count=1)
+          if n != 1:
+              sys.exit("could not locate the [workspace.package] version line in Cargo.toml")
+          open("Cargo.toml", "w", encoding="utf-8").write(new)
+          PY
+          # `--workspace` limits the lockfile update to the workspace members (whose versions just
+          # changed) — it does NOT churn external dependencies. Keeps `--locked` builds green.
+          cargo update --workspace
+
+      - name: Push the release line + prep commit
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.inputs.outputs.branch }}
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "dig-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): prep v$VERSION"
+          # Lands on the ruleset-protected release branch via RELEASE_TOKEN's bypass (SPEC §14.7),
+          # the same enforce_admins=false posture main uses for the changelog commit.
+          git push origin "$BRANCH"
+          echo "Opened $BRANCH at v$VERSION. Cut the first stable with: Actions → Nightly + stable release → channel: stable, ref: $BRANCH."
+
+      - name: Open the "next dev cycle" PR (bump main)
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          NEXT_DEV: ${{ steps.inputs.outputs.next_dev }}
+          XY: ${{ steps.inputs.outputs.xy }}
+          BRANCH: ${{ steps.inputs.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # Advance main's LEADING dev version past the just-cut line, so per-PR bumps on main
+          # accumulate toward the NEXT stable line and never collide with release/X.Y. This is a
+          # normal PR through main's gates (not a direct push) — main stays PR-only.
+          DEV_BRANCH="chore/next-dev-$NEXT_DEV"
+          git checkout main
+          git checkout -b "$DEV_BRANCH"
+          python3 - "$NEXT_DEV" <<'PY'
+          import re, sys
+          version = sys.argv[1]
+          text = open("Cargo.toml", encoding="utf-8").read()
+          new, n = re.subn(r'(?m)^(version\s*=\s*")[^"]+(")', rf'\g<1>{version}\g<2>', text, count=1)
+          if n != 1:
+              sys.exit("could not locate the [workspace.package] version line in Cargo.toml")
+          open("Cargo.toml", "w", encoding="utf-8").write(new)
+          PY
+          cargo update --workspace
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): open dev cycle for v$NEXT_DEV"
+          git push origin "$DEV_BRANCH"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$DEV_BRANCH" \
+            --title "chore(release): open dev cycle for v$NEXT_DEV" \
+            --body "Automated by \`cut-release-branch.yml\`: the stable line \`$BRANCH\` was cut at \`v${NEXT_DEV%.*}\`… (see the release runbook). This advances main's leading dev version to \`v$NEXT_DEV\` so per-PR bumps accumulate toward the next stable line and never collide with \`$BRANCH\`. Nightlies keep cutting from main HEAD (unchanged)."

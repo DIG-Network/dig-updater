@@ -3,6 +3,12 @@
 # the beacon can track either (SPEC §10.1, #591):
 #
 #   • stable   (updates.dig.net/v1/stable/)  — each component resolved from `releases/latest`.
+#              This is BRANCH-AGNOSTIC by design: a stable `vX.Y.Z` now originates from a
+#              `release/X.Y` branch (epic #1049), but the stable release is published with
+#              `make_latest:true` (release.yml), so it resolves here via `releases/latest`
+#              regardless of which branch its tag was cut from — NO feed logic changes for the
+#              release-branch model. INVARIANT: the stable cut MUST keep `make_latest:true`, or this
+#              leg would resolve the wrong (or a stale) release. See SPEC §10.3 + §14.2.
 #   • nightly  (updates.dig.net/v1/nightly/) — each component resolved from the rolling `nightly`
 #                                              release (#590), build-dated YYYYMMDD.
 #

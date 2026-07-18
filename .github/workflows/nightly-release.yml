@@ -6,16 +6,16 @@
 # It replaces the old "tag-and-release-on-every-merge-to-main" model. Releases are no longer cut
 # per merge; they are batched to a nightly cron (+ manual dispatch), across two channels:
 #
-#   • STABLE channel  (job `stable`): the unchanged changelog+tag logic, now cut ONLY by a manual
-#     `workflow_dispatch` (channel: stable|both) — the midnight cron NEVER runs it (CLAUDE.md
-#     §3.6-A: in modules/apps a stable tag is manual-dispatch-only). It reads the version from
-#     Cargo.toml and cuts `vX.Y.Z` ONLY when that tag does not already exist — i.e. only when the
-#     version file was bumped since the last release (an unchanged version = the tag exists = a
-#     no-op). Cutting the tag = git-cliff
-#     regenerates CHANGELOG.md, commits it to main, tags that commit `vX.Y.Z`, and pushes both
-#     with RELEASE_TOKEN. The pushed `v*` tag then fires the STABLE binary build+publish
-#     (release.yml). This is the SAME stable path as before — only its trigger changed: it now
-#     fires solely on a manual dispatch, never on the cron.
+#   • STABLE channel  (job `stable`): the changelog+tag logic, cut from a `release/X.Y` BRANCH by a
+#     manual `workflow_dispatch` (channel: stable|both) selected against that branch — NEVER from
+#     main and NEVER by the cron (epic #1049 / CLAUDE.md §3.6). main is the leading DEV trunk;
+#     deliberate stable lines live on `release/X.Y` (opened by cut-release-branch.yml). It reads the
+#     version from the branch's Cargo.toml and cuts `vX.Y.Z` ONLY when that tag does not already
+#     exist (an unchanged version = the tag exists = a no-op). Cutting the tag = git-cliff
+#     regenerates CHANGELOG.md, commits it to the RELEASE BRANCH, tags that commit `vX.Y.Z`, and
+#     pushes both with RELEASE_TOKEN. The pushed `v*` tag then fires the STABLE binary build+publish
+#     (release.yml), which publishes with make_latest:true — so the tag's origin branch is
+#     irrelevant to consumers (the feed resolves stable via `releases/latest`, SPEC §10.3/§14.2).
 #
 #   • NIGHTLY channel (jobs `nightly-meta` → `nightly-build` → `nightly-publish`): every night it
 #     builds `main` HEAD and publishes a GitHub PRE-release (never `latest`) under a dated tag
@@ -73,23 +73,24 @@ jobs:
   # → commit + tag + push (RELEASE_TOKEN). The pushed `v*` tag fires release.yml (the binary build).
   stable:
     name: Stable — changelog + tag
-    # Manual-dispatch-ONLY (CLAUDE.md §3.6-A): a stable `vX.Y.Z` tag is cut solely by a human
-    # `workflow_dispatch(channel: stable|both)` — the midnight cron cuts nightlies only and MUST
-    # NOT reach this job (a scheduled `both` = nightly only). The
-    # `!startsWith(...chore(release):...)` guard is preserved from the on-merge era: it is INERT on
-    # dispatch (there is no `head_commit`), but it keeps the release changelog commit self-labelled
-    # so the loop stays safe even if a push trigger is ever re-introduced.
-    # #616 (mirrors feed.yml's H1, #540): the STABLE job does `git push origin HEAD:main` with
-    # RELEASE_TOKEN (past branch protection, `enforce_admins=false`) and cuts a fleet-reaching
-    # `vX.Y.Z`. Bind that capability to REVIEWED main code: a `workflow_dispatch(channel=stable)`
-    # selected against a NON-main branch would otherwise checkout that branch and push ITS commits to
-    # main. The cron always runs on main and the production dispatch is always against main, so this
-    # ref guard costs nothing legitimate — it closes the accident/abuse path. (The real boundary
-    # remains who-can-dispatch = write-access + a main-only environment-scoped RELEASE_TOKEN; this is
-    # defense-in-depth on top.)
+    # Cut from a RELEASE BRANCH, manual-dispatch-ONLY (epic #1049 / CLAUDE.md §3.6). A stable
+    # `vX.Y.Z` tag is cut solely by a human `workflow_dispatch(channel: stable|both)` selected
+    # against a `release/X.Y` branch — NOT from main. main is the leading DEV trunk (nightlies cut
+    # there); deliberate stable lines live on `release/X.Y` (cut by cut-release-branch.yml). The
+    # midnight cron runs on main, so it can NEVER reach this job (startsWith release/ is false) —
+    # the cron cuts nightlies only.
+    # The `!startsWith(...chore(release):...)` guard is preserved: it is INERT on dispatch (there is
+    # no `head_commit`), but it keeps the release changelog commit self-labelled so the loop stays
+    # safe even if a push trigger is ever re-introduced.
+    # #616 ref bind (now to release/*, mirrors feed.yml's H1, #540): the STABLE job does
+    # `git push origin HEAD:<release branch>` with RELEASE_TOKEN (past the release/* ruleset,
+    # bypass-actor) and cuts a fleet-reaching `vX.Y.Z`. Binding to `refs/heads/release/*` means a
+    # dispatch selected against main (or any non-release ref) is an inert no-op — the changelog +
+    # tag land ONLY on a curated release line. (The real boundary remains who-can-dispatch =
+    # write-access + a scoped RELEASE_TOKEN; this is defense-in-depth on top.)
     if: >-
       ${{
-        github.ref == 'refs/heads/main' &&
+        startsWith(github.ref, 'refs/heads/release/') &&
         !startsWith(github.event.head_commit.message, 'chore(release):') &&
         github.event_name == 'workflow_dispatch' &&
         (inputs.channel == 'stable' || inputs.channel == 'both')
@@ -113,7 +114,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: main
+          # Cut from the dispatched release branch (e.g. release/0.14), not main. The changelog +
+          # tag land on the curated stable line; main keeps moving with dev/nightly work.
+          ref: ${{ github.ref_name }}
           token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Resolve version + skip if already tagged
@@ -218,14 +221,15 @@ jobs:
           # skip it (the loop guard on the job `if:`).
           git commit -m "chore(release): ${{ steps.ver.outputs.tag }}" || echo "changelog unchanged"
           # A `force` re-cut moves an existing tag onto the fresh changelog commit; a normal cut
-          # creates a new tag. Main is NEVER force-pushed.
+          # creates a new tag. The release branch is NEVER force-pushed (the changelog commit lands
+          # on the curated `release/X.Y` line the dispatch selected, not on main).
           if [ "$FORCE_TAG" = "true" ]; then
             git tag -f -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
-            git push origin "HEAD:main"
+            git push origin "HEAD:${{ github.ref_name }}"
             git push -f origin "${{ steps.ver.outputs.tag }}"
           else
             git tag -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
-            git push origin "HEAD:main"
+            git push origin "HEAD:${{ github.ref_name }}"
             git push origin "${{ steps.ver.outputs.tag }}"
           fi
           echo "Pushed changelog commit + ${{ steps.ver.outputs.tag }} — release.yml (stable build) will fire."
