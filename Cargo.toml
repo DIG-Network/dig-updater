@@ -64,7 +64,7 @@ thiserror = "1"
 # The worker's only network dependency: a small, blocking HTTP/HTTPS client (rustls). The
 # beacon is a transient single-pass process, so blocking I/O is the right model and avoids an
 # async runtime in the security-sensitive fetch path.
-ureq = "2"
+ureq = "3"
 # OS privilege primitives for the privileged broker's sandboxed spawn (`sandbox.rs`) and — on
 # Unix — the state-dir hardening + single-instance lock's directory creation (`lock.rs`); Windows'
 # lock uses `fs4` instead of `libc` there (see below). These are the only `unsafe` surfaces in the
