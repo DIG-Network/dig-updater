@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-broker"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "base64 0.23.0",
  "dig-release-resolver",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-cli"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "dig-updater-broker",
  "dig-updater-trust",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-feedsign"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "base64 0.23.0",
  "dig-updater-trust",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-trust"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "base64 0.23.0",
  "ed25519-dalek",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-worker"
-version = "0.15.3"
+version = "0.15.4"
 dependencies = [
  "base64 0.23.0",
  "dig-updater-trust",
