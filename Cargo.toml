@@ -44,7 +44,7 @@ members = [
 # The RELEASE version of the beacon. The nightly-release orchestrator + version-increment CI read
 # this `[workspace.package].version` from the ROOT manifest (§3.6 / SPEC §14); the members inherit
 # it via `version.workspace = true`, so a release fires off this single value.
-version = "0.15.3"
+version = "0.15.4"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-updater"
@@ -58,7 +58,7 @@ serde = { version = "1", features = ["derive"] }
 # (`serde_json::value::RawValue`) instead of a re-serialization of the parsed struct — the
 # forward-compatibility fix at the heart of #504-D (SPEC §5.4).
 serde_json = { version = "1", features = ["raw_value"] }
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 thiserror = "1"
 # The worker's only network dependency: a small, blocking HTTP/HTTPS client (rustls). The
