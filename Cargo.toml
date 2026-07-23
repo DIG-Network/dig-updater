@@ -58,7 +58,7 @@ serde = { version = "1", features = ["derive"] }
 # (`serde_json::value::RawValue`) instead of a re-serialization of the parsed struct — the
 # forward-compatibility fix at the heart of #504-D (SPEC §5.4).
 serde_json = { version = "1", features = ["raw_value"] }
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 thiserror = "1"
 # The worker's only network dependency: a small, blocking HTTP/HTTPS client (rustls). The
