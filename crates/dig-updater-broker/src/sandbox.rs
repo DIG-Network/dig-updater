@@ -60,9 +60,17 @@ pub fn spawn_worker_process(
 /// the worker inherits the broker's identity (tests, non-root), the broker owner already has write
 /// access, so no chown is needed.
 ///
+/// Ownership and mode are not sufficient on their own: the dropped worker must also be able to
+/// TRAVERSE every ancestor down to `dir`. That is why staging lives BESIDE the locked-down state
+/// directory rather than inside it ([`crate::paths::sibling_staging_dir`]), and why this verifies
+/// the reachability it just arranged — a pass that cannot be reached by its own worker must fail
+/// HERE, naming the offending directory, instead of surfacing later as an opaque
+/// `staging_io_error: Permission denied (os error 13)` (#1747).
+///
 /// # Errors
 ///
-/// [`BrokerError::Io`] if the directory cannot be created, hardened, or chowned.
+/// [`BrokerError::Io`] if the directory cannot be created, hardened, or chowned, or if an ancestor
+/// denies the privilege-dropped worker the traverse right it needs to reach `dir`.
 pub fn prepare_worker_writable_dir(dir: &Path, sandbox: Sandbox) -> Result<(), BrokerError> {
     std::fs::create_dir_all(dir).map_err(|e| BrokerError::Io(e.to_string()))?;
     crate::secure::harden_state_dir(dir)?;
@@ -71,6 +79,16 @@ pub fn prepare_worker_writable_dir(dir: &Path, sandbox: Sandbox) -> Result<(), B
         if sandbox == Sandbox::Restricted && imp::is_root() {
             let (uid, gid) = imp::nobody_ids();
             imp::chown_dir(dir, uid, gid)?;
+            if let Some(blocker) =
+                crate::secure::first_untraversable_ancestor(dir, &crate::secure::filesystem_root())
+            {
+                return Err(BrokerError::Io(format!(
+                    "the worker identity cannot reach its staging directory {}: {} denies traverse \
+                     to any other identity",
+                    dir.display(),
+                    blocker.display()
+                )));
+            }
         }
     }
     #[cfg(not(unix))]

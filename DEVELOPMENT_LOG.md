@@ -433,3 +433,38 @@ one and it still fails on the next:
   `Description=`, and echo it in `dig-updater status` / `schedule status`. launchd has no friendly
   name — its identity IS the reverse-DNS `Label` (`net.dignetwork.dig-updater`). Machine identifiers
   stay canonical; the display name is legibility-only and is a cross-repo contract (#546).
+- **A privilege-separated directory needs OWNERSHIP, MODE, *and* an ancestor chain the owner can
+  traverse — the third is the one that gets forgotten.** The beacon created `<state_dir>/staging`,
+  chowned it to the `nobody` identity it drops the worker to, hardened it `0700`, and could then
+  never use it: `harden_state_dir` locks `<state_dir>` itself to `0700 root`, and entering a
+  directory requires the traverse right on every component above it. Ownership and mode were both
+  perfect; the directory was unreachable by its own owner. Every pass on every Linux install failed
+  `staging_io_error: Permission denied (os error 13)` and `trust_state.root_version` never left 0 —
+  auto-update was dead platform-wide (#1747). The fix is placement, not permission: staging is a
+  SIBLING of the state dir (`/var/lib/dig-updater-staging`), the same shape the world-readable
+  status mirror already used for the same reason. Granting the state dir `o+x` instead would have
+  worked and been WRONG: the per-channel trust state and `config.json` are written with the process
+  umask, so that `0700` is the only barrier standing between the anti-rollback high-water marks and
+  any local identity that knows the file names. Rule: when a hardened directory must hand a
+  subdirectory to a LESS privileged identity, put the subdirectory beside it, never inside it.
+- **A test on the wrong property passes against this whole class of defect.** "The staging
+  directories exist", "staging is `0700`", "staging is owned by the worker uid" — all true of the
+  broken install. Only traversability distinguishes the two states, so assert the ancestor chain and,
+  where a root runner is available, drop to the uid with `setpriv` and write. A placement fix also
+  needs its companion assertion: a test that only proves "staging is now reachable" is equally
+  satisfied by the `o+x` fix, so a second test pins that the state dir was NOT widened. Together the
+  pair admits only the intended fix.
+- **A scheduled one-shot that exits 0 on failure is invisible forever, and it hides the bug that
+  caused it.** `dig-updater run` returned `ExitCode::SUCCESS` for any completed pass, so systemd
+  logged `Deactivated successfully` over a pass that had applied nothing for a permission fault: an
+  enabled timer, a green unit, and no updates, indefinitely. The exit status is the only signal an
+  operator gets unprompted, so it must carry the fault — but a blanket non-zero is just as useless,
+  because a healthy beacon has nothing to do almost every night. The distinction that works is an
+  ALLOWLIST of benign no-op reasons (`already_running`, `paused`, plus any applied pass — "already
+  current" is an applied pass with all components `skipped`), failing closed on anything else
+  including an unrecognized or absent reason.
+- **A beacon broken before its install step cannot deliver its own fix.** The staging failure aborted
+  the pass before any component — including `dig-updater` itself — was installed, so no amount of
+  self-update could repair it. A defect in the pass PRELUDE (paths, permissions, locks, the ACL
+  self-check) is categorically not auto-recoverable and can only reach existing installs through a
+  reinstall channel. Worth weighing whenever code moves earlier in the pass than the self-update step.

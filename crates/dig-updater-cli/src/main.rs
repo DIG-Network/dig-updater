@@ -314,9 +314,32 @@ fn run_pass(feed_base: Option<String>, json: bool) -> ExitCode {
     match broker.run_once_with_feed(resolve_feed(feed_base)) {
         Ok(report) => {
             println!("{}", render_pass_report(&report, json));
-            ExitCode::SUCCESS
+            ExitCode::from(pass_exit_status(&report))
         }
         Err(e) => fail(&e, json),
+    }
+}
+
+/// The exit status a successful `dig-updater` path returns.
+const SUCCESS_EXIT_STATUS: u8 = 0;
+
+/// The exit status every failing `dig-updater` path returns.
+const FAILURE_EXIT_STATUS: u8 = 2;
+
+/// The process exit status one completed pass deserves: `0` when the beacon did its job (applied an
+/// update, or had nothing to do), [`FAILURE_EXIT_STATUS`] when the pass FAULTED
+/// ([`PassReport::is_fault`]).
+///
+/// This is what lets the scheduler surface a broken beacon. `dig-updater run` is invoked by a
+/// systemd timer / launchd / Task Scheduler, none of which read the report — they read the exit
+/// status, and a pass that returned 0 after failing for a permission fault presented an operator
+/// with an enabled timer, a green unit, and no updates, indefinitely (#1747). Pure, so both arms
+/// are pinned by tests.
+fn pass_exit_status(report: &PassReport) -> u8 {
+    if report.is_fault() {
+        FAILURE_EXIT_STATUS
+    } else {
+        SUCCESS_EXIT_STATUS
     }
 }
 
@@ -1183,6 +1206,80 @@ mod tests {
         assert_eq!(parsed["applied"], true);
         assert_eq!(parsed["state_advanced"], true);
         assert_eq!(parsed["components"][0]["component"], "digstore");
+    }
+
+    // -- pass exit status: a faulted pass must be visible to the scheduler (#1747) --------------
+
+    /// A pass that could not act because of an environment/permission fault — the shipped beacon
+    /// returned this every night, behind a green systemd unit.
+    fn faulted_report(reason: &str) -> PassReport {
+        PassReport {
+            applied: false,
+            reason: Some(reason.into()),
+            detail: Some("staging I/O error: Permission denied (os error 13)".into()),
+            components: Vec::new(),
+            state_advanced: false,
+        }
+    }
+
+    #[test]
+    fn a_pass_that_faulted_on_the_environment_exits_non_zero() {
+        for reason in [
+            "staging_io_error",
+            "feed_unavailable",
+            "manifest_expired",
+            "digest_mismatch",
+        ] {
+            assert_eq!(
+                pass_exit_status(&faulted_report(reason)),
+                FAILURE_EXIT_STATUS,
+                "a `{reason}` pass installed nothing and must not report success"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pass_with_an_unclassified_reason_exits_non_zero() {
+        // Fail-closed: a rejection code added later must surface until someone deliberately
+        // classifies it as an ordinary no-op, and a `!applied` report with no reason at all is not
+        // evidence of success.
+        assert_eq!(
+            pass_exit_status(&faulted_report("some_future_rejection")),
+            FAILURE_EXIT_STATUS
+        );
+        let mut reasonless = faulted_report("ignored");
+        reasonless.reason = None;
+        assert_eq!(pass_exit_status(&reasonless), FAILURE_EXIT_STATUS);
+    }
+
+    #[test]
+    fn an_already_current_pass_exits_zero() {
+        // The other arm, and the reason this is an allowlist rather than a blanket non-zero: a
+        // healthy beacon has nothing to do almost every night. `applied` is true with every
+        // component Skipped, and the daily unit must stay green.
+        let mut already_current = applied_report();
+        for component in &mut already_current.components {
+            component.result = dig_updater_broker::ComponentResult::Skipped;
+        }
+        assert_eq!(
+            pass_exit_status(&already_current),
+            SUCCESS_EXIT_STATUS,
+            "an already-current pass is a real success"
+        );
+    }
+
+    #[test]
+    fn the_two_ordinary_no_ops_exit_zero() {
+        // A pass that found a prior pass holding the lock, or a deliberately paused beacon: both
+        // are expected outcomes of a working install, not faults.
+        assert_eq!(
+            pass_exit_status(&PassReport::already_running()),
+            SUCCESS_EXIT_STATUS
+        );
+        assert_eq!(
+            pass_exit_status(&PassReport::paused(Some(1_700_000_000))),
+            SUCCESS_EXIT_STATUS
+        );
     }
 
     #[test]

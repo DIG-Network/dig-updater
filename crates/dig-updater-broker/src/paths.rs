@@ -139,8 +139,45 @@ pub fn default_status_dir() -> PathBuf {
 /// permanent lockstep, with no second path to keep in sync.
 #[must_use]
 pub fn sibling_status_dir(state_dir: &Path) -> PathBuf {
+    sibling_of(state_dir, "-status")
+}
+
+/// The staging directory that mirrors `state_dir`: the SAME parent, with `-staging` appended
+/// (`/var/lib/dig-updater` → `/var/lib/dig-updater-staging`).
+///
+/// It must be a SIBLING, never a subdirectory of `state_dir`, for the mirror image of the reason
+/// [`sibling_status_dir`] must be: [`crate::secure::harden_state_dir`] locks `state_dir` down to
+/// privileged identities only (Unix `0700` root, Windows an Admin/SYSTEM `(OI)(CI)` DACL), and
+/// **traversing into a nested directory requires the traverse right on every parent**. The staging
+/// directory is the one beacon-owned directory the PRIVILEGE-DROPPED worker must write into
+/// ([`crate::sandbox::prepare_worker_writable_dir`] chowns it to that identity), so nesting it
+/// inside the lock-down made it unreachable by its own owner: every pass failed
+/// `staging_io_error` and the trust state could never advance (#1747).
+///
+/// Placing it beside `state_dir` — under the already world-traversable `/var/lib` — keeps the
+/// state directory's `0700` **completely unwidened** (the persisted trust state, whose
+/// high-water-marks are the anti-rollback memory, and `config.json` stay unreachable by any
+/// unprivileged process, SPEC §6, §9.3) while the staging directory itself stays `0700` owned by
+/// the worker identity — reachable by root + the worker and nobody else (SPEC §8.3).
+#[must_use]
+pub fn sibling_staging_dir(state_dir: &Path) -> PathBuf {
+    sibling_of(state_dir, "-staging")
+}
+
+/// Where staging lived BEFORE #1747 — nested inside `state_dir`, where its own worker could not
+/// reach it. An upgraded install still carries this directory, owned by the worker identity and
+/// unreachable by every identity including that one, so a pass discards it; nothing reads it.
+#[must_use]
+pub fn legacy_nested_staging_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("staging")
+}
+
+/// A directory beside `state_dir` whose name is `state_dir`'s own with `suffix` appended. Deriving
+/// every sibling from `state_dir` — rather than a second hard-coded constant — keeps a test's
+/// custom `state_dir` ([`crate::Broker::with_paths`]) and the real default in permanent lockstep.
+fn sibling_of(state_dir: &Path, suffix: &str) -> PathBuf {
     let mut sibling_name = state_dir.file_name().unwrap_or_default().to_os_string();
-    sibling_name.push("-status");
+    sibling_name.push(suffix);
     state_dir.with_file_name(sibling_name)
 }
 
@@ -340,6 +377,36 @@ mod tests {
         let occupied = tmp.path().join("state");
         std::fs::write(&occupied, b"not a directory").expect("occupy the path with a file");
         assert!(!is_dir_writable(&occupied));
+    }
+
+    #[test]
+    fn staging_dir_is_a_sibling_of_state_dir_and_distinct_from_the_status_sibling() {
+        // #1747: nesting staging inside the hardened state dir put it behind a traverse right its
+        // own privilege-dropped worker does not have. It is a sibling for the same reason the status
+        // mirror is — and a DIFFERENT sibling, since the two have opposite grants.
+        let state_dir = PathBuf::from("/var/lib/dig-updater");
+        let staging_dir = sibling_staging_dir(&state_dir);
+        assert_eq!(staging_dir, PathBuf::from("/var/lib/dig-updater-staging"));
+        assert_eq!(
+            staging_dir.parent(),
+            state_dir.parent(),
+            "must share the SAME parent, never nest under the hardened state dir"
+        );
+        assert_ne!(staging_dir, sibling_status_dir(&state_dir));
+    }
+
+    #[test]
+    fn the_legacy_nested_staging_dir_names_the_pre_fix_location() {
+        // What an upgraded install still carries, and what a pass discards.
+        let state_dir = PathBuf::from("/var/lib/dig-updater");
+        assert_eq!(
+            legacy_nested_staging_dir(&state_dir),
+            PathBuf::from("/var/lib/dig-updater/staging")
+        );
+        assert_ne!(
+            legacy_nested_staging_dir(&state_dir),
+            sibling_staging_dir(&state_dir)
+        );
     }
 
     #[test]

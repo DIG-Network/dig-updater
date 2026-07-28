@@ -352,6 +352,58 @@ fn decide_acl(writability: Writability, repair: Repair) -> AclDecision {
     }
 }
 
+/// The first ancestor of `dir` an *unrelated* identity — one that is neither the directory's owner
+/// nor in its group, i.e. the privilege-dropped worker walking down to its staging directory —
+/// cannot TRAVERSE, or `None` when the whole path is traversable.
+///
+/// Reaching a directory requires the traverse right on **every** component above it, so a
+/// beacon-owned directory handed to the worker is unreachable if any ancestor withholds it — the
+/// failure mode that made every pass on a real install fail `staging_io_error` while the staging
+/// directory's own mode and ownership looked perfect (#1747). Checking the ANCESTORS, rather than
+/// the directory itself, is what distinguishes those two states.
+///
+/// The walk stops after `boundary` (inclusive) when `boundary` is an ancestor of `dir`; otherwise
+/// it runs to the filesystem root. Production passes the root — every component matters on a real
+/// install; a test passes its temp root, whose own `0700` mode is an artifact of `tempfile`, not of
+/// the layout under test. `dir` itself is deliberately excluded: it is OWNED by the traversing
+/// identity, so its "other" bits say nothing about whether that identity can enter it.
+///
+/// Windows returns `None`: traversal there is governed by the DACL [`harden_state_dir`] applies,
+/// not by a mode word, and the alpha-floor Windows posture is documented on
+/// [`classify_writability`].
+#[must_use]
+pub fn first_untraversable_ancestor(dir: &Path, boundary: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for ancestor in dir.ancestors().skip(1) {
+            // A missing ancestor cannot be the blocker: `dir` could not exist beneath it, and the
+            // creating pass will make it with a traversable mode.
+            if let Ok(meta) = std::fs::metadata(ancestor) {
+                if meta.permissions().mode() & 0o001 == 0 {
+                    return Some(ancestor.to_path_buf());
+                }
+            }
+            if ancestor == boundary {
+                break;
+            }
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, boundary);
+        None
+    }
+}
+
+/// The filesystem root — the [`first_untraversable_ancestor`] boundary a real pass uses, so every
+/// component between the root and the staging directory is checked.
+#[must_use]
+pub fn filesystem_root() -> PathBuf {
+    Path::new(std::path::MAIN_SEPARATOR_STR).to_path_buf()
+}
+
 /// Verify every guarded path is writable only by privileged identities, repairing directories the
 /// broker owns and ABORTING fail-closed on any un-repairable violation (SPEC §8.3, §9.3).
 ///
