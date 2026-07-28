@@ -577,9 +577,16 @@ fn restart_after(
     Ok(outcome)
 }
 
-/// The production enumeration/health probe: spawn `<path> --version`.
+/// The production enumeration/health probe: spawn `<path> --version`, BOUNDED.
+///
+/// The bound is not incidental (dig_ecosystem#1746): a component that never answers `--version` — a
+/// per-user tray daemon such as `dig-app`, whose `main` parses no arguments and mounts an event loop
+/// — would otherwise stall this probe forever under the shared resolver's unbounded
+/// `Command::output()`, freezing the whole pass at ENUMERATION and stranding a daemon under the
+/// beacon's identity. See [`crate::probe`] for what an unanswering binary is reported as, and why
+/// the health gate must reject it.
 pub fn spawn_version_probe() -> impl Fn(&Path) -> DetectedVersion {
-    dig_release_resolver::detect_installed_version
+    crate::probe::detect_installed_version
 }
 
 /// The detail persisted for a just-installed, health-verified component: what the health gate
