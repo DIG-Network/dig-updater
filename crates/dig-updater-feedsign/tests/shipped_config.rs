@@ -41,12 +41,12 @@ fn dig_app_v3_release() -> GithubRelease {
             )
         })
         .collect();
-    let json = format!(
-        r#"{{"tag_name":"v3.0.0","assets":[{}]}}"#,
-        assets.join(",")
-    );
-    GithubRelease::from_json("https://api.github.com/repos/DIG-Network/dig-app/releases/latest", &json)
-        .expect("the real release shape parses")
+    let json = format!(r#"{{"tag_name":"v3.0.0","assets":[{}]}}"#, assets.join(","));
+    GithubRelease::from_json(
+        "https://api.github.com/repos/DIG-Network/dig-app/releases/latest",
+        &json,
+    )
+    .expect("the real release shape parses")
 }
 
 #[test]
@@ -77,7 +77,10 @@ fn the_shipped_dig_app_entry_resolves_all_four_real_v3_platforms() {
     let arts = select_artifacts(&dig_app_v3_release(), dig_app, "3.0.0")
         .expect("dig-app's real release resolves under its shipped config");
 
-    let mut platforms: Vec<_> = arts.iter().map(|a| (a.os.as_str(), a.arch.as_str())).collect();
+    let mut platforms: Vec<_> = arts
+        .iter()
+        .map(|a| (a.os.as_str(), a.arch.as_str()))
+        .collect();
     platforms.sort_unstable();
     assert_eq!(
         platforms,
