@@ -197,6 +197,17 @@ impl Broker {
         let loaded = TrustStateStore::for_channel(&self.state_dir, config.channel).load()?;
         let feed_sources =
             feed_override.unwrap_or_else(|| channel_feed_ladder(config.channel.as_str()));
+        // Prepare staging the way a full pass does, so an ELEVATED dry check hands the
+        // privilege-dropped worker a directory it can reach AND create — as root the worker cannot
+        // make its own staging directory under root-owned `/var/lib`, which is why a dry check on a
+        // real install failed `staging_io_error` exactly like a real pass did (#1747).
+        //
+        // Best-effort, deliberately: an UNPRIVILEGED dry check may be unable to create the directory
+        // at all, and in that case the worker's own `create_dir_all` and the resulting
+        // `staging_io_error` rejection — with the operator directive the CLI prints beside it
+        // (#582) — remain the honest, unchanged answer. This must never turn a rejection an operator
+        // can act on into an opaque error.
+        let _ = sandbox::prepare_worker_writable_dir(&self.staging_dir(), Sandbox::Restricted);
         let report = self.fetch_and_verify(feed_sources, loaded.state, Sandbox::Restricted)?;
         self.refresh_status_after_check(&report, &config, now_unix_secs(), loaded.state);
         Ok(report)
@@ -460,6 +471,9 @@ impl Broker {
         secure::acl_self_check(&self.guarded_paths())?;
         // Staging must be writable by the (possibly privilege-dropped) worker yet non-world-writable.
         sandbox::prepare_worker_writable_dir(&staging_dir, sandbox)?;
+        // Debris from before #1747: the unreachable nested staging directory an older beacon left
+        // inside the state dir. Best-effort — failing to remove dead bytes must never fail a pass.
+        let _ = std::fs::remove_dir_all(paths::legacy_nested_staging_dir(&self.state_dir));
 
         let loaded = store.load()?;
         let report = self.fetch_and_verify(feed_sources, loaded.state, sandbox)?;
@@ -523,11 +537,14 @@ impl Broker {
         paths
     }
 
-    /// The broker-owned staging directory (`<state_dir>/staging`) — NOT world-writable `/tmp`. The
-    /// worker writes verified artifacts here; the broker re-hashes + installs from it.
+    /// The broker-owned staging directory — a SIBLING of the state dir
+    /// (`/var/lib/dig-updater-staging`), never `/tmp` and never nested inside the locked-down state
+    /// dir, which its own privilege-dropped worker could not traverse into
+    /// ([`paths::sibling_staging_dir`] carries the full rationale, #1747). The worker writes
+    /// verified artifacts here; the broker re-hashes + installs from it.
     #[must_use]
     pub fn staging_dir(&self) -> PathBuf {
-        self.state_dir.join("staging")
+        paths::sibling_staging_dir(&self.state_dir)
     }
 
     /// The Admin/SYSTEM-only last-known-good cache ROOT (`<state_dir>/lkg`) — the hardened parent of
@@ -682,13 +699,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn staging_and_lkg_live_under_the_state_dir_not_tmp() {
-        // The staging + last-known-good dirs are broker-owned (under the Admin-only state dir),
-        // NOT world-writable /tmp (SPEC §8.3, #504-E).
+    fn staging_and_lkg_are_broker_owned_and_never_under_tmp() {
+        // Both are beacon-owned, never world-writable /tmp (SPEC §8.3, #504-E). They differ in
+        // WHERE, because they differ in who must reach them: only the broker ever touches the
+        // last-known-good cache, so it lives inside the locked-down state dir; the
+        // privilege-dropped WORKER must write staging, so staging sits beside it (#1747 —
+        // `paths::sibling_staging_dir`).
         let broker = Broker::with_paths(PathBuf::from("/var/lib/dig-updater"), PathBuf::from("x"));
         assert_eq!(
             broker.staging_dir(),
-            PathBuf::from("/var/lib/dig-updater/staging")
+            PathBuf::from("/var/lib/dig-updater-staging")
         );
         assert_eq!(broker.lkg_dir(), PathBuf::from("/var/lib/dig-updater/lkg"));
     }

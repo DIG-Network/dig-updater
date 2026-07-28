@@ -382,6 +382,19 @@ The broker MUST re-verify (or receive proof of verification for) any artifact be
 it; it MUST NOT trust the worker to have verified correctly on a security-relevant path where
 re-verification is cheap (digests are).
 
+The staging directory MUST be **reachable by the identity the worker runs as, and by no unrelated
+identity.** Concretely, on Unix it MUST be owned by that identity with mode `0700`, AND every
+ancestor directory MUST grant that identity the traverse right. It therefore MUST NOT be nested
+inside the state directory (§13.1), whose Admin/SYSTEM-only lock-down withholds exactly that right:
+it is a SIBLING (`/var/lib/dig-updater-staging`; `%ProgramData%\DIG\updater-staging`), for the same
+reason the world-readable status directory is (§13.2). Ownership and mode alone are NOT sufficient —
+a directory correctly owned by the worker with mode `0700` is still unusable if an ancestor denies
+traversal, and a beacon whose staging directory is unreachable can never apply an update: every pass
+fails `staging_io_error` and the trust state never advances. A pass MUST verify the reachability it
+arranges and fail closed, naming the offending ancestor, rather than surfacing an opaque permission
+error. Widening the state directory's own grant to obtain traversal is FORBIDDEN — the persisted
+trust state's anti-rollback marks and `config.json` sit behind it.
+
 The staging directory is writable by the (privilege-dropped) worker, so its contents and the paths
 the worker reports are untrusted. The broker therefore MUST:
 
@@ -1059,6 +1072,26 @@ Administrator/root.
 Every command MUST offer both a human-readable line and a `--json` machine-readable object (§6.2).
 The feed base is overridable per `--feed-base <url>`/`$DIG_UPDATER_FEED_BASE` on `check` and `run`
 alike (untrusted transport, §1); the pinned root key has no such override.
+
+#### 13.3.1 Exit status — a FAULTED pass MUST be non-zero
+
+The scheduler that invokes `run` (§8.4) does not read the report; it reads the exit status, and that
+status is the only signal an operator ever sees unprompted. So `run` (and `check --now`) MUST exit:
+
+- **`0` when the beacon did its job.** It applied an update, OR it had nothing to do: every tracked
+  component already current (an applied pass whose components are all `skipped`), a prior pass still
+  holding the single-instance lock (`already_running`, §8.2), or auto-updates deliberately paused
+  (`paused`, §13.1). These are the ordinary nights of a healthy install and MUST NOT be reported as
+  failures — doing so trains an operator to ignore the unit's status.
+- **Non-zero for every other outcome in which nothing was applied.** A permission or environment
+  fault (`staging_io_error`), an unreachable feed, a manifest that failed the trust chain, or any
+  rejection code not explicitly classified as an ordinary no-op above. The classification MUST be an
+  ALLOWLIST of benign reasons and MUST fail closed: an unrecognized or absent reason is a fault.
+
+A dry `check` already distinguishes these (a rejection exits non-zero); this makes `run` consistent
+with it. Without this, a beacon that can never apply anything — an unreachable staging directory
+(§8.3) being the concrete case — presents an enabled timer, a green unit, and no updates,
+indefinitely.
 
 **An overridden feed on a real pass installs but MUST NOT advance the tracked channel's trust
 state.** The feed override selects the transport (which base the manifest is fetched from), while the

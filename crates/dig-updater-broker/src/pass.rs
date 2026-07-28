@@ -126,7 +126,45 @@ pub struct PassReport {
     pub state_advanced: bool,
 }
 
+/// The rejection code [`PassReport::already_running`] carries.
+const REASON_ALREADY_RUNNING: &str = "already_running";
+
+/// The rejection code [`PassReport::paused`] carries.
+const REASON_PAUSED: &str = "paused";
+
+/// The ONLY `!applied` reasons that are an ordinary, healthy outcome rather than something an
+/// operator must act on — see [`PassReport::is_fault`]. Kept beside the constructors that emit them
+/// so the allowlist cannot drift from the codes actually produced.
+const BENIGN_NO_OP_REASONS: [&str; 2] = [REASON_ALREADY_RUNNING, REASON_PAUSED];
+
 impl PassReport {
+    /// Whether this pass FAILED in a way the operator must act on, as opposed to having nothing to
+    /// do (SPEC §9.6).
+    ///
+    /// The distinction is the whole value of the pass's exit code. A scheduled beacon spends almost
+    /// every night with nothing to do — everything already current, or a deliberate pause — and
+    /// those runs are successes: reporting them as failures would train an operator to ignore the
+    /// unit's status. But a pass that could not even TRY (a permission or environment fault, an
+    /// unreachable feed, a manifest that failed the trust chain) is not a success in any sense, and
+    /// on a real install it was reported as one — `staging_io_error` every night behind a green
+    /// systemd unit, for every pass the beacon had ever run (#1747).
+    ///
+    /// So: an APPLIED pass is never a fault (an all-`Skipped` "already current" pass has
+    /// `applied == true`), and a non-applied pass is a fault unless its reason is one of the two
+    /// ordinary no-ops in [`BENIGN_NO_OP_REASONS`]. The allowlist shape is deliberate and
+    /// fail-closed — a rejection code added later, or a report with no reason at all, is surfaced
+    /// as a fault until someone deliberately classifies it as benign.
+    #[must_use]
+    pub fn is_fault(&self) -> bool {
+        if self.applied {
+            return false;
+        }
+        !self
+            .reason
+            .as_deref()
+            .is_some_and(|reason| BENIGN_NO_OP_REASONS.contains(&reason))
+    }
+
     /// A fail-closed no-op pass: the worker verified nothing installable.
     fn nothing_to_do(reason: &str, detail: &str) -> Self {
         Self {
@@ -143,7 +181,7 @@ impl PassReport {
     #[must_use]
     pub fn already_running() -> Self {
         Self::nothing_to_do(
-            "already_running",
+            REASON_ALREADY_RUNNING,
             "a prior pass still holds the single-instance lock; exited without acting",
         )
     }
@@ -161,7 +199,7 @@ impl PassReport {
             }
             None => "auto-updates are paused; exited without acting".to_string(),
         };
-        Self::nothing_to_do("paused", &detail)
+        Self::nothing_to_do(REASON_PAUSED, &detail)
     }
 }
 
