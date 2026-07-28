@@ -62,6 +62,7 @@ mod pass;
 pub mod paths;
 mod persist;
 pub mod plan;
+pub mod probe;
 pub mod proc;
 pub mod rollback;
 pub mod sandbox;

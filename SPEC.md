@@ -632,6 +632,83 @@ bare name resolved through `PATH`. Availability invariants:
   never turns an otherwise-correct on-disk state into a hard failure (the next scheduled wake + the
   service manager's own boot recovery bring it back).
 
+### 9.6 The version probe is BOUNDED — and what a component owes it
+
+Enumeration and the §9.5 health gate both answer one question about each component: what version is
+the binary at its destination? Both MUST answer it by spawning `<dest> --version` under a **bounded**
+wait.
+
+- A binary that has not answered within the probe budget MUST be **killed** and reported as
+  *installed but unreadable* (`Present` with no version), which the decision matrix treats as
+  unparseable — so the component is reinstalled and the §9.5 health gate REJECTS it.
+- The wait MUST NOT be unbounded. The probe runs at ENUMERATION, before any install, so an
+  unanswering binary on an unbounded probe stalls the ENTIRE pass indefinitely — one component
+  freezes every other component's updates on that host — and strands the spawned process under the
+  beacon's identity.
+
+**Therefore a component the beacon tracks MUST answer `--version` on stdout and EXIT.** A program
+that ignores its arguments and enters a long-running loop cannot be health-gated: it fails its gate
+by construction, so it is not merely unsupported but un-updatable. Bounding the wait makes such a
+binary SAFE to enumerate; it does not make it installable.
+
+### 9.7 Per-user daemon components (normative)
+
+A component may be a **per-user daemon with a login autostart** rather than a service or a CLI —
+`dig-app`, the tray/menu-bar identity agent, registered under Windows `HKCU\…\Run`, a macOS
+LaunchAgent, or a Linux systemd **user** unit. Four contracts govern such a component.
+
+**(1) Replacement is a move-aside swap; activation is DEFERRED to next login.** A running daemon
+holds its own image open, so the §9.5 resilient raw-binary replace applies unchanged: the existing
+binary is moved aside to its `.dig-updater-old` sibling and the verified copy takes its name. The
+RUNNING process keeps executing from the moved-aside image and is NOT killed, prompted, or asked to
+exit — a per-user agent may hold an unlocked session, and terminating it to install an update would
+destroy user state to deliver a background task. The new binary takes effect when the autostart next
+launches it, i.e. at next login. The broker MUST NOT wait for or force that activation.
+
+**(2) Scope: the beacon owns the BINARY, the user owns the AUTOSTART.** The beacon runs elevated
+(SYSTEM/root) and writes only the binary, in the shared install root it derives from its own
+`current_exe()` (§9.5). The per-user autostart entry references that path and is NEVER written,
+read, or repaired by the beacon — registering and removing autostart belongs to the installer and to
+the app itself. That division is what makes a per-user daemon updatable at all: the per-user part is
+only an *activation pointer*, so updating the binary it points at needs no per-user writer.
+
+The elevated beacon writing a per-user daemon's binary is NOT a new scope crossing — the shared
+install root is itself currently per-user (`%LOCALAPPDATA%\Programs\DigStore\bin` on Windows), so the
+beacon already writes every component there. Two consequences follow, and neither is specific to
+daemons:
+
+- Whatever relocation makes that root admin-only-writable applies to a daemon component unchanged:
+  its binary becomes machine-scope while its autostart stays per-user, which is the intended shape.
+- **A per-user install root means per-USER coverage.** The beacon derives the root from its own
+  image, so on a multi-user host it updates the copy in the install it was itself installed into.
+  A service component has one machine-wide install and is unaffected; a per-user daemon may have one
+  copy PER USER, and only the one beside the beacon is updated. Covering every user's copy would
+  require either a machine-wide install root or a per-user beacon, and MUST NOT be assumed.
+
+**(3) The health gate probes the INSTALLED FILE, never the running process.** Because activation is
+deferred (1), the process still running immediately after a successful install is the OLD build.
+Probing it would report the old version and roll back a correct install every pass. The gate is
+therefore satisfied by the newly installed binary at its destination reporting the expected version
+under §9.6 — evidence that the bytes on disk are a runnable build of the promised version. Rollback
+is the §9.5 path unchanged: the moved-aside image is reinstated, so a failed install never leaves
+the user without an app.
+
+**(4) The artifact is the raw per-platform binary.** Such a component publishes
+`{name}-{version}-{os}-{arch}` (with `.exe` on Windows) and is declared `raw_binary` (§10.3). A
+differently-named companion binary in the same release is NOT part of the component's set: an
+`aliases` entry is derived by COPYING the primary's verified bytes, so it may only name a
+byte-identical alias, never a distinct sibling program. A sibling program that needs updating is its
+own component, and MUST NOT be claimed by two components at once — two components resolving one
+installed filename would overwrite each other on every pass.
+
+**Tracked status.** `dig-app` is declared in the feed (§10.3), so the manifest publishes its build
+for all four platforms. It is NOT yet in the broker's tracked catalog, and MUST NOT be until it
+satisfies §9.6: `dig-app` currently parses no arguments — its `main` builds its agent and mounts a
+tray event loop that owns the process — so it cannot report a version, and its sibling `dign` cannot
+stand in for it (it exposes no `--version` either, and `dign` is already installed as a
+byte-identical alias of `dig-node`, so it is claimed by another component per (4)). A manifest entry
+is inert for an untracked component: the broker acts only on its own catalog.
+
 ---
 
 ## 10. The feed + signing (CI)
@@ -711,7 +788,7 @@ The asset selected within a release depends on the component's **asset kind** �
 select the SAME shape the broker will install (§9.5), or the broker stages a mislabelled file (a raw
 executable renamed `dig-node.msi`) and its OS installer rejects it (`msiexec` exit 1620):
 
-- **raw binary** (digstore, dig-dns, dig-updater — the default) — `{prefix}-{version}-{os}-{arch}`,
+- **raw binary** (digstore, dig-dns, dig-updater, dig-app — the default) — `{prefix}-{version}-{os}-{arch}`,
   with `.exe` on Windows (e.g. `digstore-0.13.1-windows-x64.exe`, `dig-node-0.31.1-linux-x64`);
 - **native package** (dig-node) — the platform installer's native asset name: Windows
   `{prefix}-{version}-{os}-{arch}.msi`; macOS `{prefix}-{version}-macos.pkg` (ONE universal package,
@@ -721,7 +798,8 @@ executable renamed `dig-node.msi`) and its OS installer rejects it (`msiexec` ex
 Both channels track the SAME component set with the SAME asset kinds — only the release each
 resolves differs. Sibling `.tar.gz`/companion assets are excluded by requiring an EXACT
 asset-name match. The alpha component set is **dig-node (native package), digstore, dig-updater,
-dig-dns (raw binaries)**; each component's `asset_kind` comes from the committed `feed-config.json`
+dig-dns, dig-app (raw binaries)** — dig-app is PUBLISHED in the feed but not yet tracked by the
+broker's catalog (§9.7), and a manifest entry for an untracked component is inert; each component's `asset_kind` comes from the committed `feed-config.json`
 (default kind `raw_binary`). The anti-rollback floor is **per channel** (`channels.stable`,
 `channels.nightly` — each on its own build scale, both defaulting to `0` = nothing floored;
 raised deliberately to retire a vulnerable build). The component set, per-component asset kind, the
