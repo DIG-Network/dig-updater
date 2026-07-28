@@ -1323,3 +1323,5 @@ the protected line (the same posture `main` uses via `enforce_admins=false`). Th
 (`ci.yml`, `commitlint.yml`, `ensure-version-increment.yml`) trigger on `release/**` too, and the
 version-increment gate compares against the PR's actual base (`github.base_ref`) so a hotfix PR must
 increment vs the release line it targets.
+
+<!-- lane: #1746 dig-app auto-update coverage -->
