@@ -158,7 +158,7 @@ fn dig_node_declares_its_managed_service_for_stop_replace_restart_666b() {
 fn a_service_backed_replace_lands_new_bytes_on_disk_before_health_666b() {
     use dig_release_resolver::DetectedVersion;
     use dig_updater_broker::health::check_health;
-    use dig_updater_broker::plan::ComponentTarget;
+    use dig_updater_broker::plan::{ComponentTarget, VersionEvidence};
 
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -174,6 +174,7 @@ fn a_service_backed_replace_lands_new_bytes_on_disk_before_health_666b() {
         aliases: vec![],
         // Intended new field: the service this component's binary belongs to.
         service: Some("net.dignetwork.dig-node".to_string()),
+        evidence: VersionEvidence::SafeToProbe,
     };
 
     let pc = PlannedComponent {

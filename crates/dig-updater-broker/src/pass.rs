@@ -64,6 +64,11 @@ pub enum ComponentResult {
     Deferred,
     /// The install failed (or failed health) and was rolled back to the last-known-good build.
     RolledBack,
+    /// Tracked, but deliberately NOT acted on this pass — the component is declared unsafe to
+    /// execute, so it was not even probed, let alone installed over or rolled back
+    /// ([`crate::plan::HeldComponent`]). Distinct from `Skipped`, which asserts the component is
+    /// already current; a hold asserts nothing about it except that the beacon left it alone.
+    Held,
 }
 
 impl ComponentResult {
@@ -78,6 +83,7 @@ impl ComponentResult {
             Self::Skipped => "skipped",
             Self::Deferred => "deferred",
             Self::RolledBack => "rolled_back",
+            Self::Held => "held",
         }
     }
 }
@@ -125,6 +131,10 @@ pub struct PassReport {
     /// Whether the monotonic trust state advanced (only when every actionable component succeeded).
     pub state_advanced: bool,
 }
+
+/// The `action` a HELD component's report line carries — it had no Install/Update/Skip decision to
+/// report, because the planner stopped before deciding one ([`crate::plan::HeldComponent`]).
+const ACTION_HOLD: &str = "hold";
 
 /// The rejection code [`PassReport::already_running`] carries.
 const REASON_ALREADY_RUNNING: &str = "already_running";
@@ -304,6 +314,19 @@ impl Installer<'_> {
             }
             components.push(outcome);
         }
+
+        // 3b. Report every HELD component (SPEC §9.7(5)): a component declared unsafe to execute is
+        // absent from `plan.components` by construction — never probed, never installed — so there
+        // is nothing to apply. It MUST still appear in the report with its reason, or a pass would claim
+        // success while silently never considering it. A hold is a declared, expected state rather
+        // than a failure, so it leaves `all_succeeded` alone: freezing every other component's
+        // trust-state advance behind it would turn a legible hold into a host-wide stall.
+        components.extend(plan.held.iter().map(|h| ComponentOutcome {
+            component: h.name.clone(),
+            action: ACTION_HOLD.to_string(),
+            result: ComponentResult::Held,
+            detail: h.reason.clone(),
+        }));
 
         // 4. Advance the trust state ONLY once every OTHER component fully succeeded (SPEC §9
         // step 7) AND the feed was not overridden (`suppress_state_advance` — #621 item 1, so an

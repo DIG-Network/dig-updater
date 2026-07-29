@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use dig_updater_broker::config::Channel;
 use dig_updater_broker::{
     BrokerError, Catalog, ComponentResult, ComponentTarget, DetectedVersion, InstallMethod,
-    Installer, LkgCache, PassReport, RetryPolicy, TrustStateStore,
+    Installer, LkgCache, PassReport, RetryPolicy, TrustStateStore, VersionEvidence,
 };
 use dig_updater_trust::{
     Artifact, Component, Delegation, Manifest, SignedDelegation, SignedManifest, TrustState,
@@ -207,6 +207,7 @@ fn apply_with_suppress(
         dest: dest.to_path_buf(),
         aliases: vec![],
         service: None,
+        evidence: VersionEvidence::SafeToProbe,
     }]);
     let platform = Platform::current();
     let installer = Installer {
@@ -623,6 +624,7 @@ fn apply_self_and_other(
             dest: self_dest.to_path_buf(),
             aliases: vec![],
             service: None,
+            evidence: VersionEvidence::SafeToProbe,
         },
         ComponentTarget {
             name: "digstore".into(),
@@ -630,6 +632,7 @@ fn apply_self_and_other(
             dest: other_dest.to_path_buf(),
             aliases: vec![],
             service: None,
+            evidence: VersionEvidence::SafeToProbe,
         },
     ]);
     let platform = Platform::current();
@@ -820,6 +823,7 @@ fn apply_with_service(
         dest: dest.to_path_buf(),
         aliases: vec![],
         service: Some(service_id.to_string()),
+        evidence: VersionEvidence::SafeToProbe,
     }]);
     let platform = Platform::current();
     let installer = Installer {
@@ -1001,6 +1005,7 @@ fn apply_aliased(
         dest: dest.to_path_buf(),
         aliases,
         service: service_id.map(str::to_string),
+        evidence: VersionEvidence::SafeToProbe,
     }]);
     let platform = Platform::current();
     let installer = Installer {
@@ -1123,5 +1128,185 @@ fn a_stale_alias_is_re_refreshed_on_a_later_pass_even_when_the_primary_is_curren
         std::fs::read(&alias).unwrap(),
         artifact,
         "the stale alias was refreshed to the verified bytes"
+    );
+}
+
+/// A manifest with an ordinary component ("digstore") beside the per-user daemon ("dig-app"), each
+/// with its own artifact URL — the shape a real host sees now that dig-app is in the feed (§10.3).
+fn manifest_with_dig_app(base: &str, other_artifact: &[u8], dig_app_artifact: &[u8]) -> Manifest {
+    let p = Platform::current();
+    Manifest {
+        components: vec![
+            Component {
+                name: "digstore".into(),
+                version: "0.2.0".into(),
+                build: 2_000,
+                artifacts: vec![Artifact {
+                    os: p.os.clone(),
+                    arch: p.arch.clone(),
+                    url: format!("{base}/other-artifact"),
+                    sha256: hex(&Sha256::digest(other_artifact)),
+                    size: other_artifact.len() as u64,
+                }],
+            },
+            Component {
+                name: "dig-app".into(),
+                version: "3.4.0".into(),
+                build: 3_004_000,
+                artifacts: vec![Artifact {
+                    os: p.os,
+                    arch: p.arch,
+                    url: format!("{base}/self-artifact"),
+                    sha256: hex(&Sha256::digest(dig_app_artifact)),
+                    size: dig_app_artifact.len() as u64,
+                }],
+            },
+        ],
+        ..manifest(base, "0.2.0", 2_000, 0, other_artifact)
+    }
+}
+
+/// A REAL pass over a host running an unsafe-to-probe `dig-app` beside an out-of-date `digstore`
+/// (dig_ecosystem#1746/#1749).
+///
+/// The fixture varies ONE actor: dig-app is declared unsafe to probe, while digstore answers honestly
+/// and is genuinely stale — the truthful control that makes a hold distinguishable from an abandoned
+/// pass. Both artifacts are really downloaded, verified and staged by the worker, so nothing but the
+/// applier's own decision keeps dig-app's bytes off disk.
+///
+/// Two load-bearing assertions, because the design has two distinct failure modes:
+///
+/// - **The probe is never called for dig-app.** In production `detect` EXECUTES the target, and
+///   dig-app <= 3.3.0 treats any argument as "boot the identity agent" — under SYSTEM, sealing a
+///   master seed and binding a signing socket. Both injected probes panic on dig-app's path, so this
+///   whole pass fails if the privileged exec happens anywhere: enumeration OR the health gate.
+/// - **The destination file is byte-untouched and no `.dig-updater-old` sibling exists.** A hold
+///   placed at the wrong layer — filtering in `Plan::actionable`, or skipping late in the apply loop —
+///   satisfies "dig-app is not reported as Installed" identically while already having written the
+///   file. (A rollback would restore the bytes, so the `Held` RESULT assertion is what catches that
+///   variant; the move-aside sibling is what catches a swap that landed and was reverted.)
+#[test]
+fn an_unsafe_to_probe_dig_app_is_held_unexecuted_while_its_stale_sibling_really_installs() {
+    let home = tempfile::tempdir().unwrap();
+    let digstore_dest = home.path().join("bin").join("digstore");
+    let dig_app_dest = home.path().join("bin").join("dig-app");
+
+    let digstore_artifact = b"the-new-digstore-0.2.0-binary";
+    let dig_app_artifact = b"the-new-dig-app-3.4.0-binary";
+    let srv = Server::bind();
+    let m = manifest_with_dig_app(&srv.base, digstore_artifact, dig_app_artifact);
+    let _guard = srv.serve(routes_with_self_and_other(
+        &m,
+        dig_app_artifact,
+        digstore_artifact,
+    ));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    // dig-app IS installed (a real file on disk, so the hold cannot be an artefact of it being
+    // absent) and both probes REFUSE to run it; digstore honestly reports a stale 0.1.0.
+    std::fs::create_dir_all(dig_app_dest.parent().unwrap()).unwrap();
+    std::fs::write(&dig_app_dest, b"the-running-dig-app-3.3.0-binary").unwrap();
+    let refuse_to_exec_dig_app = |p: &Path, stage: &str| {
+        assert!(
+            !p.ends_with("dig-app"),
+            "the pass EXECUTED dig-app at {stage} — under SYSTEM that boots the identity agent, \
+             seals a master seed and binds a signing socket (dig_ecosystem#1746)"
+        );
+    };
+    let detect = |p: &Path| {
+        refuse_to_exec_dig_app(p, "enumeration");
+        DetectedVersion::Present("digstore 0.1.0".to_string())
+    };
+    let health = |p: &Path| {
+        refuse_to_exec_dig_app(p, "the health gate");
+        DetectedVersion::Present("digstore 0.2.0".to_string())
+    };
+
+    let store = TrustStateStore::for_channel(home.path(), Channel::Stable);
+    let loaded = store.load().expect("load state");
+    let lkg = LkgCache::at(home.path().join("lkg"));
+    let apply_dir = home.path().join("apply");
+    std::fs::create_dir_all(&apply_dir).unwrap();
+    let catalog = Catalog::new(vec![
+        ComponentTarget {
+            name: "digstore".into(),
+            method: InstallMethod::RawBinary,
+            dest: digstore_dest.clone(),
+            aliases: vec![],
+            service: None,
+            evidence: VersionEvidence::SafeToProbe,
+        },
+        ComponentTarget {
+            name: "dig-app".into(),
+            method: InstallMethod::RawBinary,
+            dest: dig_app_dest.clone(),
+            aliases: vec![],
+            service: None,
+            evidence: VersionEvidence::UnsafeToProbe,
+        },
+    ]);
+    let platform = Platform::current();
+    let installer = Installer {
+        store: &store,
+        catalog: &catalog,
+        platform: &platform,
+        lkg: &lkg,
+        staging_dir: &home.path().join("staging"),
+        apply_dir: &apply_dir,
+        retry: RetryPolicy {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        },
+        now: NOW,
+        detect: &detect,
+        health: &health,
+        service_ctl: &|_, _| Ok(()),
+        suppress_state_advance: false,
+    };
+    let result = installer
+        .apply(&test_root().verifying_key(), &report, loaded)
+        .expect("a held component never fails the pass");
+
+    let digstore = result
+        .components
+        .iter()
+        .find(|c| c.component == "digstore")
+        .expect("digstore is reported");
+    assert_eq!(
+        digstore.result,
+        ComponentResult::Installed,
+        "holding dig-app must not abandon the pass: {}",
+        digstore.detail
+    );
+    assert_eq!(
+        std::fs::read(&digstore_dest).unwrap(),
+        digstore_artifact,
+        "the control component's verified bytes really landed"
+    );
+
+    let dig_app = result
+        .components
+        .iter()
+        .find(|c| c.component == "dig-app")
+        .expect("a held component is REPORTED, never silently dropped from the pass");
+    assert_eq!(dig_app.result, ComponentResult::Held);
+    assert_eq!(dig_app.action, "hold");
+    assert!(
+        dig_app.detail.contains("did not run it"),
+        "the hold states that the binary was NOT executed: {}",
+        dig_app.detail
+    );
+    assert_eq!(
+        std::fs::read(&dig_app_dest).unwrap(),
+        b"the-running-dig-app-3.3.0-binary",
+        "the held component's binary is BYTE-UNTOUCHED — never installed over, never rolled back"
+    );
+    assert!(
+        !dig_app_dest.with_extension("dig-updater-old").exists(),
+        "no move-aside swap was even attempted for a held component"
+    );
+    assert!(
+        result.state_advanced,
+        "one un-probeable per-user daemon must not freeze every other component's trust state"
     );
 }
