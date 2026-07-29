@@ -14,13 +14,23 @@
 //! install — so one unanswering binary on disk is enough to stop a host updating anything, ever.
 //!
 //! This module bounds that wait. A binary that has not answered within [`PROBE_BUDGET`] is KILLED
-//! and reported as `Present("")` — "installed, but its version could not be read" — which the
-//! shared decision matrix treats as unparseable, so the component is reinstalled and, crucially,
-//! [`crate::health::check_health`] REJECTS it. An unanswering component therefore fails its gate
-//! and rolls back, instead of hanging every other component's update behind it.
+//! and reported as `Present("")` — "installed, but its version could not be read" — which the shared
+//! decision matrix treats as unparseable. For a component declared safe to probe, that means the
+//! bytes are corrupt or partial: it is reinstalled and [`crate::health::check_health`] REJECTS
+//! anything that still cannot report the promised version, so it rolls back rather than hanging every
+//! other component's update behind it.
 //!
-//! Bounding the wait is what makes a daemon component SAFE to enumerate; it does not make one
-//! installable. A component the beacon is to keep current MUST answer `--version` and exit.
+//! **Bounding the wait does NOT make an unanswering binary safe to run.** It stops the pass hanging;
+//! it does not un-run whatever the binary did when it started, and this parent is SYSTEM/root. A
+//! binary whose behaviour on `--version` is not known to be "print and exit" is therefore declared
+//! [`VersionEvidence::UnsafeToProbe`](crate::plan::VersionEvidence::UnsafeToProbe) and is never
+//! spawned by the planner at all — the exec is not attempted, so neither the hang nor the side
+//! effects are possible. `dig-app` ≤ 3.3.0 is exactly that case (dig_ecosystem#1746/#1749): its
+//! `--version` boots the identity agent, seals a master seed on first run and binds a signing
+//! socket. The two mechanisms are layered, not alternatives: the declaration prevents the exec, this
+//! bound + [`apply_minimal_env`] contain a probe of a binary believed safe that turns out not to be.
+//!
+//! A component the beacon is to keep current MUST answer `--version` on stdout and EXIT.
 
 use std::io;
 use std::path::Path;
@@ -54,12 +64,62 @@ pub fn detect_installed_version(path: &Path) -> DetectedVersion {
 
 /// Spawn `<path> --version` with its stdout captured — the production probe launch.
 fn spawn_version_query(path: &Path) -> io::Result<Child> {
-    Command::new(path)
+    let mut command = Command::new(path);
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    apply_minimal_env(&mut command);
+    command.spawn()
+}
+
+/// The ONLY environment variables a probe child inherits — everything else is cleared.
+///
+/// These are the variables a process needs to run at all on its platform, not to do any work:
+/// `SystemRoot`/`SystemDrive` because the Windows loader and Win32 initialization resolve system DLLs
+/// through them, and `PATH` because a dynamically-linked binary may need the loader's search path.
+/// Deliberately ABSENT: every variable that tells a program WHERE A USER'S DATA LIVES — `HOME`,
+/// `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` and the whole `XDG_*` family.
+const PROBE_ENV_ALLOWLIST: [&str; 3] = ["SystemRoot", "SystemDrive", "PATH"];
+
+/// Clear the probe child's inherited environment down to [`PROBE_ENV_ALLOWLIST`].
+///
+/// The probe executes a binary whose behaviour the beacon does not control, from a privileged parent,
+/// so the environment it inherits is an input to someone else's code. Two concrete harms this closes:
+///
+/// - a probed program that resolves a data directory on startup would otherwise write into whatever
+///   profile the BEACON runs under (SYSTEM's `%LOCALAPPDATA%`, root's `$HOME`);
+/// - under `sudo -E dig-updater run` — a documented operator action — the invoking user's
+///   `$HOME`/`$XDG_DATA_HOME` are inherited all the way down, so a probed program would plant
+///   ROOT-OWNED directories inside that user's own data dir and permanently break it for them
+///   (dig_ecosystem#1748's class, reached through the probe).
+///
+/// This is defence in depth, NOT the primary control: a binary that must not be executed is declared
+/// [`VersionEvidence::UnsafeToProbe`](crate::plan::VersionEvidence::UnsafeToProbe) and is never
+/// spawned at all. Clearing the environment bounds the damage from a binary that IS probed and
+/// nevertheless misbehaves.
+fn apply_minimal_env(command: &mut Command) {
+    command.env_clear();
+    for (key, value) in inherited_allowlisted_env() {
+        command.env(key, value);
+    }
+}
+
+/// The allowlisted variables actually present in this process's environment, as owned pairs.
+///
+/// Split out as a pure function so the POLICY is unit-testable on every OS without spawning anything:
+/// a test can set a `HOME`/`XDG_DATA_HOME`/`LOCALAPPDATA` canary and assert it is not in the result.
+#[must_use]
+fn inherited_allowlisted_env() -> Vec<(String, String)> {
+    PROBE_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
 }
 
 /// The body of [`detect_installed_version`], with the child launch INJECTED so both the
@@ -299,6 +359,79 @@ mod tests {
         assert_eq!(
             bounded_probe(&installed_path(), PROBE_BUDGET, spawn_rejecting),
             DetectedVersion::Present(String::new()),
+        );
+    }
+
+    /// The probe child MUST NOT inherit any variable that tells a program where a user's data lives.
+    ///
+    /// This is the `sudo -E dig-updater run` leak in miniature: with the parent's environment
+    /// inherited, a probed program resolving its data directory on startup writes into the BEACON's
+    /// profile (SYSTEM's `%LOCALAPPDATA%`, root's `$HOME`) or — worse, under `sudo -E` — plants
+    /// root-owned directories inside the invoking user's own data dir. Canaries are set here rather
+    /// than assumed present, so the assertion cannot pass merely because the CI runner happens not to
+    /// define them.
+    #[test]
+    fn the_probe_child_inherits_no_profile_or_xdg_variables() {
+        // SAFETY: single-threaded within this test; the canaries are unique to it and only read back
+        // through `inherited_allowlisted_env`, which is what the production spawn uses.
+        let leaky = [
+            ("HOME", "/home/canary-1746"),
+            ("USERPROFILE", r"C:\Users\canary-1746"),
+            ("LOCALAPPDATA", r"C:\Users\canary-1746\AppData\Local"),
+            ("APPDATA", r"C:\Users\canary-1746\AppData\Roaming"),
+            ("XDG_DATA_HOME", "/home/canary-1746/.local/share"),
+            ("XDG_CONFIG_HOME", "/home/canary-1746/.config"),
+        ];
+        for (key, value) in leaky {
+            std::env::set_var(key, value);
+        }
+
+        let inherited = inherited_allowlisted_env();
+
+        for (key, _) in leaky {
+            assert!(
+                !inherited.iter().any(|(k, _)| k == key),
+                "{key} reaches the probe child — a probed program would resolve the beacon's (or a \
+                 sudo -E caller's) data directory from it"
+            );
+        }
+        assert!(
+            inherited
+                .iter()
+                .all(|(k, _)| PROBE_ENV_ALLOWLIST.contains(&k.as_str())),
+            "only allowlisted variables may be passed: {inherited:?}"
+        );
+    }
+
+    /// `env_clear` is actually APPLIED to the production launch — the allowlist policy above is only
+    /// worth anything if the spawn honours it. Proven by executing a real child that prints the
+    /// canary: unix only, because it needs a fixture that ignores `--version` and reports an
+    /// environment variable, which a shebang script gives portably on unix alone. This is also the
+    /// platform on which the `sudo -E` leak was demonstrated.
+    #[cfg(unix)]
+    #[test]
+    fn the_production_spawn_really_clears_the_environment() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = dir.path().join("prints-xdg");
+        let mut file = std::fs::File::create(&script).expect("create fixture");
+        // Ignores its arguments entirely and prints the variable — dig-app's shape, minus the harm.
+        writeln!(file, "#!/bin/sh\necho \"[${{XDG_DATA_HOME:-unset}}]\"").expect("write fixture");
+        file.flush().expect("flush");
+        drop(file);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+
+        std::env::set_var("XDG_DATA_HOME", "/home/canary-1746/.local/share");
+
+        let detected = bounded_probe(&script, PROBE_BUDGET, spawn_version_query);
+
+        assert_eq!(
+            detected,
+            DetectedVersion::Present("[unset]".to_string()),
+            "the probe child saw XDG_DATA_HOME — the production spawn does not clear its environment"
         );
     }
 

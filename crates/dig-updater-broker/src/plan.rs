@@ -7,10 +7,15 @@
 //! [`dig_release_resolver`]'s shared [`decide`], the exact same logic `dig-installer` ships, so a
 //! DIG box makes one consistent decision no matter which tool asks (SPEC §12, CLAUDE.md §4.1).
 //!
-//! A [`Catalog`] maps each tracked component to WHERE it installs and HOW ([`InstallMethod`]) on
-//! this host. The alpha defaults ([`Catalog::alpha_defaults`]) cover dig-node (native package),
-//! digstore / dig-updater / dig-dns (raw binary); they are fully overridable so tests and the
-//! installer (#504-H) can point at their own destinations.
+//! A [`Catalog`] maps each tracked component to WHERE it installs, HOW ([`InstallMethod`]), and
+//! whether it is even safe to RUN ([`VersionEvidence`]) on this host. The alpha defaults
+//! ([`Catalog::alpha_defaults`]) cover dig-node (native package), digstore / dig-updater / dig-dns
+//! (raw binary) and dig-app (raw binary, unsafe to probe); they are fully overridable so tests and
+//! the installer (#504-H) can point at their own destinations.
+//!
+//! Planning therefore has one step before the Install/Update/Skip matrix: a component declared unsafe
+//! to probe is HELD ([`HeldComponent`]) **without being executed**, because detecting its version
+//! means running it, and this process is SYSTEM/root.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +33,7 @@ pub const BEACON_COMPONENT_NAME: &str = "dig-updater";
 
 /// The manifest component name of the per-user identity agent (SPEC §9.7) — the one tracked
 /// component that is a desktop tray daemon rather than a CLI or an OS service, and so the one that
-/// requires [`VersionEvidence::Required`].
+/// requires [`VersionEvidence::UnsafeToProbe`].
 pub const DIG_APP_COMPONENT_NAME: &str = "dig-app";
 
 /// The radix that keeps a packed `build` number monotonic in the version — the SAME encoding the
@@ -107,32 +112,43 @@ pub enum InstallMethod {
     LinuxDeb,
 }
 
-/// Whether the beacon may act on a component whose installed version it cannot READ.
+/// Whether a component is SAFE TO PROBE — i.e. whether asking it `--version` is a question or an
+/// action (SPEC §9.7(5)).
 ///
-/// Every tracked component is health-gated on the version it reports (SPEC §9.5/§9.6), so a probe
-/// that comes back unreadable is the one answer the planner cannot reason from. What to DO about it
-/// differs by component, and getting that wrong is expensive in opposite directions:
+/// The version probe is not a read. It is `Command::new(dest).arg("--version")`, executed by a
+/// beacon running as SYSTEM / root, and its behaviour is decided entirely by the binary on disk. A
+/// program that parses its arguments answers and exits; a program that ignores them does whatever it
+/// does on startup — and `dig-app` ≤ 3.3.0 ignores them completely: `--version` boots its identity
+/// agent, seals a fresh master seed on first run, and binds a browser-reachable signing WebSocket,
+/// all under the machine account. Bounding that wait (see [`crate::probe`]) stops the pass hanging;
+/// it does NOT un-run the side effects.
 ///
-/// - For a CLI or a service executable, which certainly answers `--version`, an unreadable answer
-///   means the installed bytes are corrupt or partial — and reinstalling from the verified artifact
-///   is exactly the repair. That is [`Self::NotRequired`], the behaviour every such component keeps.
-/// - For a component that may not answer at all — `dig-app` until dig_ecosystem#1749 lands — the
-///   same reinstall would download it, install it, fail its health gate and roll it back on EVERY
-///   pass, forever, burying the real cause under churn. That is [`Self::Required`]: the beacon acts
-///   only on a build that has PROVEN which version it is, and reports the hold otherwise.
+/// So this is a SAFETY declaration, not a preference:
 ///
-/// The distinction is deliberately keyed on the host's own probe answer rather than on a flag
-/// someone must flip: the pass a held component gains `--version` is the pass it starts updating
-/// normally, with its full health gate, and no change here.
+/// - [`Self::SafeToProbe`] — the binary is known to answer `--version` and exit. The beacon probes
+///   it, and an unreadable answer means corrupt or partial bytes, repaired by reinstalling. Every
+///   CLI and service component.
+/// - [`Self::UnsafeToProbe`] — executing the installed binary may have side effects, so the beacon
+///   MUST NOT execute it at all. The component is [`HeldComponent`]: not probed, not staged, not
+///   installed, and reported with its reason every pass.
+///
+/// **The gate is declaration-driven, deliberately.** An earlier revision of this design decided the
+/// hold from the probe's own answer, so that a component gaining `--version` would start updating
+/// with no code change. That is elegant and wrong: learning the answer REQUIRES the exec this exists
+/// to prevent, so the beacon would have booted a custody agent at machine privilege on every pass in
+/// order to conclude that it should leave it alone. There is no version evidence obtainable by
+/// executing a binary you have not established is safe to execute. Flipping a component to
+/// [`Self::SafeToProbe`] is therefore a reviewed one-line change, made once its released binary is
+/// known to answer without booting — the cost of that review is the whole point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VersionEvidence {
-    /// Act on the component regardless — an unreadable version is a corrupt install to be repaired
-    /// by reinstalling. The default, and the behaviour of every component that answers `--version`.
+    /// The binary answers `--version` and exits: probe it, and reinstall it if the answer is
+    /// unreadable. The default, and the behaviour of every component that ships a CLI entrypoint.
     #[default]
-    NotRequired,
-    /// Act only on a component that has proven its version by answering the §9.6 probe; otherwise
-    /// HOLD it ([`HeldComponent`]) and report why.
-    Required,
+    SafeToProbe,
+    /// Executing the binary may have side effects, so it is never executed and the component is
+    /// always HELD ([`HeldComponent`]).
+    UnsafeToProbe,
 }
 
 /// Where + how one tracked component installs on THIS host.
@@ -161,9 +177,8 @@ pub struct ComponentTarget {
     /// component's binary is file-locked while the service runs, so the applier MUST stop the
     /// service before replacing it and restart it after (#666 Bug B).
     pub service: Option<String>,
-    /// Whether this component must PROVE its installed version before the beacon acts on it
-    /// ([`VersionEvidence`]). Default ([`VersionEvidence::NotRequired`]) for everything that
-    /// answers `--version`.
+    /// Whether running this component's binary to ask its version is safe ([`VersionEvidence`]).
+    /// Default ([`VersionEvidence::SafeToProbe`]) for everything known to answer `--version` and exit.
     pub evidence: VersionEvidence,
 }
 
@@ -245,7 +260,7 @@ impl Catalog {
                 // OS service `net.dignetwork.dig-node`, whose executable is held open while it runs.
                 aliases: vec![exe("dign")],
                 service: Some("net.dignetwork.dig-node".into()),
-                evidence: VersionEvidence::NotRequired,
+                evidence: VersionEvidence::SafeToProbe,
             },
             ComponentTarget {
                 name: "digstore".into(),
@@ -254,7 +269,7 @@ impl Catalog {
                 // digstore ships the byte-identical alias `digs` (#434).
                 aliases: vec![exe("digs")],
                 service: None,
-                evidence: VersionEvidence::NotRequired,
+                evidence: VersionEvidence::SafeToProbe,
             },
             ComponentTarget {
                 name: "dig-dns".into(),
@@ -264,7 +279,7 @@ impl Catalog {
                 // binary a pre-fix beacon left frozen at its install-time version.
                 aliases: vec![exe("digd")],
                 service: None,
-                evidence: VersionEvidence::NotRequired,
+                evidence: VersionEvidence::SafeToProbe,
             },
             ComponentTarget {
                 name: BEACON_COMPONENT_NAME.into(),
@@ -272,7 +287,7 @@ impl Catalog {
                 dest: exe(BEACON_COMPONENT_NAME),
                 aliases: vec![],
                 service: None,
-                evidence: VersionEvidence::NotRequired,
+                evidence: VersionEvidence::SafeToProbe,
             },
             ComponentTarget {
                 name: DIG_APP_COMPONENT_NAME.into(),
@@ -290,9 +305,12 @@ impl Catalog {
                 // until the user's next login. Killing it to install an update would destroy an
                 // unlocked identity session to deliver a background task.
                 service: None,
-                // Until dig-app can answer `--version` (dig_ecosystem#1749) the beacon HOLDS it
-                // rather than reinstalling-and-rolling-back every pass.
-                evidence: VersionEvidence::Required,
+                // dig-app <= 3.3.0 parses NO arguments: `--version` boots the identity agent, seals a
+                // master seed on a first run and binds a loopback signing socket. Probing it would do
+                // all of that as SYSTEM/root on every pass, so the beacon does not run it at all and
+                // HOLDS the component. Flip this to `SafeToProbe` only once the dig-app release hosts
+                // actually run prints its version and EXITS (dig_ecosystem#1749, landed in 3.4.0).
+                evidence: VersionEvidence::UnsafeToProbe,
             },
         ])
     }
@@ -338,10 +356,15 @@ pub struct PlannedComponent {
 /// A tracked component this pass will NOT act on, and why.
 ///
 /// A hold is a first-class, REPORTED outcome, not a silent omission: the component is deliberately
-/// absent from [`Plan::components`] — so no code path can install, health-gate or roll it back — and
-/// the applier turns each hold into a [`ComponentResult::Held`](crate::ComponentResult::Held) line
-/// in the pass report carrying [`Self::reason`]. Fail-closed and legible, rather than a pass that
-/// quietly claims success while one component was never considered.
+/// absent from [`Plan::components`] — so no code path can probe, install, health-gate or roll it
+/// back — and the applier turns each hold into a
+/// [`ComponentResult::Held`](crate::ComponentResult::Held) line in the pass report carrying
+/// [`Self::reason`]. Fail-closed and legible, rather than a pass that quietly claims success while one
+/// component was never considered.
+///
+/// "Not probed" is part of the guarantee, not a detail: the probe EXECUTES the binary from a
+/// privileged parent ([`VersionEvidence`]), so a hold that had to look before it declined would be
+/// no protection at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldComponent {
     /// The manifest component name.
@@ -390,17 +413,20 @@ impl Plan {
                 continue; // nothing for this OS/arch
             };
 
-            let detected = detect(&target.dest);
-            // Decide the HOLD before anything else: a component the beacon will not act on needs no
-            // staged bytes, so requiring them here would let a missing download fault the whole pass
-            // over a component nobody was going to touch.
-            if let Some(reason) = hold_reason(target, &detected) {
+            // Decide the HOLD FIRST, and — the security-critical part — decide it WITHOUT running
+            // `detect`, because `detect` EXECUTES the installed binary (see [`hold_reason`]). A held
+            // component is therefore never spawned, never staged and never installed: this `continue`
+            // is the only thing standing between a SYSTEM/root beacon and a component that treats
+            // every argument as "boot me".
+            if let Some(reason) = hold_reason(target) {
                 held.push(HeldComponent {
                     name: component.name.clone(),
                     reason,
                 });
                 continue;
             }
+
+            let detected = detect(&target.dest);
 
             // The worker-reported `staged_path` is carried verbatim here and is NOT trusted: it is
             // canonicalized + confined to the broker-owned staging dir by
@@ -465,48 +491,46 @@ impl Plan {
 /// ([`pack_build`]) — the build a rollback would reinstate. `None` when nothing is installed, or when
 /// what it printed carries no version this beacon can age.
 ///
-/// The version is the LAST whitespace-separated token, because the conventional `--version` line is
-/// `<program> <version>` (clap's default) and a bare `<version>` is the same token.
+/// The version is the FIRST whitespace-separated token that packs, not the last. A `--version` line
+/// is conventionally `<program> <version>` (clap's default), but trailing detail is common
+/// (`dig-app 3.4.0 (build abc123)`) — and taking the last token there yields `(build`, which packs to
+/// nothing. Reading "the first token that IS a version" is stable against detail appearing on either
+/// side, so a cosmetic change to a component's version line cannot silently un-age its install.
 #[must_use]
 fn installed_build(detected: &DetectedVersion) -> Option<u64> {
     match detected {
-        DetectedVersion::Present(raw) => pack_build(raw.split_whitespace().last().unwrap_or("")),
+        DetectedVersion::Present(raw) => raw.split_whitespace().find_map(pack_build),
         DetectedVersion::Absent => None,
     }
 }
 
 /// Why `target` is HELD this pass, or `None` to plan it normally ([`VersionEvidence`]).
 ///
-/// A component that does not require version evidence is never held. One that does is held unless
-/// its probe answer packs to a real build — i.e. unless the build on disk has PROVEN which version
-/// it is. Both failing answers are held rather than acted on, for the same reason:
+/// Takes ONLY the target: the decision is deliberately made from the DECLARATION, without touching —
+/// let alone executing — the binary. Reading the answer first would defeat the purpose, since the
+/// read IS the exec (see [`VersionEvidence`]).
 ///
-/// - *installed but mute* — the beacon cannot tell whether an update is needed, and cannot verify one
-///   afterwards, so installing would fail the §9.5 health gate and roll back on every pass forever.
-/// - *not installed* — a fresh install could not be health-gated either, and placing a per-user
-///   agent nobody installed is the installer's job, not the beacon's (SPEC §9.7(2)).
-///
-/// The reason names the missing capability, so the pass report says what is wrong and what would fix
-/// it rather than reporting a component-shaped silence.
+/// The reason states the cause and the remedy, so a held pass says why the component was left alone
+/// rather than reporting a component-shaped silence. `dest.exists()` — a metadata read, no exec —
+/// only sharpens that wording.
 #[must_use]
-fn hold_reason(target: &ComponentTarget, detected: &DetectedVersion) -> Option<String> {
-    if target.evidence == VersionEvidence::NotRequired || installed_build(detected).is_some() {
+fn hold_reason(target: &ComponentTarget) -> Option<String> {
+    if target.evidence == VersionEvidence::SafeToProbe {
         return None;
     }
     let name = &target.name;
     let dest = target.dest.display();
-    Some(match detected {
-        DetectedVersion::Present(_) => format!(
-            "held: {name} is installed at {dest} but did not report a readable version, so an \
-             update could not be verified (it must answer `--version` and exit — \
-             dig_ecosystem#1749); nothing was installed, changed or rolled back"
-        ),
-        DetectedVersion::Absent => format!(
-            "held: {name} is not installed at {dest}; the beacon updates it but does not place it \
-             (run the DIG installer), and an install it cannot version-check via `--version` could \
-             not be health-gated"
-        ),
-    })
+    let presence = if target.dest.exists() {
+        "is installed at"
+    } else {
+        "is not installed at"
+    };
+    Some(format!(
+        "held: {name} {presence} {dest} and is declared unsafe to probe, so the beacon did not run \
+         it and cannot tell which version is there. Nothing was probed, downloaded over, installed \
+         or rolled back. It updates once it ships a `--version` that prints and EXITS without \
+         starting the app (dig_ecosystem#1749) and is declared safe to probe."
+    ))
 }
 
 /// Re-drive an aliased component as an `Update` when the PRIMARY looks current (`Skip`) but ANY of
@@ -628,7 +652,7 @@ mod tests {
             dest: PathBuf::from("/opt/dig/digstore"),
             aliases: vec![PathBuf::from("/opt/dig/digs")],
             service: None,
-            evidence: VersionEvidence::NotRequired,
+            evidence: VersionEvidence::SafeToProbe,
         }])
     }
 
@@ -657,7 +681,7 @@ mod tests {
     }
 
     /// A catalog holding `digstore` (an ordinary component that answers `--version`) beside
-    /// `dig-app` (which requires version evidence before the beacon will act on it).
+    /// `dig-app` (declared unsafe to probe, so the beacon must never execute it).
     fn catalog_with_dig_app() -> Catalog {
         Catalog::new(vec![
             ComponentTarget {
@@ -666,7 +690,7 @@ mod tests {
                 dest: PathBuf::from("/opt/dig/digstore"),
                 aliases: vec![],
                 service: None,
-                evidence: VersionEvidence::NotRequired,
+                evidence: VersionEvidence::SafeToProbe,
             },
             ComponentTarget {
                 name: DIG_APP_COMPONENT_NAME.into(),
@@ -674,19 +698,26 @@ mod tests {
                 dest: PathBuf::from("/opt/dig/dig-app"),
                 aliases: vec![],
                 service: None,
-                evidence: VersionEvidence::Required,
+                evidence: VersionEvidence::UnsafeToProbe,
             },
         ])
     }
 
-    /// A probe that answers for `digstore` and stays MUTE for `dig-app` — the pre-#1749 reality on a
-    /// host where both are installed. Only the dig-app answer varies; digstore is the control.
-    fn digstore_answers_dig_app_is_mute(path: &Path) -> DetectedVersion {
-        if path.ends_with("dig-app") {
-            DetectedVersion::Present(String::new()) // installed, but reported no version
-        } else {
-            DetectedVersion::Present("digstore 0.14.0".into())
-        }
+    /// A probe that answers honestly for `digstore` and PANICS if it is ever asked about `dig-app`.
+    ///
+    /// In production `detect` is not a lookup — it is `Command::new(dest).arg("--version")` run by a
+    /// SYSTEM/root beacon, and for dig-app <= 3.3.0 that boots the identity agent, seals a master
+    /// seed and binds a signing socket. So "was the probe called?" IS the security property, and a
+    /// probe that merely returns a mute answer cannot express it: such a fixture passes whether or
+    /// not the exec happened. Panicking makes the exec observable. digstore stays a truthful control,
+    /// so a passing test also proves the planner still probes what it IS allowed to probe.
+    fn probe_that_refuses_to_run_dig_app(path: &Path) -> DetectedVersion {
+        assert!(
+            !path.ends_with("dig-app"),
+            "the planner EXECUTED dig-app to decide whether to hold it — the privileged exec the \
+             hold exists to prevent (a SYSTEM boot of the identity agent on every pass)"
+        );
+        DetectedVersion::Present("digstore 0.14.0".into())
     }
 
     #[test]
@@ -719,29 +750,32 @@ mod tests {
     }
 
     #[test]
-    fn only_dig_app_requires_version_evidence() {
-        // The policy is PER COMPONENT: every component that answers `--version` keeps the ordinary
-        // reinstall-to-repair behaviour, so this is not a global weakening of the update path.
+    fn only_dig_app_is_declared_unsafe_to_probe() {
+        // The declaration is PER COMPONENT: every component known to answer `--version` and exit is
+        // still probed and still repaired by reinstalling, so this is neither a global weakening of
+        // the update path nor a global ban on probing.
         let cat = Catalog::alpha_defaults_in(Path::new("/opt/dig/bin"), &platform());
         assert_eq!(
             cat.target(DIG_APP_COMPONENT_NAME).unwrap().evidence,
-            VersionEvidence::Required
+            VersionEvidence::UnsafeToProbe
         );
         for component in ["dig-node", "digstore", "dig-dns", BEACON_COMPONENT_NAME] {
             assert_eq!(
                 cat.target(component).unwrap().evidence,
-                VersionEvidence::NotRequired,
+                VersionEvidence::SafeToProbe,
                 "{component} answers --version, so it is repaired by reinstalling"
             );
         }
     }
 
     #[test]
-    fn a_component_that_cannot_report_its_version_is_held_while_its_siblings_still_update() {
-        // The fail-closed core (dig_ecosystem#1746/#1749). dig-app is installed but mute, so it is
-        // HELD: no plan entry at all, hence nothing the applier could install, health-gate or roll
-        // back. digstore — the control — is on 0.14.0 against a 0.15.0 manifest and MUST still be
-        // planned as an Update: holding one component must not abandon the pass.
+    fn an_unsafe_to_probe_component_is_held_while_its_siblings_still_update() {
+        // The fail-closed core (dig_ecosystem#1746/#1749) AND the security property in one fixture:
+        // dig-app is declared unsafe to probe, so it is HELD **without ever being executed** — the
+        // probe panics if asked about it — and gets no plan entry, hence nothing the applier could
+        // install, health-gate or roll back. digstore, the truthful control, is on 0.14.0 against a
+        // 0.15.0 manifest and MUST still be probed and planned as an Update: holding one component
+        // must neither abandon the pass nor stop the beacon probing what it may.
         let m = manifest_of(&[
             ("digstore", "0.15.0", 15_000),
             ("dig-app", "3.4.0", 3_004_000),
@@ -754,7 +788,7 @@ mod tests {
             ],
             &catalog_with_dig_app(),
             &platform(),
-            &digstore_answers_dig_app_is_mute,
+            &probe_that_refuses_to_run_dig_app,
         )
         .unwrap();
 
@@ -779,41 +813,56 @@ mod tests {
     }
 
     #[test]
-    fn a_component_requiring_evidence_is_held_when_it_is_not_installed_at_all() {
-        // Absent is held too, not Installed: the beacon UPDATES a per-user daemon it can verify, and
-        // an install it could not health-gate would be attempt-fail-rollback churn on every pass.
+    fn an_unsafe_to_probe_component_is_never_executed_even_to_decide_the_hold() {
+        // THE SECURITY PROPERTY, isolated. The unsafe component is the ONLY one in the manifest, so
+        // nothing else could account for a probe call: any exec at all fails this test. A hold
+        // decided from the probe's ANSWER — however correct its outcome — cannot pass here, which is
+        // exactly the point: that answer is unobtainable without the exec.
         let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
         let plan = Plan::build(
             &m,
             &[staged("dig-app", "/staging/dig-app")],
             &catalog_with_dig_app(),
             &platform(),
-            &|_| DetectedVersion::Absent,
+            &|path| panic!("the planner executed {} to decide a hold", path.display()),
         )
-        .unwrap();
+        .expect("holding a component never fails the plan");
+
         assert!(plan.components.is_empty());
         assert_eq!(plan.held.len(), 1);
-        assert!(plan.held[0].reason.contains("not installed"));
+        assert!(
+            plan.held[0].reason.contains("did not run it"),
+            "the reason must state that the binary was NOT executed: {}",
+            plan.held[0].reason
+        );
     }
 
     #[test]
-    fn a_component_requiring_evidence_updates_normally_once_it_answers_the_probe() {
-        // THE GATE OPENS BY ITSELF. The hold is keyed on the host's own probe answer, not on a flag
-        // someone must remember to flip, so the pass dig_ecosystem#1749 ships turns dig-app into an
-        // ordinary health-gated component with NO further change here. An implementation that simply
-        // never plans dig-app would pass every other test in this file and fail this one.
+    fn declaring_a_component_safe_to_probe_makes_it_update_normally() {
+        // The flip is a ONE-LINE catalog change, and this proves the whole path behind it is complete:
+        // the reviewed decision to trust a component's `--version` is all that stands between dig-app
+        // and ordinary health-gated updates. An implementation that special-cased dig-app by NAME
+        // rather than by declaration would fail this.
         let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
+        let safe_dig_app = Catalog::new(vec![ComponentTarget {
+            name: DIG_APP_COMPONENT_NAME.into(),
+            method: InstallMethod::RawBinary,
+            dest: PathBuf::from("/opt/dig/dig-app"),
+            aliases: vec![],
+            service: None,
+            evidence: VersionEvidence::SafeToProbe, // the ONLY difference from the held fixture
+        }]);
         let plan = Plan::build(
             &m,
             &[staged("dig-app", "/staging/dig-app")],
-            &catalog_with_dig_app(),
+            &safe_dig_app,
             &platform(),
             &|_| DetectedVersion::Present("dig-app 3.3.0".into()),
         )
         .unwrap();
         assert!(
             plan.held.is_empty(),
-            "a component that proved its version is not held"
+            "a safe-to-probe component is not held"
         );
         assert_eq!(plan.components[0].action, UpdateAction::Update);
         assert_eq!(
@@ -824,7 +873,33 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_version_still_reinstalls_a_component_that_does_not_require_evidence() {
+    fn a_version_line_with_trailing_detail_is_still_aged_correctly() {
+        // A hold must never be reachable by a COSMETIC change to a component's version line. Reading
+        // the last whitespace token would take `(build` out of `dig-app 3.4.0 (build abc123)` and pack
+        // it to nothing — silently un-ageing a perfectly good install, and for a safe-to-probe
+        // component silently reinstalling it every pass. The first token that IS a version is stable
+        // against detail on either side.
+        let detailed = DetectedVersion::Present("dig-app 3.4.0 (build abc123)".into());
+        assert_eq!(installed_build(&detailed), Some(3_004_000));
+        assert_eq!(
+            installed_build(&DetectedVersion::Present("digstore 0.15.0".into())),
+            Some(15_000),
+            "the conventional two-token line is unchanged"
+        );
+        assert_eq!(
+            installed_build(&DetectedVersion::Present("0.15.0".into())),
+            Some(15_000),
+            "a bare version is unchanged"
+        );
+        assert_eq!(
+            installed_build(&DetectedVersion::Present("no version here at all".into())),
+            None,
+            "and a line with no version in it is still un-ageable"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_version_still_reinstalls_a_safe_to_probe_component() {
         // The control for the policy: digstore answers `--version`, so an unreadable answer means a
         // corrupt or partial install and reinstalling from the verified artifact is the REPAIR. Held
         // must not leak into the components that rely on that behaviour.
@@ -848,7 +923,7 @@ mod tests {
         // whole pass (`StagedArtifactMissing`) over a component nobody was going to touch.
         let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
         let plan = Plan::build(&m, &[], &catalog_with_dig_app(), &platform(), &|_| {
-            DetectedVersion::Present(String::new())
+            panic!("a held component is neither probed nor staged")
         })
         .expect("a held component with no staged bytes is not a structurally incomplete plan");
         assert_eq!(plan.held.len(), 1);

@@ -64,8 +64,8 @@ pub enum ComponentResult {
     Deferred,
     /// The install failed (or failed health) and was rolled back to the last-known-good build.
     RolledBack,
-    /// Tracked, but deliberately NOT acted on this pass — the component has not proven which version
-    /// is installed, so nothing was downloaded over it, installed, or rolled back
+    /// Tracked, but deliberately NOT acted on this pass — the component is declared unsafe to
+    /// execute, so it was not even probed, let alone downloaded over, installed or rolled back
     /// ([`crate::plan::HeldComponent`]). Distinct from `Skipped`, which asserts the component is
     /// already current; a hold asserts nothing about it except that the beacon left it alone.
     Held,
@@ -315,12 +315,12 @@ impl Installer<'_> {
             components.push(outcome);
         }
 
-        // 3b. Report every HELD component (SPEC §9.7): a component that has not proven its installed
-        // version is absent from `plan.components` by construction, so there is nothing to apply —
-        // but it MUST still appear in the report with its reason, or a pass would claim success while
-        // silently never considering it. A hold is an ordinary expected state, not a failure, so it
-        // leaves `all_succeeded` alone: freezing every other component's trust-state advance behind
-        // one un-probeable daemon would turn a legible hold into an ecosystem-wide stall.
+        // 3b. Report every HELD component (SPEC §9.7(5)): a component declared unsafe to execute is
+        // absent from `plan.components` by construction — never probed, never staged — so there is
+        // nothing to apply. It MUST still appear in the report with its reason, or a pass would claim
+        // success while silently never considering it. A hold is a declared, expected state rather
+        // than a failure, so it leaves `all_succeeded` alone: freezing every other component's
+        // trust-state advance behind it would turn a legible hold into a host-wide stall.
         components.extend(plan.held.iter().map(|h| ComponentOutcome {
             component: h.name.clone(),
             action: ACTION_HOLD.to_string(),

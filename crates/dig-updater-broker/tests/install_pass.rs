@@ -207,7 +207,7 @@ fn apply_with_suppress(
         dest: dest.to_path_buf(),
         aliases: vec![],
         service: None,
-        evidence: VersionEvidence::NotRequired,
+        evidence: VersionEvidence::SafeToProbe,
     }]);
     let platform = Platform::current();
     let installer = Installer {
@@ -624,7 +624,7 @@ fn apply_self_and_other(
             dest: self_dest.to_path_buf(),
             aliases: vec![],
             service: None,
-            evidence: VersionEvidence::NotRequired,
+            evidence: VersionEvidence::SafeToProbe,
         },
         ComponentTarget {
             name: "digstore".into(),
@@ -632,7 +632,7 @@ fn apply_self_and_other(
             dest: other_dest.to_path_buf(),
             aliases: vec![],
             service: None,
-            evidence: VersionEvidence::NotRequired,
+            evidence: VersionEvidence::SafeToProbe,
         },
     ]);
     let platform = Platform::current();
@@ -823,7 +823,7 @@ fn apply_with_service(
         dest: dest.to_path_buf(),
         aliases: vec![],
         service: Some(service_id.to_string()),
-        evidence: VersionEvidence::NotRequired,
+        evidence: VersionEvidence::SafeToProbe,
     }]);
     let platform = Platform::current();
     let installer = Installer {
@@ -1005,7 +1005,7 @@ fn apply_aliased(
         dest: dest.to_path_buf(),
         aliases,
         service: service_id.map(str::to_string),
-        evidence: VersionEvidence::NotRequired,
+        evidence: VersionEvidence::SafeToProbe,
     }]);
     let platform = Platform::current();
     let installer = Installer {
@@ -1166,20 +1166,27 @@ fn manifest_with_dig_app(base: &str, other_artifact: &[u8], dig_app_artifact: &[
     }
 }
 
-/// A REAL pass over a host running a mute `dig-app` beside an out-of-date `digstore`
+/// A REAL pass over a host running an unsafe-to-probe `dig-app` beside an out-of-date `digstore`
 /// (dig_ecosystem#1746/#1749).
 ///
-/// The fixture varies ONE actor: dig-app answers `--version` with nothing (its pre-#1749 reality),
-/// while digstore answers honestly and is genuinely stale — the truthful control that makes a
-/// hold distinguishable from an abandoned pass. Both artifacts are really downloaded, verified and
-/// staged by the worker, so nothing but the applier's own decision keeps dig-app's bytes off disk.
+/// The fixture varies ONE actor: dig-app is declared unsafe to probe, while digstore answers honestly
+/// and is genuinely stale — the truthful control that makes a hold distinguishable from an abandoned
+/// pass. Both artifacts are really downloaded, verified and staged by the worker, so nothing but the
+/// applier's own decision keeps dig-app's bytes off disk.
 ///
-/// The dig-app destination file is the load-bearing assertion. A hold placed at the wrong layer —
-/// filtering in `Plan::actionable`, or skipping late in the apply loop — satisfies "dig-app is not
-/// reported as Installed" identically, but would already have written the file (and, its health gate
-/// failing, rolled it back). Asserting the file was never created is what pins the placement.
+/// Two load-bearing assertions, because the design has two distinct failure modes:
+///
+/// - **The probe is never called for dig-app.** In production `detect` EXECUTES the target, and
+///   dig-app <= 3.3.0 treats any argument as "boot the identity agent" — under SYSTEM, sealing a
+///   master seed and binding a signing socket. Both injected probes panic on dig-app's path, so this
+///   whole pass fails if the privileged exec happens anywhere: enumeration OR the health gate.
+/// - **The destination file is byte-untouched and no `.dig-updater-old` sibling exists.** A hold
+///   placed at the wrong layer — filtering in `Plan::actionable`, or skipping late in the apply loop —
+///   satisfies "dig-app is not reported as Installed" identically while already having written the
+///   file. (A rollback would restore the bytes, so the `Held` RESULT assertion is what catches that
+///   variant; the move-aside sibling is what catches a swap that landed and was reverted.)
 #[test]
-fn a_mute_dig_app_is_held_while_its_stale_sibling_really_installs() {
+fn an_unsafe_to_probe_dig_app_is_held_unexecuted_while_its_stale_sibling_really_installs() {
     let home = tempfile::tempdir().unwrap();
     let digstore_dest = home.path().join("bin").join("digstore");
     let dig_app_dest = home.path().join("bin").join("dig-app");
@@ -1195,19 +1202,25 @@ fn a_mute_dig_app_is_held_while_its_stale_sibling_really_installs() {
     ));
     let report = stage(&srv.base, &home.path().join("staging"));
 
-    // dig-app IS installed (a file on disk, so the hold cannot be an artefact of it being absent)
-    // but reports no version; digstore honestly reports a stale 0.1.0.
+    // dig-app IS installed (a real file on disk, so the hold cannot be an artefact of it being
+    // absent) and both probes REFUSE to run it; digstore honestly reports a stale 0.1.0.
     std::fs::create_dir_all(dig_app_dest.parent().unwrap()).unwrap();
     std::fs::write(&dig_app_dest, b"the-running-dig-app-3.3.0-binary").unwrap();
-    let dig_app_dest_probe = dig_app_dest.clone();
-    let detect = move |p: &Path| {
-        if p == dig_app_dest_probe {
-            DetectedVersion::Present(String::new())
-        } else {
-            DetectedVersion::Present("digstore 0.1.0".to_string())
-        }
+    let refuse_to_exec_dig_app = |p: &Path, stage: &str| {
+        assert!(
+            !p.ends_with("dig-app"),
+            "the pass EXECUTED dig-app at {stage} — under SYSTEM that boots the identity agent, \
+             seals a master seed and binds a signing socket (dig_ecosystem#1746)"
+        );
     };
-    let health = |_: &Path| DetectedVersion::Present("digstore 0.2.0".to_string());
+    let detect = |p: &Path| {
+        refuse_to_exec_dig_app(p, "enumeration");
+        DetectedVersion::Present("digstore 0.1.0".to_string())
+    };
+    let health = |p: &Path| {
+        refuse_to_exec_dig_app(p, "the health gate");
+        DetectedVersion::Present("digstore 0.2.0".to_string())
+    };
 
     let store = TrustStateStore::for_channel(home.path(), Channel::Stable);
     let loaded = store.load().expect("load state");
@@ -1221,7 +1234,7 @@ fn a_mute_dig_app_is_held_while_its_stale_sibling_really_installs() {
             dest: digstore_dest.clone(),
             aliases: vec![],
             service: None,
-            evidence: VersionEvidence::NotRequired,
+            evidence: VersionEvidence::SafeToProbe,
         },
         ComponentTarget {
             name: "dig-app".into(),
@@ -1229,7 +1242,7 @@ fn a_mute_dig_app_is_held_while_its_stale_sibling_really_installs() {
             dest: dig_app_dest.clone(),
             aliases: vec![],
             service: None,
-            evidence: VersionEvidence::Required,
+            evidence: VersionEvidence::UnsafeToProbe,
         },
     ]);
     let platform = Platform::current();
@@ -1279,8 +1292,8 @@ fn a_mute_dig_app_is_held_while_its_stale_sibling_really_installs() {
     assert_eq!(dig_app.result, ComponentResult::Held);
     assert_eq!(dig_app.action, "hold");
     assert!(
-        dig_app.detail.contains("--version"),
-        "the hold names its cause: {}",
+        dig_app.detail.contains("did not run it"),
+        "the hold states that the binary was NOT executed: {}",
         dig_app.detail
     );
     assert_eq!(

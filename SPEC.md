@@ -638,13 +638,27 @@ Enumeration and the §9.5 health gate both answer one question about each compon
 the binary at its destination? Both MUST answer it by spawning `<dest> --version` under a **bounded**
 wait.
 
-- A binary that has not answered within the probe budget MUST be **killed** and reported as
-  *installed but unreadable* (`Present` with no version), which the decision matrix treats as
-  unparseable — so the component is reinstalled and the §9.5 health gate REJECTS it.
+- A binary that has not answered within the probe budget (**10 seconds**) MUST be **killed** and
+  reported as *installed but unreadable* (`Present` with no version), which the decision matrix treats
+  as unparseable. **For a component declared safe to probe** (§9.7(5)) that means corrupt or partial
+  bytes: it is reinstalled and the §9.5 health gate REJECTS anything that still cannot report the
+  promised version. A component declared UNSAFE to probe is never spawned at all, so this case cannot
+  arise for it.
 - The wait MUST NOT be unbounded. The probe runs at ENUMERATION, before any install, so an
   unanswering binary on an unbounded probe stalls the ENTIRE pass indefinitely — one component
   freezes every other component's updates on that host — and strands the spawned process under the
   beacon's identity.
+- **The probe EXECUTES the installed binary, from a SYSTEM/root parent.** It is therefore not a read,
+  and what it does is decided by the binary, not by the beacon. Two consequences are normative: a
+  binary whose `--version` behaviour is not known to be "print and exit" MUST NOT be probed at all
+  (§9.7(5)), and the probe child MUST be spawned with a CLEARED environment — only variables required
+  to run a process on the platform (`SystemRoot`, `SystemDrive`, `PATH`) are passed, never `HOME`,
+  `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` or any `XDG_*`. Passing those lets a probed program resolve
+  a data directory belonging to the beacon's own privileged profile, or — under `sudo -E` — plant
+  root-owned state inside the invoking user's data directory.
+- The version is read as the FIRST whitespace-separated token of the answer that parses as a version,
+  not the last. Trailing detail (`dig-app 3.4.0 (build abc123)`) is common, and taking the last token
+  would leave a component un-ageable on a purely cosmetic change to its version line.
 
 **Therefore a component the beacon tracks MUST answer `--version` on stdout and EXIT.** A program
 that ignores its arguments and enters a long-running loop cannot be health-gated: it fails its gate
@@ -656,7 +670,8 @@ HELD, never installed on the hope that it will (§9.7(5)).
 
 A component may be a **per-user daemon with a login autostart** rather than a service or a CLI —
 `dig-app`, the tray/menu-bar identity agent, registered under Windows `HKCU\…\Run`, a macOS
-LaunchAgent, or a Linux systemd **user** unit. Four contracts govern such a component.
+LaunchAgent, or a Linux systemd **user** unit. The contracts below — (1) through (5) — govern such a
+component.
 
 **(1) Replacement is a move-aside swap; activation is DEFERRED to next login.** A running daemon
 holds its own image open, so the §9.5 resilient raw-binary replace applies unchanged: the existing
@@ -702,41 +717,45 @@ byte-identical alias, never a distinct sibling program. A sibling program that n
 own component, and MUST NOT be claimed by two components at once — two components resolving one
 installed filename would overwrite each other on every pass.
 
-**(5) A component MAY require VERSION EVIDENCE before the beacon acts on it.** A tracked component
-declares whether an unreadable version (§9.6) is to be repaired by reinstalling or is a reason to
-stand back:
+**(5) Every tracked component declares whether it is SAFE TO PROBE, and one that is not is never
+EXECUTED.** The §9.6 probe runs the installed binary from a SYSTEM/root parent, so whether
+`--version` is a question or an action is a property of the binary, not of the beacon:
 
-- *evidence not required* (every CLI and service component, the default) — an unreadable version means
-  the installed bytes are corrupt or partial, and reinstalling from the verified artifact is the
-  repair. Unchanged behaviour.
-- *evidence required* — the beacon acts ONLY on a build that has proven which version it is by
-  answering the §9.6 probe. Otherwise the component is **HELD**: it MUST NOT be installed over,
-  moved aside, health-gated or rolled back, and the pass MUST report it as `held` with a reason
-  naming the missing capability. A hold asserts nothing about the component except that the beacon
-  left it alone — it is NOT `skipped`, which claims the component is already current.
+- *safe to probe* (every CLI and service component, the default) — the binary is known to answer
+  `--version` and exit. It is probed, and an unreadable answer means corrupt or partial bytes,
+  repaired by reinstalling (§9.6). Unchanged behaviour.
+- *unsafe to probe* — executing the binary may have side effects. The beacon MUST NOT execute it,
+  and MUST NOT decide anything that requires executing it. The component is **HELD**: not probed, not
+  downloaded over, not installed, not moved aside, not health-gated, not rolled back. The pass MUST
+  report it as `held` with a reason stating that the binary was not run and what would make it
+  updatable. A hold asserts nothing about the component except that the beacon left it alone — it is
+  NOT `skipped`, which claims the component is already current.
 
-A hold is decided from the host's own probe answer, never from a build-time flag, so the first pass
-after the component gains `--version` plans it as an ordinary component under the full §9.5 health
-gate with no change to the broker. Both failing answers are held: *installed but mute* (an install
-could not be verified afterwards) and *not installed* (a fresh install could not be health-gated
-either, and placing a per-user agent is the installer's job per (2)).
+**The hold MUST be decided from the DECLARATION, never from the probe's answer.** Deciding it from the
+answer requires the very execution the declaration exists to prevent — the beacon would boot the
+component at machine privilege in order to conclude that it should leave it alone. There is no version
+evidence obtainable by running a binary not yet established as safe to run. A component therefore
+becomes updatable by a reviewed change of its declaration, once its released binary is known to print
+and exit; that review is the control, and its cost is deliberate.
 
 A hold MUST NOT block the pass: the other components install normally and the trust state still
-advances, because freezing every component's anti-rollback progress behind one un-probeable daemon
-would turn a legible hold into a host-wide stall. Requiring evidence is therefore fail-closed for the
-component and fail-open for the pass — and never silent, which is what keeps it from becoming a
-vacuous success.
+advances, because freezing every component's anti-rollback progress behind one unprobeable daemon
+would turn a legible hold into a host-wide stall. A hold is therefore fail-closed for the component
+and fail-open for the pass — and never silent, which is what keeps it from becoming a vacuous success.
 
 **Tracked status.** `dig-app` is declared in the feed (§10.3) and IS in the broker's tracked catalog
-as a raw-binary, service-less, alias-less component declaring *evidence required* per (5). Its
-release also publishes `dign`, which is NOT part of its set: `dign` is already installed as
-dig-node's byte-identical alias, and one installed filename claimed by two components would have them
-overwrite each other every pass per (4).
+as a raw-binary, service-less, alias-less component declared *unsafe to probe* per (5). Its release
+also publishes `dign`, which is NOT part of its set: `dign` is already installed as dig-node's
+byte-identical alias, and one installed filename claimed by two components would have them overwrite
+each other every pass per (4).
 
-Until dig_ecosystem#1749 lands, `dig-app` parses no arguments — its `main` builds its agent and mounts
-a tray event loop that owns the process — so it cannot report a version and every pass HOLDS it,
-reporting the cause. It is not installed, replaced, or rolled back in that state. The pass after it
-answers `--version` updates it normally.
+`dig-app` <= 3.3.0 parses NO arguments — `main` builds its agent and mounts a tray event loop that owns
+the process — so `--version` boots the agent: on a first run it seals a fresh master seed and it binds
+a loopback identity/signing socket. Probed by the beacon, that would happen under SYSTEM/root on every
+pass. So every pass HOLDS dig-app, without running it, and reports the cause. `dig-app` 3.4.0 adds a
+`--version` that prints and exits (dig_ecosystem#1749); it becomes updatable when the catalog declares
+it safe to probe, which MUST NOT be done before a stable dig-app release carrying that behaviour is
+the version hosts actually have.
 
 ---
 

@@ -174,7 +174,7 @@ fn a_service_backed_replace_lands_new_bytes_on_disk_before_health_666b() {
         aliases: vec![],
         // Intended new field: the service this component's binary belongs to.
         service: Some("net.dignetwork.dig-node".to_string()),
-        evidence: VersionEvidence::NotRequired,
+        evidence: VersionEvidence::SafeToProbe,
     };
 
     let pc = PlannedComponent {
