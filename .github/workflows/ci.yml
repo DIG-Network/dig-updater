@@ -43,6 +43,21 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  release-scripts:
+    # The release helpers under `scripts/` mutate a git tree from a release workflow, where a wrong
+    # exit code costs a failed release cut rather than a failed test (#1806). They are shell, so they
+    # are tested as shell — against real throwaway repositories — and gated here.
+    name: Release helper scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (the helpers re-sync Cargo.lock)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Shell lint
+        run: shellcheck scripts/*.sh scripts/tests/*.sh
+      - name: Test
+        run: bash scripts/tests/release-helpers.test.sh
+
   clippy:
     # Lint on Linux AND Windows: the privilege-drop sandbox is `#[cfg]`-split per OS, so a
     # single-OS lint would leave the Windows restricted-token path unchecked.

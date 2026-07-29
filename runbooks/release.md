@@ -68,6 +68,14 @@ commit, pushes the branch, and opens a **"next dev cycle" PR** bumping main to `
 merge that PR so main moves ahead. The workflow REFUSES if `release/0.15` or `v0.15.0` already
 exists.
 
+**When main already carries the version you are opening the line at** — the normal case for a repo's
+FIRST cut — the prep commit has nothing to change, and that is fine: the step logs `already correct`
+and the branch is still pushed. Same for the next-dev PR when main is already at `next_dev_version`:
+it logs that no PR is needed instead of failing. Every mutating step in the cut tolerates being
+already in the desired state, so **re-running a cut that failed part-way through is the normal
+recovery** — it will converge rather than die on work it already did. (What it still refuses: a line
+that already exists on the remote, and a `Cargo.toml` whose version line cannot be found.)
+
 ### Step 2 — cut `vX.Y.Z` from the release line
 
 Actions → **Nightly + stable release** → **Run workflow** → **set the branch/ref to `release/0.15`**
