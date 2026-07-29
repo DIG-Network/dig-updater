@@ -18,6 +18,15 @@
 # The stable version is DELIBERATE at branch-cut (release-prep), not the accidental sum of per-PR
 # bumps on main — that gap is exactly what epic #1049 fixes.
 #
+# IDEMPOTENCY (learned the hard way, #1806). Every mutating step tolerates "already in the desired
+# state" and says so, because the FIRST cut a repo ever makes is the case that breaks a naive
+# implementation: main already carries the version the line opens at, so the prep commit changes
+# nothing, `git commit` exits 1, and the job dies BEFORE pushing the branch or opening the next-dev
+# PR — having done nothing at all. The steps that matter here are the push and the PR, not the
+# commit, and retrying a half-finished release cut is normal recovery, so a step whose work is
+# already done must succeed. What is NOT tolerated: re-opening a line that already exists on the
+# remote, or a Cargo.toml whose version line cannot be found (both still hard failures).
+#
 # RELEASE_TOKEN posture: pushing the new `release/X.Y` branch + its prep commit lands on a branch
 # protected by the `release/*` ruleset (SPEC §14.7), which GITHUB_TOKEN cannot do. The bump-main PR
 # is a NORMAL PR through main's gates. If RELEASE_TOKEN is absent this workflow NO-OPS with a clear
@@ -129,23 +138,7 @@ jobs:
         if: steps.token.outputs.present == 'true'
         id: setver
         shell: bash
-        env:
-          VERSION: ${{ steps.inputs.outputs.version }}
-        run: |
-          set -euo pipefail
-          python3 - "$VERSION" <<'PY'
-          import re, sys
-          version = sys.argv[1]
-          text = open("Cargo.toml", encoding="utf-8").read()
-          # Set the single [workspace.package] version members inherit via version.workspace = true.
-          new, n = re.subn(r'(?m)^(version\s*=\s*")[^"]+(")', rf'\g<1>{version}\g<2>', text, count=1)
-          if n != 1:
-              sys.exit("could not locate the [workspace.package] version line in Cargo.toml")
-          open("Cargo.toml", "w", encoding="utf-8").write(new)
-          PY
-          # `--workspace` limits the lockfile update to the workspace members (whose versions just
-          # changed) — it does NOT churn external dependencies. Keeps `--locked` builds green.
-          cargo update --workspace
+        run: bash scripts/set-workspace-version.sh "${{ steps.inputs.outputs.version }}"
 
       - name: Push the release line + prep commit
         if: steps.token.outputs.present == 'true'
@@ -157,13 +150,19 @@ jobs:
           set -euo pipefail
           git config user.name "dig-release-bot"
           git config user.email "release-bot@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): prep v$VERSION"
+          # `-B` rather than `-b`: creating the line is the intent, and re-running a cut whose push
+          # failed must not die on "branch already exists" before it gets to retry the push. The
+          # remote is still protected by the earlier refuse-if-the-line-exists guard.
+          git checkout -B "$BRANCH"
+          # The prep commit is a no-op when main ALREADY carries the version the line opens at —
+          # which is every repo's first release cut. That is a success: the branch still has to be
+          # pushed, and it is the push that opens the line.
+          bash scripts/commit-if-changed.sh "chore(release): prep v$VERSION" Cargo.toml Cargo.lock
           # Lands on the ruleset-protected release branch via RELEASE_TOKEN's bypass (SPEC §14.7),
           # the same enforce_admins=false posture main uses for the changelog commit.
           git push origin "$BRANCH"
-          echo "Opened $BRANCH at v$VERSION. Cut the first stable with: Actions → Nightly + stable release → channel: stable, ref: $BRANCH."
+          echo "Opened $BRANCH at v$VERSION (HEAD $(git rev-parse --short HEAD))."
+          echo "Cut the first stable with: Actions → Nightly + stable release → channel: stable, ref: $BRANCH."
 
       - name: Open the "next dev cycle" PR (bump main)
         if: steps.token.outputs.present == 'true'
@@ -171,6 +170,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           NEXT_DEV: ${{ steps.inputs.outputs.next_dev }}
+          VERSION: ${{ steps.inputs.outputs.version }}
           XY: ${{ steps.inputs.outputs.xy }}
           BRANCH: ${{ steps.inputs.outputs.branch }}
         run: |
@@ -180,20 +180,24 @@ jobs:
           # normal PR through main's gates (not a direct push) — main stays PR-only.
           DEV_BRANCH="chore/next-dev-$NEXT_DEV"
           git checkout main
-          git checkout -b "$DEV_BRANCH"
-          python3 - "$NEXT_DEV" <<'PY'
-          import re, sys
-          version = sys.argv[1]
-          text = open("Cargo.toml", encoding="utf-8").read()
-          new, n = re.subn(r'(?m)^(version\s*=\s*")[^"]+(")', rf'\g<1>{version}\g<2>', text, count=1)
-          if n != 1:
-              sys.exit("could not locate the [workspace.package] version line in Cargo.toml")
-          open("Cargo.toml", "w", encoding="utf-8").write(new)
-          PY
-          cargo update --workspace
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): open dev cycle for v$NEXT_DEV"
-          git push origin "$DEV_BRANCH"
+          git checkout -B "$DEV_BRANCH"
+          bash scripts/set-workspace-version.sh "$NEXT_DEV"
+          # Idempotent for the same reason as the prep commit: if main is already at the next dev
+          # version (a re-run, or a repo whose dev version was advanced by hand), there is nothing to
+          # commit and the PR below is still the thing that needs to exist.
+          bash scripts/commit-if-changed.sh "chore(release): open dev cycle for v$NEXT_DEV" Cargo.toml Cargo.lock
+          if [ -z "$(git log origin/main..HEAD --oneline)" ]; then
+            echo "main is already at v$NEXT_DEV — no next-dev PR is needed."
+            exit 0
+          fi
+          git push --force-with-lease origin "$DEV_BRANCH"
+          # A re-run of a cut whose PR step failed must converge, not fail: an existing open PR for
+          # this branch is the desired end state.
+          if existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$DEV_BRANCH" --state open --json number --jq '.[0].number')" \
+            && [ -n "$existing" ]; then
+            echo "PR #$existing already open for $DEV_BRANCH — left as is."
+            exit 0
+          fi
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$DEV_BRANCH" \
             --title "chore(release): open dev cycle for v$NEXT_DEV" \
-            --body "Automated by \`cut-release-branch.yml\`: the stable line \`$BRANCH\` was cut at \`v${NEXT_DEV%.*}\`… (see the release runbook). This advances main's leading dev version to \`v$NEXT_DEV\` so per-PR bumps accumulate toward the next stable line and never collide with \`$BRANCH\`. Nightlies keep cutting from main HEAD (unchanged)."
+            --body "Automated by \`cut-release-branch.yml\`: the stable line \`$BRANCH\` was cut at \`v$VERSION\` (see the release runbook). This advances main's leading dev version to \`v$NEXT_DEV\` so per-PR bumps accumulate toward the next stable line and never collide with \`$BRANCH\`. Nightlies keep cutting from main HEAD (unchanged)."
