@@ -649,7 +649,8 @@ wait.
 **Therefore a component the beacon tracks MUST answer `--version` on stdout and EXIT.** A program
 that ignores its arguments and enters a long-running loop cannot be health-gated: it fails its gate
 by construction, so it is not merely unsupported but un-updatable. Bounding the wait makes such a
-binary SAFE to enumerate; it does not make it installable.
+binary SAFE to enumerate; it does not make it installable — a tracked component that cannot answer is
+HELD, never installed on the hope that it will (§9.7(5)).
 
 ### 9.7 Per-user daemon components (normative)
 
@@ -701,13 +702,41 @@ byte-identical alias, never a distinct sibling program. A sibling program that n
 own component, and MUST NOT be claimed by two components at once — two components resolving one
 installed filename would overwrite each other on every pass.
 
-**Tracked status.** `dig-app` is declared in the feed (§10.3), so the manifest publishes its build
-for all four platforms. It is NOT yet in the broker's tracked catalog, and MUST NOT be until it
-satisfies §9.6: `dig-app` currently parses no arguments — its `main` builds its agent and mounts a
-tray event loop that owns the process — so it cannot report a version, and its sibling `dign` cannot
-stand in for it (it exposes no `--version` either, and `dign` is already installed as a
-byte-identical alias of `dig-node`, so it is claimed by another component per (4)). A manifest entry
-is inert for an untracked component: the broker acts only on its own catalog.
+**(5) A component MAY require VERSION EVIDENCE before the beacon acts on it.** A tracked component
+declares whether an unreadable version (§9.6) is to be repaired by reinstalling or is a reason to
+stand back:
+
+- *evidence not required* (every CLI and service component, the default) — an unreadable version means
+  the installed bytes are corrupt or partial, and reinstalling from the verified artifact is the
+  repair. Unchanged behaviour.
+- *evidence required* — the beacon acts ONLY on a build that has proven which version it is by
+  answering the §9.6 probe. Otherwise the component is **HELD**: it MUST NOT be installed over,
+  moved aside, health-gated or rolled back, and the pass MUST report it as `held` with a reason
+  naming the missing capability. A hold asserts nothing about the component except that the beacon
+  left it alone — it is NOT `skipped`, which claims the component is already current.
+
+A hold is decided from the host's own probe answer, never from a build-time flag, so the first pass
+after the component gains `--version` plans it as an ordinary component under the full §9.5 health
+gate with no change to the broker. Both failing answers are held: *installed but mute* (an install
+could not be verified afterwards) and *not installed* (a fresh install could not be health-gated
+either, and placing a per-user agent is the installer's job per (2)).
+
+A hold MUST NOT block the pass: the other components install normally and the trust state still
+advances, because freezing every component's anti-rollback progress behind one un-probeable daemon
+would turn a legible hold into a host-wide stall. Requiring evidence is therefore fail-closed for the
+component and fail-open for the pass — and never silent, which is what keeps it from becoming a
+vacuous success.
+
+**Tracked status.** `dig-app` is declared in the feed (§10.3) and IS in the broker's tracked catalog
+as a raw-binary, service-less, alias-less component declaring *evidence required* per (5). Its
+release also publishes `dign`, which is NOT part of its set: `dign` is already installed as
+dig-node's byte-identical alias, and one installed filename claimed by two components would have them
+overwrite each other every pass per (4).
+
+Until dig_ecosystem#1749 lands, `dig-app` parses no arguments — its `main` builds its agent and mounts
+a tray event loop that owns the process — so it cannot report a version and every pass HOLDS it,
+reporting the cause. It is not installed, replaced, or rolled back in that state. The pass after it
+answers `--version` updates it normally.
 
 ---
 
@@ -1083,9 +1112,10 @@ Administrator/root.
     {
       "component": "dig-node",
       "action":    "update",              // a dry check reports "would_fetch"; a full pass
-                                           // reports its plan action ("install"/"update"/"skip")
+                                           // reports its plan action ("install"/"update"/"skip",
+                                           // or "hold" for a held component, §9.7(5))
       "result":    "installed",           // a dry check reports "staged"; a full pass reports
-                                           // "installed"/"skipped"/"deferred"/"rolled_back"
+                                           // "installed"/"skipped"/"deferred"/"rolled_back"/"held"
       "detail":    "dig-node now reports dig-node 0.26.0"
     }
   ],

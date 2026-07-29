@@ -95,7 +95,8 @@ pub use health::VersionProbe;
 pub use install::RetryPolicy;
 pub use pass::{ComponentOutcome, ComponentResult, Installer, PassReport};
 pub use plan::{
-    Catalog, ComponentTarget, InstallMethod, Plan, PlannedComponent, BEACON_COMPONENT_NAME,
+    Catalog, ComponentTarget, HeldComponent, InstallMethod, Plan, PlannedComponent,
+    VersionEvidence, BEACON_COMPONENT_NAME, DIG_APP_COMPONENT_NAME,
 };
 pub use rollback::{LkgCache, RestoreKind};
 pub use sandbox::Sandbox;
