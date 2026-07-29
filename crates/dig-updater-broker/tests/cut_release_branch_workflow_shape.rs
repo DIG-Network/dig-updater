@@ -11,11 +11,27 @@
 //!   3. It REFUSES when the `release/X.Y` branch or the `vX.Y.0` tag already exists (no re-open, no
 //!      clobber of a shipped version).
 //!   4. It no-ops cleanly without RELEASE_TOKEN (never a half-cut line).
-//!   5. It sets the version + syncs the lock with `cargo update --workspace` (so `--locked` stays
-//!      green) and pushes the prep commit to `release/X.Y`.
+//!   5. It sets the version + syncs the lock (so `--locked` stays green) and pushes the prep commit
+//!      to `release/X.Y` — via the tested `scripts/` helpers, with NO bare `git commit` anywhere.
 //!   6. It opens a NORMAL PR to bump main (main stays PR-only, never a direct push).
+//!
+//! These are assertions about SHAPE, deliberately: the helpers' BEHAVIOUR is tested against real git
+//! repositories in `scripts/tests/release-helpers.test.sh`. What this file pins is that the workflow
+//! still routes through them — a YAML that re-inlined the logic could reintroduce dig_ecosystem#1806
+//! while every shell test stayed green.
 
 use std::path::PathBuf;
+
+/// A release helper script `scripts/<name>`, so an invariant can be pinned where it now LIVES rather
+/// than where it used to be inlined.
+fn helper(name: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("scripts")
+        .join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
 
 fn cut_release_branch() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -83,9 +99,15 @@ fn no_ops_cleanly_without_release_token() {
 fn sets_version_syncs_lock_and_pushes_the_prep_commit() {
     let wf = cut_release_branch();
     assert!(
-        wf.contains("cargo update --workspace"),
-        "the cut job must sync Cargo.lock with `cargo update --workspace` after setting the version \
-         (so `--locked` builds/tests stay green on the release branch)"
+        wf.contains("scripts/set-workspace-version.sh"),
+        "the cut job must set the version through `scripts/set-workspace-version.sh` — the helper \
+         tested against real git repositories, which treats an already-correct version as success \
+         (dig_ecosystem#1806)"
+    );
+    assert!(
+        helper("set-workspace-version.sh").contains("cargo update --workspace"),
+        "the version helper must sync Cargo.lock with `cargo update --workspace` (so `--locked` \
+         builds/tests stay green on the release branch)"
     );
     assert!(
         wf.contains("chore(release): prep v"),
@@ -94,6 +116,42 @@ fn sets_version_syncs_lock_and_pushes_the_prep_commit() {
     assert!(
         wf.contains(r#"git push origin "$BRANCH""#),
         "the cut job must push the new `release/X.Y` branch with its prep commit"
+    );
+}
+
+/// THE dig_ecosystem#1806 REGRESSION GUARD, at the layer where the bug actually lived.
+///
+/// The first cut of dig-updater's release line died on `git commit` exiting 1 with nothing staged —
+/// main already carried the version the line was opening at — and the job stopped before pushing the
+/// branch or opening the PR, having done nothing at all. Every commit in this workflow must therefore
+/// go through the guarded helper. The shell suite cannot catch a YAML that stops calling it, which is
+/// exactly how this would come back.
+#[test]
+fn commits_only_through_the_guarded_helper_never_a_bare_git_commit() {
+    let wf = cut_release_branch();
+    // Comment lines are stripped first: the workflow's own header EXPLAINS the `git commit` failure
+    // this guards against, and a guard that trips on the prose describing it would be unusable — the
+    // next person would delete the explanation rather than the defect.
+    let executable: String = wf
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !executable.contains("git commit"),
+        "cut-release-branch.yml must not call `git commit` directly: a commit with nothing staged \
+         exits 1 and kills the cut before the push and the next-dev PR (dig_ecosystem#1806). Use \
+         `scripts/commit-if-changed.sh`, which treats an already-correct tree as success."
+    );
+    assert!(
+        wf.matches("scripts/commit-if-changed.sh").count() >= 2,
+        "BOTH mutating steps — the release-branch prep commit and the next-dev main bump — must go \
+         through the guarded helper; each had its own bare `git commit`"
+    );
+    assert!(
+        helper("commit-if-changed.sh").contains("git diff --cached --quiet"),
+        "the helper must decide by comparing the INDEX against HEAD — the only question that answers \
+         `would this commit contain anything?`"
     );
 }
 
