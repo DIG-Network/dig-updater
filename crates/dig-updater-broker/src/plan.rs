@@ -793,14 +793,14 @@ mod tests {
             };
             assert_eq!(
                 target.evidence, expected,
-                "{} is declared {:?}; a component the beacon may execute at machine privilege must                  be named in MAY_BE_EXECUTED with a reason, and everything else must be                  UnsafeToProbe",
+                "{} is declared {:?}; a component the beacon may execute at machine privilege must be named in MAY_BE_EXECUTED with a reason, and everything else must be UnsafeToProbe",
                 target.name, target.evidence
             );
         }
         assert_eq!(
             seen,
             MAY_BE_EXECUTED.len() + 1,
-            "the catalog should hold the executable set plus dig-app; if that changed, the new              component's evidence declaration needs reviewing here"
+            "the catalog should hold the executable set plus dig-app; if that changed, the new component's evidence declaration needs reviewing here"
         );
         assert_eq!(
             cat.target(DIG_APP_COMPONENT_NAME).unwrap().evidence,
