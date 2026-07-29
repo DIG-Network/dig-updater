@@ -651,20 +651,26 @@ wait.
 - **The probe EXECUTES the installed binary, from a SYSTEM/root parent.** It is therefore not a read,
   and what it does is decided by the binary, not by the beacon. Two consequences are normative: a
   binary whose `--version` behaviour is not known to be "print and exit" MUST NOT be probed at all
-  (§9.7(5)), and the probe child MUST be spawned with a CLEARED environment — only variables required
-  to run a process on the platform (`SystemRoot`, `SystemDrive`, `PATH`) are passed, never `HOME`,
-  `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` or any `XDG_*`. Passing those lets a probed program resolve
-  a data directory belonging to the beacon's own privileged profile, or — under `sudo -E` — plant
-  root-owned state inside the invoking user's data directory.
+  (§9.7(5)), and the probe child MUST be spawned with a CLEARED environment and a SYSTEM working
+  directory. Exactly two variables are passed — `SystemRoot` and `SystemDrive`, which the Windows
+  loader needs to resolve system DLLs — and nothing else: never `PATH`, never `HOME`, `USERPROFILE`,
+  `APPDATA`, `LOCALAPPDATA` or any `XDG_*`. Passing a data-directory variable lets a probed program
+  resolve a directory belonging to the beacon's own privileged profile, or — under `sudo -E` — plant
+  root-owned state inside the invoking user's data directory. `PATH` and the working directory are
+  excluded for a different reason: both are inputs to the Windows DLL search order for the child, so
+  inheriting them would let a directory the beacon did not choose contribute code to a process it
+  launched at machine privilege. The working directory MUST be a system-owned one
+  (`%SystemRoot%\System32`, or `/` on unix).
 - The version is read as the FIRST whitespace-separated token of the answer that parses as a version,
   not the last. Trailing detail (`dig-app 3.4.0 (build abc123)`) is common, and taking the last token
   would leave a component un-ageable on a purely cosmetic change to its version line.
 
-**Therefore a component the beacon tracks MUST answer `--version` on stdout and EXIT.** A program
-that ignores its arguments and enters a long-running loop cannot be health-gated: it fails its gate
-by construction, so it is not merely unsupported but un-updatable. Bounding the wait makes such a
-binary SAFE to enumerate; it does not make it installable — a tracked component that cannot answer is
-HELD, never installed on the hope that it will (§9.7(5)).
+**Therefore a component the beacon is to keep current MUST answer `--version` on stdout and EXIT.**
+A program that ignores its arguments and enters a long-running loop cannot be health-gated — it fails
+its gate by construction — and, because the probe is an EXECUTION, asking it is itself the harm. Such
+a component is declared unsafe to probe and HELD: not run, not installed on the hope that it will
+answer (§9.7(5)). Bounding the wait makes a MISBEHAVING probe survivable; it does not make an
+unanswering binary safe to run, and it is not what keeps the beacon from running one.
 
 ### 9.7 Per-user daemon components (normative)
 

@@ -65,7 +65,7 @@ pub enum ComponentResult {
     /// The install failed (or failed health) and was rolled back to the last-known-good build.
     RolledBack,
     /// Tracked, but deliberately NOT acted on this pass — the component is declared unsafe to
-    /// execute, so it was not even probed, let alone downloaded over, installed or rolled back
+    /// execute, so it was not even probed, let alone installed over or rolled back
     /// ([`crate::plan::HeldComponent`]). Distinct from `Skipped`, which asserts the component is
     /// already current; a hold asserts nothing about it except that the beacon left it alone.
     Held,
@@ -316,8 +316,8 @@ impl Installer<'_> {
         }
 
         // 3b. Report every HELD component (SPEC §9.7(5)): a component declared unsafe to execute is
-        // absent from `plan.components` by construction — never probed, never staged — so there is
-        // nothing to apply. It MUST still appear in the report with its reason, or a pass would claim
+        // absent from `plan.components` by construction — never probed, never installed — so there
+        // is nothing to apply. It MUST still appear in the report with its reason, or a pass would claim
         // success while silently never considering it. A hold is a declared, expected state rather
         // than a failure, so it leaves `all_succeeded` alone: freezing every other component's
         // trust-state advance behind it would turn a legible hold into a host-wide stall.

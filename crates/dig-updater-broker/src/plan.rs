@@ -129,8 +129,12 @@ pub enum InstallMethod {
 ///   it, and an unreadable answer means corrupt or partial bytes, repaired by reinstalling. Every
 ///   CLI and service component.
 /// - [`Self::UnsafeToProbe`] — executing the installed binary may have side effects, so the beacon
-///   MUST NOT execute it at all. The component is [`HeldComponent`]: not probed, not staged, not
-///   installed, and reported with its reason every pass.
+///   MUST NOT execute it at all. The component is [`HeldComponent`]: not probed, not installed, not
+///   moved aside, not health-gated, not rolled back, and reported with its reason every pass. (Its
+///   artifact IS still downloaded — the unprivileged worker stages every manifest artifact and knows
+///   nothing of the catalog — but those bytes are digest-verified, land in an Admin/SYSTEM-only
+///   directory, are never marked executable and are never read again: the cost is bandwidth, not
+///   exposure.)
 ///
 /// **The gate is declaration-driven, deliberately.** An earlier revision of this design decided the
 /// hold from the probe's own answer, so that a component gaining `--version` would start updating
@@ -140,11 +144,15 @@ pub enum InstallMethod {
 /// executing a binary you have not established is safe to execute. Flipping a component to
 /// [`Self::SafeToProbe`] is therefore a reviewed one-line change, made once its released binary is
 /// known to answer without booting — the cost of that review is the whole point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Deliberately NOT `Default`. A default would have to be one or the other, and the only one safe to
+/// pick silently is the restrictive one — while the useful one, `SafeToProbe`, is a claim about a
+/// specific binary that nobody should make by omission. Requiring every [`ComponentTarget`] to state
+/// it means a component added later cannot inherit permission to be executed at machine privilege
+/// from a `..Default::default()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionEvidence {
     /// The binary answers `--version` and exits: probe it, and reinstall it if the answer is
-    /// unreadable. The default, and the behaviour of every component that ships a CLI entrypoint.
-    #[default]
+    /// unreadable. The behaviour of every component that ships a CLI entrypoint.
     SafeToProbe,
     /// Executing the binary may have side effects, so it is never executed and the component is
     /// always HELD ([`HeldComponent`]).
@@ -320,6 +328,15 @@ impl Catalog {
     pub fn target(&self, name: &str) -> Option<&ComponentTarget> {
         self.targets.iter().find(|t| t.name == name)
     }
+
+    /// Every tracked target, in catalog order.
+    ///
+    /// Exists so the catalog can be audited as a WHOLE rather than component by name — the property
+    /// that matters about [`VersionEvidence`] is "which components may the beacon execute?", and a
+    /// by-name check cannot see a component added later.
+    pub fn targets(&self) -> impl Iterator<Item = &ComponentTarget> {
+        self.targets.iter()
+    }
 }
 
 /// One component's planned action for this pass: what to do, and everything needed to do it.
@@ -415,9 +432,10 @@ impl Plan {
 
             // Decide the HOLD FIRST, and — the security-critical part — decide it WITHOUT running
             // `detect`, because `detect` EXECUTES the installed binary (see [`hold_reason`]). A held
-            // component is therefore never spawned, never staged and never installed: this `continue`
-            // is the only thing standing between a SYSTEM/root beacon and a component that treats
-            // every argument as "boot me".
+            // component is therefore never spawned and never installed: this `continue` is the only
+            // thing standing between a SYSTEM/root beacon and a component that treats every argument
+            // as "boot me". (Its bytes are still staged by the catalog-blind worker; see
+            // `HeldComponent`.)
             if let Some(reason) = hold_reason(target) {
                 held.push(HeldComponent {
                     name: component.name.clone(),
@@ -750,22 +768,45 @@ mod tests {
     }
 
     #[test]
-    fn only_dig_app_is_declared_unsafe_to_probe() {
-        // The declaration is PER COMPONENT: every component known to answer `--version` and exit is
-        // still probed and still repaired by reinstalling, so this is neither a global weakening of
-        // the update path nor a global ban on probing.
+    fn every_component_the_beacon_may_execute_is_named_here_explicitly() {
+        // The question this answers is "which components may a SYSTEM/root beacon EXECUTE?", so it is
+        // asked of the WHOLE catalog rather than of four names: a component added later is unnamed
+        // here, so declaring it `SafeToProbe` fails this test until someone deliberately adds it and
+        // states why. A by-name loop would let the sixth component inherit permission in silence.
+        const MAY_BE_EXECUTED: [&str; 4] = [
+            // Each of these ships a CLI entrypoint whose `--version` prints and exits; verified by
+            // execution under the cleared probe environment (all four answered in under a second).
+            "dig-node",
+            "digstore",
+            "dig-dns",
+            BEACON_COMPONENT_NAME,
+        ];
         let cat = Catalog::alpha_defaults_in(Path::new("/opt/dig/bin"), &platform());
-        assert_eq!(
-            cat.target(DIG_APP_COMPONENT_NAME).unwrap().evidence,
-            VersionEvidence::UnsafeToProbe
-        );
-        for component in ["dig-node", "digstore", "dig-dns", BEACON_COMPONENT_NAME] {
+
+        let mut seen = 0;
+        for target in cat.targets() {
+            seen += 1;
+            let expected = if MAY_BE_EXECUTED.contains(&target.name.as_str()) {
+                VersionEvidence::SafeToProbe
+            } else {
+                VersionEvidence::UnsafeToProbe
+            };
             assert_eq!(
-                cat.target(component).unwrap().evidence,
-                VersionEvidence::SafeToProbe,
-                "{component} answers --version, so it is repaired by reinstalling"
+                target.evidence, expected,
+                "{} is declared {:?}; a component the beacon may execute at machine privilege must                  be named in MAY_BE_EXECUTED with a reason, and everything else must be                  UnsafeToProbe",
+                target.name, target.evidence
             );
         }
+        assert_eq!(
+            seen,
+            MAY_BE_EXECUTED.len() + 1,
+            "the catalog should hold the executable set plus dig-app; if that changed, the new              component's evidence declaration needs reviewing here"
+        );
+        assert_eq!(
+            cat.target(DIG_APP_COMPONENT_NAME).unwrap().evidence,
+            VersionEvidence::UnsafeToProbe,
+            "dig-app boots its agent on any argument, so it must never be executed"
+        );
     }
 
     #[test]

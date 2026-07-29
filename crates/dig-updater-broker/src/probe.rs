@@ -76,12 +76,19 @@ fn spawn_version_query(path: &Path) -> io::Result<Child> {
 
 /// The ONLY environment variables a probe child inherits — everything else is cleared.
 ///
-/// These are the variables a process needs to run at all on its platform, not to do any work:
-/// `SystemRoot`/`SystemDrive` because the Windows loader and Win32 initialization resolve system DLLs
-/// through them, and `PATH` because a dynamically-linked binary may need the loader's search path.
-/// Deliberately ABSENT: every variable that tells a program WHERE A USER'S DATA LIVES — `HOME`,
-/// `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` and the whole `XDG_*` family.
-const PROBE_ENV_ALLOWLIST: [&str; 3] = ["SystemRoot", "SystemDrive", "PATH"];
+/// Just the two the Windows loader and Win32 initialization need to resolve SYSTEM DLLs. Two classes
+/// are deliberately absent, for two different reasons:
+///
+/// - **Where a user's data lives** — `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, every `XDG_*`.
+///   A probed program that resolves a data directory on startup would otherwise resolve the beacon's
+///   own privileged profile, or a `sudo -E` caller's directory.
+/// - **Where code can be loaded from** — notably `PATH`, which on Windows is the tail of the DLL
+///   search order for the child. Passing it would let a directory the beacon did not choose
+///   contribute code to a process it launched at machine privilege, which is the same objection this
+///   allowlist exists to make. It is not needed: `PATH` plays no part in unix library resolution
+///   (that is `ld.so` + RPATH), and every DIG component was verified to print its version and exit
+///   in well under a second with only these two variables set.
+const PROBE_ENV_ALLOWLIST: [&str; 2] = ["SystemRoot", "SystemDrive"];
 
 /// Clear the probe child's inherited environment down to [`PROBE_ENV_ALLOWLIST`].
 ///
@@ -103,6 +110,28 @@ fn apply_minimal_env(command: &mut Command) {
     command.env_clear();
     for (key, value) in inherited_allowlisted_env() {
         command.env(key, value);
+    }
+    command.current_dir(system_working_dir());
+}
+
+/// The system-owned directory a probe child runs in.
+///
+/// Never the beacon's inherited working directory. On Windows the CWD is searched for DLLs, so a
+/// probe launched from a user-writable directory — which `dig-updater run` from an elevated prompt
+/// really is — would let a DLL planted there satisfy a genuinely-missing import in the child, as
+/// machine-privileged code. `%SystemRoot%\System32` and `/` are chosen because they are
+/// system-owned and certain to exist; the probed path itself is absolute, so nothing about resolving
+/// the program depends on this.
+#[must_use]
+fn system_working_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        std::path::PathBuf::from(root).join("System32")
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from("/")
     }
 }
 
@@ -291,9 +320,10 @@ mod tests {
         );
     }
 
-    /// The bound is only useful if the health gate then REJECTS the unreadable answer: the pass must
-    /// roll such a component back, not accept it as current. Asserting the probe's return value
-    /// alone would leave that link unproven.
+    /// For a SAFE-TO-PROBE component, the bound is only useful if the health gate then rejects the
+    /// unreadable answer: the pass must roll such a component back, not accept it as current.
+    /// Asserting the probe's return value alone would leave that link unproven. (A component declared
+    /// unsafe to probe never reaches this path at all — it is never spawned.)
     #[test]
     fn an_unanswering_binary_fails_the_health_gate() {
         let path = installed_path();
@@ -400,6 +430,14 @@ mod tests {
                 .iter()
                 .all(|(k, _)| PROBE_ENV_ALLOWLIST.contains(&k.as_str())),
             "only allowlisted variables may be passed: {inherited:?}"
+        );
+        // `PATH` is excluded on purpose and is asserted separately from the canaries above, because
+        // mutating this process's own `PATH` mid-suite would disturb sibling tests that spawn shells.
+        // On Windows it is the tail of the child's DLL search order, and no DIG component needs it to
+        // print its version.
+        assert!(
+            !PROBE_ENV_ALLOWLIST.contains(&"PATH"),
+            "PATH must not reach a probe child — it is a code-loading input on Windows"
         );
     }
 
