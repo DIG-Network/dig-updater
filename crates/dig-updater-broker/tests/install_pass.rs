@@ -106,11 +106,36 @@ impl Server {
     }
 }
 
+/// A digest reader that PANICS if consulted — see the `digest:` field comment on each harness.
+fn digest_must_not_be_read(path: &Path) -> Option<String> {
+    panic!(
+        "a component established by its `--version` probe must not be hashed: {}",
+        path.display()
+    )
+}
+
 // --- feed + worker helpers ---
+
+/// The component name the digest-evidenced scenarios use — dig-app's real manifest name, since the
+/// property under test is exactly the one the shipped catalog declares for it.
+const DIGEST_COMPONENT: &str = "dig-app";
 
 /// A manifest with one component ("digstore") whose single artifact targets THIS host and is
 /// served at `{base}/artifact`.
 fn manifest(base: &str, version: &str, build: u64, floor: u64, artifact: &[u8]) -> Manifest {
+    manifest_for("digstore", base, version, build, floor, artifact)
+}
+
+/// [`manifest`] for an arbitrarily-NAMED component, so a scenario can drive a component whose catalog
+/// entry declares a different evidence class.
+fn manifest_for(
+    name: &str,
+    base: &str,
+    version: &str,
+    build: u64,
+    floor: u64,
+    artifact: &[u8],
+) -> Manifest {
     let p = Platform::current();
     Manifest {
         schema: 1,
@@ -120,7 +145,7 @@ fn manifest(base: &str, version: &str, build: u64, floor: u64, artifact: &[u8]) 
         expires: FAR_FUTURE,
         rollback_floor_build: floor,
         components: vec![Component {
-            name: "digstore".into(),
+            name: name.into(),
             version: version.into(),
             build,
             artifacts: vec![Artifact {
@@ -224,13 +249,179 @@ fn apply_with_suppress(
         now: NOW,
         detect,
         health,
+        // Every harness in this file drives a SafeToProbe component, whose version comes from its
+        // probe — so reading a digest here would mean the planner or the health gate had consulted
+        // the wrong evidence source, which this panicking reader makes observable.
+        digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(()),
         suppress_state_advance,
     };
     installer.apply(root, report, loaded)
 }
 
+/// Drive one apply pass over a component declared [`VersionEvidence::ArtifactDigest`] — dig-app's
+/// class (dig_ecosystem#1803) — with BOTH version probes wired to panic.
+///
+/// The panicking probes are the point of the harness: the guarantee is that a SYSTEM/root beacon never
+/// EXECUTES this component, before or after installing it, and a probe that merely returned a mute
+/// answer could not tell an exec that happened from one that did not. `digest` is injected so the
+/// honest-reader and lying-reader cases can both be driven; the install itself is real bytes on disk.
+fn apply_digest_evidenced(
+    root: &VerifyingKey,
+    report: &WorkerReport,
+    home: &Path,
+    dest: &Path,
+    digest: &dyn Fn(&Path) -> Option<String>,
+) -> Result<PassReport, BrokerError> {
+    let store = TrustStateStore::for_channel(home, Channel::Stable);
+    let loaded = store.load().expect("load state");
+    let lkg = LkgCache::at(home.join("lkg"));
+    let staging_dir = home.join("staging");
+    let apply_dir = home.join("apply");
+    std::fs::create_dir_all(&apply_dir).expect("apply dir");
+    let catalog = Catalog::new(vec![ComponentTarget {
+        name: DIGEST_COMPONENT.into(),
+        method: InstallMethod::RawBinary,
+        dest: dest.to_path_buf(),
+        aliases: vec![],
+        service: None,
+        evidence: VersionEvidence::ArtifactDigest,
+    }]);
+    let never_execute = |path: &Path| -> DetectedVersion {
+        panic!(
+            "the beacon EXECUTED {} — a digest-evidenced component is never run, at any version, on \
+             any path (dig_ecosystem#1803)",
+            path.display()
+        )
+    };
+    let platform = Platform::current();
+    let installer = Installer {
+        store: &store,
+        catalog: &catalog,
+        platform: &platform,
+        lkg: &lkg,
+        staging_dir: &staging_dir,
+        apply_dir: &apply_dir,
+        retry: RetryPolicy {
+            attempts: 2,
+            backoff: Duration::ZERO,
+        },
+        now: NOW,
+        detect: &never_execute,
+        health: &never_execute,
+        digest,
+        service_ctl: &|_, _| Ok(()),
+        suppress_state_advance: false,
+    };
+    installer.apply(root, report, loaded)
+}
+
 // =============================== the scenarios ===============================
+
+#[test]
+fn a_digest_evidenced_component_installs_without_ever_being_executed() {
+    // dig_ecosystem#1803 end to end, with the PRODUCTION digest reader and real bytes: a component
+    // the beacon may never run is nonetheless brought current and health-gated, because the evidence
+    // is the signed manifest's artifact digest measured against the file on disk.
+    //
+    // Both probes panic, so this cannot pass on an implementation that executes the component
+    // anywhere on the path — including the post-install health gate, which is the second exec site
+    // and the one a plan-only fix would leave open. The health gate is a REAL re-hash of the
+    // just-installed bytes via `installed_digest_hex`, so it is a genuine gate rather than an
+    // exemption: it can only pass because the installed bytes actually are the promised artifact.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("dig-app");
+
+    let artifact = b"the-dig-app-3.4.0-binary-bytes";
+    let server = Server::bind();
+    let m = manifest_for(
+        DIGEST_COMPONENT,
+        &server.base,
+        "3.4.0",
+        3_004_000,
+        0,
+        artifact,
+    );
+    let _guard = server.serve(routes(&m, artifact));
+    let report = stage(&server.base, &home.path().join("staging"));
+
+    let out = apply_digest_evidenced(
+        &test_root().verifying_key(),
+        &report,
+        home.path(),
+        &dest,
+        &dig_updater_broker::installed_digest_hex,
+    )
+    .expect("the pass applies");
+
+    let line = &out.components[0];
+    assert_eq!(
+        line.result,
+        ComponentResult::Installed,
+        "a digest-evidenced component installs like any other: {}",
+        line.detail
+    );
+    assert_eq!(
+        std::fs::read(&dest).expect("the binary is on disk"),
+        artifact,
+        "the installed bytes are the verified artifact"
+    );
+    assert_eq!(
+        dig_updater_broker::installed_digest_hex(&dest).as_deref(),
+        Some(hex(&Sha256::digest(artifact)).as_str()),
+        "and they hash to the digest the signed manifest promised"
+    );
+    assert!(out.state_advanced, "a fully successful pass advances state");
+}
+
+#[test]
+fn a_digest_evidenced_component_rolls_back_when_the_post_install_digest_does_not_match() {
+    // The health gate's FAILING arm, which is what makes the digest re-hash a gate rather than a
+    // rubber stamp. The reader answers a digest that is never the manifest's, so the pass installs
+    // and then cannot prove the bytes at the destination are the promised build — and must roll the
+    // component back instead of reporting a success it did not verify.
+    //
+    // The same reader also drives enumeration, so the component is correctly planned as an Update
+    // first: the fixture exercises the whole plan → install → gate → rollback path, not just the gate
+    // in isolation. The probes still panic, so failing the gate must not fall back to executing it.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("dig-app");
+
+    let artifact = b"the-dig-app-3.4.0-binary-bytes";
+    let server = Server::bind();
+    let m = manifest_for(
+        DIGEST_COMPONENT,
+        &server.base,
+        "3.4.0",
+        3_004_000,
+        0,
+        artifact,
+    );
+    let _guard = server.serve(routes(&m, artifact));
+    let report = stage(&server.base, &home.path().join("staging"));
+
+    let a_digest_that_is_never_the_manifests = "0".repeat(64);
+    let out = apply_digest_evidenced(
+        &test_root().verifying_key(),
+        &report,
+        home.path(),
+        &dest,
+        &|_| Some(a_digest_that_is_never_the_manifests.clone()),
+    )
+    .expect("a rolled-back component is a reported outcome, not a pass failure");
+
+    let line = &out.components[0];
+    assert_eq!(line.result, ComponentResult::RolledBack);
+    assert!(
+        line.detail.contains("digest check failed"),
+        "the detail must name the digest as what failed, not a version probe: {}",
+        line.detail
+    );
+    assert!(
+        !out.state_advanced,
+        "a pass with a rolled-back component must not advance the trust state"
+    );
+}
 
 #[test]
 fn fresh_install_places_bytes_and_advances_state() {
@@ -658,6 +849,9 @@ fn apply_self_and_other(
         now: NOW,
         detect: &detect,
         health: &health,
+        // A SafeToProbe component's version comes from its probe; hashing it here would mean the
+        // wrong evidence source was consulted, which this panicking reader makes observable.
+        digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(()),
         suppress_state_advance: false,
     };
@@ -840,6 +1034,9 @@ fn apply_with_service(
         now: NOW,
         detect,
         health,
+        // These harnesses drive SafeToProbe components (primary + aliases), established by their
+        // probes — a digest read here would mean the wrong evidence source was consulted.
+        digest: &digest_must_not_be_read,
         service_ctl,
         suppress_state_advance: false,
     };
@@ -1022,6 +1219,9 @@ fn apply_aliased(
         now: NOW,
         detect,
         health,
+        // These harnesses drive SafeToProbe components (primary + aliases), established by their
+        // probes — a digest read here would mean the wrong evidence source was consulted.
+        digest: &digest_must_not_be_read,
         service_ctl,
         suppress_state_advance: false,
     };
@@ -1260,6 +1460,9 @@ fn an_unsafe_to_probe_dig_app_is_held_unexecuted_while_its_stale_sibling_really_
         now: NOW,
         detect: &detect,
         health: &health,
+        // A SafeToProbe component's version comes from its probe; hashing it here would mean the
+        // wrong evidence source was consulted, which this panicking reader makes observable.
+        digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(()),
         suppress_state_advance: false,
     };

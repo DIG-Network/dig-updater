@@ -623,6 +623,7 @@ mod tests {
             action: dig_release_resolver::UpdateAction::Install,
             summary: String::new(),
             installed_build: None,
+            evidence: crate::plan::VersionEvidence::SafeToProbe,
         }
     }
 

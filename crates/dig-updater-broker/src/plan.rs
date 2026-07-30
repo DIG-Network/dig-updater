@@ -8,14 +8,16 @@
 //! DIG box makes one consistent decision no matter which tool asks (SPEC §12, CLAUDE.md §4.1).
 //!
 //! A [`Catalog`] maps each tracked component to WHERE it installs, HOW ([`InstallMethod`]), and
-//! whether it is even safe to RUN ([`VersionEvidence`]) on this host. The alpha defaults
+//! WHAT ESTABLISHES which build is there ([`VersionEvidence`]) on this host. The alpha defaults
 //! ([`Catalog::alpha_defaults`]) cover dig-node (native package), digstore / dig-updater / dig-dns
-//! (raw binary) and dig-app (raw binary, unsafe to probe); they are fully overridable so tests and
-//! the installer (#504-H) can point at their own destinations.
+//! (raw binary, self-reported version) and dig-app (raw binary, content-digest evidence); they are
+//! fully overridable so tests and the installer (#504-H) can point at their own destinations.
 //!
-//! Planning therefore has one step before the Install/Update/Skip matrix: a component declared unsafe
-//! to probe is HELD ([`HeldComponent`]) **without being executed**, because detecting its version
-//! means running it, and this process is SYSTEM/root.
+//! Planning therefore has one step before the Install/Update/Skip matrix: WHICH evidence establishes
+//! the installed version, chosen from the DECLARATION alone. A component whose version can only be
+//! learned by running it, and which is not safe to run, is HELD ([`HeldComponent`]) **without being
+//! executed** — because this process is SYSTEM/root. A component with content-digest evidence needs
+//! no execution at all and is planned normally.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +27,7 @@ use dig_updater_trust::Manifest;
 use dig_updater_worker::{Platform, StagedArtifact};
 
 use crate::error::BrokerError;
+use crate::hashing::DigestReader;
 
 /// The manifest component name the beacon tracks for ITSELF. The applier uses this to carve its
 /// own component out of the ordinary per-component loop and apply it LAST, via a platform-specific
@@ -112,8 +115,8 @@ pub enum InstallMethod {
     LinuxDeb,
 }
 
-/// Whether a component is SAFE TO PROBE — i.e. whether asking it `--version` is a question or an
-/// action (SPEC §9.7(5)).
+/// WHAT establishes which build of a component is installed — and, for the two classes that would
+/// have to ASK the binary, whether asking it `--version` is a question or an action (SPEC §9.7(5)).
 ///
 /// The version probe is not a read. It is `Command::new(dest).arg("--version")`, executed by a
 /// beacon running as SYSTEM / root, and its behaviour is decided entirely by the binary on disk. A
@@ -123,18 +126,23 @@ pub enum InstallMethod {
 /// all under the machine account. Bounding that wait (see [`crate::probe`]) stops the pass hanging;
 /// it does NOT un-run the side effects.
 ///
-/// So this is a SAFETY declaration, not a preference:
+/// So this is a SAFETY declaration, not a preference. Three classes:
 ///
 /// - [`Self::SafeToProbe`] — the binary is known to answer `--version` and exit. The beacon probes
 ///   it, and an unreadable answer means corrupt or partial bytes, repaired by reinstalling. Every
 ///   CLI and service component.
-/// - [`Self::UnsafeToProbe`] — executing the installed binary may have side effects, so the beacon
-///   MUST NOT execute it at all. The component is [`HeldComponent`]: not probed, not installed, not
-///   moved aside, not health-gated, not rolled back, and reported with its reason every pass. (Its
-///   artifact IS still downloaded — the unprivileged worker stages every manifest artifact and knows
-///   nothing of the catalog — but those bytes are digest-verified, land in an Admin/SYSTEM-only
-///   directory, are never marked executable and are never read again: the cost is bandwidth, not
-///   exposure.)
+/// - [`Self::ArtifactDigest`] — the installed version is established by HASHING the file on disk
+///   against the signed manifest artifact's `sha256`, so the binary is never executed at all, at any
+///   version, on any path. The component is otherwise ordinary: planned, installed, health-gated
+///   (by a re-hash) and rolled back like every other.
+/// - [`Self::UnsafeToProbe`] — the version could only be learned by running the binary, and running
+///   it may have side effects, so the beacon MUST NOT execute it. The component is [`HeldComponent`]:
+///   not probed, not installed, not moved aside, not health-gated, not rolled back, and reported with
+///   its reason every pass. (Its artifact IS still downloaded — the unprivileged worker stages every
+///   manifest artifact and knows nothing of the catalog — but those bytes are digest-verified, land
+///   in an Admin/SYSTEM-only directory, are never marked executable and are never read again: the
+///   cost is bandwidth, not exposure.) This is the FAIL-CLOSED default for a component nobody has
+///   established evidence for yet.
 ///
 /// **The gate is declaration-driven, deliberately.** An earlier revision of this design decided the
 /// hold from the probe's own answer, so that a component gaining `--version` would start updating
@@ -142,9 +150,15 @@ pub enum InstallMethod {
 /// to prevent, so the beacon would have booted a custody agent at machine privilege on every pass in
 /// order to conclude that it should leave it alone. There is no version evidence obtainable by
 /// executing a binary you have not established is safe to execute. Flipping a component to
-/// [`Self::SafeToProbe`] is therefore a reviewed one-line change, made once its released binary is
-/// known to answer without booting — the cost of that review is the whole point.
-/// Deliberately NOT `Default`. A default would have to be one or the other, and the only one safe to
+/// [`Self::SafeToProbe`] is therefore a reviewed change, made once its released binary is known to
+/// answer without booting — the cost of that review is the whole point.
+///
+/// **[`Self::ArtifactDigest`] exists so that review is not the only way out.** It is strictly
+/// STRONGER than a probe rather than a convenient weakening: the evidence originates in the
+/// root-signed manifest instead of in the binary's own claim, so a component cannot lie about its
+/// version, and no `--version` behaviour has to be trusted at all. Prefer it over
+/// [`Self::SafeToProbe`] for any component whose startup behaviour the beacon should not have to
+/// vouch for. Deliberately NOT `Default`. A default would have to be one or the other, and the only one safe to
 /// pick silently is the restrictive one — while the useful one, `SafeToProbe`, is a claim about a
 /// specific binary that nobody should make by omission. Requiring every [`ComponentTarget`] to state
 /// it means a component added later cannot inherit permission to be executed at machine privilege
@@ -154,9 +168,25 @@ pub enum VersionEvidence {
     /// The binary answers `--version` and exits: probe it, and reinstall it if the answer is
     /// unreadable. The behaviour of every component that ships a CLI entrypoint.
     SafeToProbe,
-    /// Executing the binary may have side effects, so it is never executed and the component is
-    /// always HELD ([`HeldComponent`]).
+    /// The installed version is established by hashing the file at the destination against the signed
+    /// manifest artifact's `sha256` — the binary is NEVER executed. Requires the component to declare
+    /// no aliases (an alias would have to be compared some other way; see [`hold_reason`]).
+    ArtifactDigest,
+    /// The version could only be learned by executing the binary, and executing it may have side
+    /// effects — so it is never executed and the component is always HELD ([`HeldComponent`]).
     UnsafeToProbe,
+}
+
+impl VersionEvidence {
+    /// Whether establishing this component's installed version means EXECUTING it — the single
+    /// question every exec site in the crate must be able to ask of a declaration alone.
+    ///
+    /// Exists so "may the beacon run this?" is answered in ONE place rather than re-derived at each
+    /// call site as a pattern match that a fourth variant could silently fall through.
+    #[must_use]
+    pub fn requires_execution(self) -> bool {
+        self == Self::SafeToProbe
+    }
 }
 
 /// Where + how one tracked component installs on THIS host.
@@ -313,12 +343,23 @@ impl Catalog {
                 // until the user's next login. Killing it to install an update would destroy an
                 // unlocked identity session to deliver a background task.
                 service: None,
-                // dig-app <= 3.3.0 parses NO arguments: `--version` boots the identity agent, seals a
-                // master seed on a first run and binds a loopback signing socket. Probing it would do
-                // all of that as SYSTEM/root on every pass, so the beacon does not run it at all and
-                // HOLDS the component. Flip this to `SafeToProbe` only once the dig-app release hosts
-                // actually run prints its version and EXITS (dig_ecosystem#1749, landed in 3.4.0).
-                evidence: VersionEvidence::UnsafeToProbe,
+                // dig-app is kept current WITHOUT EVER BEING EXECUTED (dig_ecosystem#1803). Its
+                // `--version` behaviour is irrelevant here by design: the installed build is
+                // established by hashing this destination against the signed manifest artifact's
+                // `sha256`, which works because the raw-binary install renames the verified,
+                // digest-checked copy into `dest` — so a digest match IS "the current build is
+                // installed", evidenced by the root-signed manifest rather than by the binary.
+                //
+                // NEVER flip this to `SafeToProbe`, and never add a version sidecar beside the
+                // binary. dig-app <= 3.3.0 parses NO arguments — `--version` boots the identity
+                // agent, seals a master seed on a first run and binds a loopback signing socket — and
+                // that population is real and unobservable: v3.0.0/3.2.0/3.3.0 all shipped, and
+                // dig-installer 0.30.0 (the first release to carry dig-app) predates dig-app 3.4.0 by
+                // ~16 hours. The install root is per-user and user-writable (SPEC §9.7(2)), so any
+                // file-based self-report there is FORGEABLE: an unprivileged user could claim "3.4.0"
+                // beside a 3.0.0 binary and induce this SYSTEM/root beacon to boot it. A digest read
+                // cannot be steered that way, because the expected value comes from the manifest.
+                evidence: VersionEvidence::ArtifactDigest,
             },
         ])
     }
@@ -368,6 +409,11 @@ pub struct PlannedComponent {
     /// The installed version detected before this pass (`None` if absent), packed for the
     /// rollback-floor comparison — the build a rollback would reinstate.
     pub installed_build: Option<u64>,
+    /// What establishes this component's installed version, carried from its
+    /// [`ComponentTarget::evidence`] so the applier's health gate uses the SAME evidence class the
+    /// planner did. Without it the gate would fall back to a version PROBE — re-introducing, after
+    /// the install, exactly the privileged exec the planner avoided before it.
+    pub evidence: VersionEvidence,
 }
 
 /// A tracked component this pass will NOT act on, and why.
@@ -402,7 +448,10 @@ pub struct Plan {
 
 impl Plan {
     /// Enumerate + plan against the RE-VERIFIED `manifest`, the worker's `staged` artifacts, this
-    /// host's `catalog`, and `platform`, using `detect` to read each component's installed version.
+    /// host's `catalog`, and `platform`, establishing each component's installed version from the
+    /// evidence class it declares: `detect` (which EXECUTES the binary) for
+    /// [`VersionEvidence::SafeToProbe`], and `digest` (which only hashes it) for
+    /// [`VersionEvidence::ArtifactDigest`].
     ///
     /// Untracked components (not in the catalog) and components with no artifact for this platform
     /// are skipped entirely. A tracked, platform-relevant component whose artifact the worker did
@@ -419,6 +468,7 @@ impl Plan {
         catalog: &Catalog,
         platform: &Platform,
         detect: &dyn Fn(&Path) -> DetectedVersion,
+        digest: &DigestReader,
     ) -> Result<Self, BrokerError> {
         let mut components = Vec::new();
         let mut held = Vec::new();
@@ -444,7 +494,14 @@ impl Plan {
                 continue;
             }
 
-            let detected = detect(&target.dest);
+            // Then choose the EVIDENCE, again from the declaration alone. `detect` is reached only
+            // for a component whose declaration permits executing it; a digest-evidenced dest is
+            // measured instead, so no exec site in this function can be reached with it.
+            let detected = if target.evidence.requires_execution() {
+                detect(&target.dest)
+            } else {
+                digest_evidence(&target.dest, &artifact.sha256, &component.version, digest)
+            };
 
             // The worker-reported `staged_path` is carried verbatim here and is NOT trusted: it is
             // canonicalized + confined to the broker-owned staging dir by
@@ -472,13 +529,20 @@ impl Plan {
             // the stale alias would NEVER be re-refreshed and Bug A would recur. So: when the primary
             // says `Skip` but ANY alias is missing or reports a different version, re-drive the
             // component as an `Update` so the applier refreshes + health-checks the whole set.
-            let (action, summary) = redrive_for_stale_alias(
-                target,
-                &component.version,
-                decision.action,
-                decision.summary,
-                detect,
-            );
+            // The alias re-drive probes each alias, so it is reachable only for a component the
+            // declaration permits executing. A digest-evidenced component declares no aliases (or it
+            // was held above), so there is nothing for it to re-drive either way.
+            let (action, summary) = if target.evidence.requires_execution() {
+                redrive_for_stale_alias(
+                    target,
+                    &component.version,
+                    decision.action,
+                    decision.summary,
+                    detect,
+                )
+            } else {
+                (decision.action, decision.summary)
+            };
             components.push(PlannedComponent {
                 name: component.name.clone(),
                 method: target.method,
@@ -491,6 +555,7 @@ impl Plan {
                 action,
                 summary,
                 installed_build,
+                evidence: target.evidence,
             });
         }
         Ok(Self { components, held })
@@ -522,6 +587,38 @@ fn installed_build(detected: &DetectedVersion) -> Option<u64> {
     }
 }
 
+/// Establish an [`VersionEvidence::ArtifactDigest`] component's installed version by MEASURING the
+/// file at `dest` against the signed manifest artifact's `expected_digest` — never by running it.
+///
+/// The answer is expressed as a [`DetectedVersion`] so it flows into the SAME shared decision matrix
+/// ([`decide`]) every other component uses; there is no second Install/Update/Skip matrix to keep in
+/// agreement with the first (SPEC §12).
+///
+/// - digest MATCHES → the current build is what is installed, so report the manifest's own version.
+///   This is exact rather than optimistic: for a raw-binary component the verified artifact is
+///   renamed into `dest`, so equal bytes mean equal build.
+/// - digest DIFFERS → *something* is installed but its build is not established. Reported as a
+///   present-but-unreadable version, which the shared matrix turns into an Update and which leaves
+///   the component deliberately UN-AGEABLE (`installed_build == None`). That is the conservative
+///   direction: a cross-pass rollback then refuses the anti-downgrade floor gate rather than
+///   reinstating bytes whose build nobody can bound.
+/// - NO digest (absent, unreadable, a refused symlink) → nothing is established there → Install.
+#[must_use]
+fn digest_evidence(
+    dest: &Path,
+    expected_digest: &str,
+    manifest_version: &str,
+    digest: &DigestReader,
+) -> DetectedVersion {
+    match digest(dest) {
+        None => DetectedVersion::Absent,
+        Some(found) if found.eq_ignore_ascii_case(expected_digest) => {
+            DetectedVersion::Present(manifest_version.to_string())
+        }
+        Some(_) => DetectedVersion::Present(String::new()),
+    }
+}
+
 /// Why `target` is HELD this pass, or `None` to plan it normally ([`VersionEvidence`]).
 ///
 /// Takes ONLY the target: the decision is deliberately made from the DECLARATION, without touching —
@@ -533,22 +630,36 @@ fn installed_build(detected: &DetectedVersion) -> Option<u64> {
 /// only sharpens that wording.
 #[must_use]
 fn hold_reason(target: &ComponentTarget) -> Option<String> {
-    if target.evidence == VersionEvidence::SafeToProbe {
-        return None;
-    }
     let name = &target.name;
     let dest = target.dest.display();
-    let presence = if target.dest.exists() {
-        "is installed at"
-    } else {
-        "is not installed at"
-    };
-    Some(format!(
-        "held: {name} {presence} {dest} and is declared unsafe to probe, so the beacon did not run \
-         it and cannot tell which version is there. Nothing was probed, downloaded over, installed \
-         or rolled back. It updates once it ships a `--version` that prints and EXITS without \
-         starting the app (dig_ecosystem#1749) and is declared safe to probe."
-    ))
+    match target.evidence {
+        VersionEvidence::SafeToProbe => None,
+        // Content-digest evidence needs no execution, so there is nothing to hold FROM — unless the
+        // component also claims aliases, whose freshness this evidence class says nothing about
+        // (an alias is not named in the manifest, so it has no artifact digest of its own). Rather
+        // than silently skip the alias check that every other component gets, hold fail-closed.
+        VersionEvidence::ArtifactDigest if target.aliases.is_empty() => None,
+        VersionEvidence::ArtifactDigest => Some(format!(
+            "held: {name} declares content-digest evidence AND {} alias binaries, which this beacon \
+             cannot reconcile — an alias carries no manifest artifact digest of its own, so its \
+             freshness could only be established by executing it. Nothing was probed, installed or \
+             rolled back. Either drop the aliases or give the component a form of evidence that \
+             covers them.",
+            target.aliases.len()
+        )),
+        VersionEvidence::UnsafeToProbe => Some(format!(
+            "held: {name} {presence} {dest} and is declared unsafe to probe, so the beacon did not \
+             run it and cannot tell which version is there. Nothing was probed, downloaded over, \
+             installed or rolled back. It updates once it either ships a `--version` that prints and \
+             EXITS without starting the app (dig_ecosystem#1749) or is declared to carry \
+             content-digest evidence (dig_ecosystem#1803).",
+            presence = if target.dest.exists() {
+                "is installed at"
+            } else {
+                "is not installed at"
+            }
+        )),
+    }
 }
 
 /// Re-drive an aliased component as an `Update` when the PRIMARY looks current (`Skip`) but ANY of
@@ -698,22 +809,53 @@ mod tests {
         }
     }
 
+    /// The `sha256` every fixture manifest artifact carries — so a digest reader answering THIS means
+    /// "the manifest's build is what is installed", and answering anything else is a mismatch.
+    const FIXTURE_DIGEST: &str = "deadbeef";
+
+    /// A component name that is neither dig-app nor in the shipped catalog — the stand-in for "some
+    /// future component nobody has established evidence for yet". The HELD machinery must stay
+    /// covered by such a component now that dig-app has left it: a hold test pinned to dig-app would
+    /// have silently stopped testing the hold the moment dig-app moved to digest evidence.
+    const FUTURE_UNKNOWN_COMPONENT: &str = "dig-future-tray-app";
+
+    /// An ordinary alias-less component that answers `--version`.
+    fn probeable(name: &str, dest: &str) -> ComponentTarget {
+        ComponentTarget {
+            name: name.into(),
+            method: InstallMethod::RawBinary,
+            dest: PathBuf::from(dest),
+            aliases: vec![],
+            service: None,
+            evidence: VersionEvidence::SafeToProbe,
+        }
+    }
+
     /// A catalog holding `digstore` (an ordinary component that answers `--version`) beside
-    /// `dig-app` (declared unsafe to probe, so the beacon must never execute it).
+    /// `dig-app` (content-digest evidenced, so the beacon must never execute it).
     fn catalog_with_dig_app() -> Catalog {
         Catalog::new(vec![
-            ComponentTarget {
-                name: "digstore".into(),
-                method: InstallMethod::RawBinary,
-                dest: PathBuf::from("/opt/dig/digstore"),
-                aliases: vec![],
-                service: None,
-                evidence: VersionEvidence::SafeToProbe,
-            },
+            probeable("digstore", "/opt/dig/digstore"),
             ComponentTarget {
                 name: DIG_APP_COMPONENT_NAME.into(),
                 method: InstallMethod::RawBinary,
                 dest: PathBuf::from("/opt/dig/dig-app"),
+                aliases: vec![],
+                service: None,
+                evidence: VersionEvidence::ArtifactDigest,
+            },
+        ])
+    }
+
+    /// A catalog holding `digstore` beside a component declared [`VersionEvidence::UnsafeToProbe`] —
+    /// the fail-closed default, kept under test independently of dig-app.
+    fn catalog_with_an_unevidenced_component() -> Catalog {
+        Catalog::new(vec![
+            probeable("digstore", "/opt/dig/digstore"),
+            ComponentTarget {
+                name: FUTURE_UNKNOWN_COMPONENT.into(),
+                method: InstallMethod::RawBinary,
+                dest: PathBuf::from("/opt/dig").join(FUTURE_UNKNOWN_COMPONENT),
                 aliases: vec![],
                 service: None,
                 evidence: VersionEvidence::UnsafeToProbe,
@@ -721,7 +863,24 @@ mod tests {
         ])
     }
 
-    /// A probe that answers honestly for `digstore` and PANICS if it is ever asked about `dig-app`.
+    /// A digest reader that PANICS if consulted — the control for every probe-path fixture. It keeps
+    /// the two evidence classes genuinely separate: a planner that hashed every destination "just in
+    /// case" would do pointless privileged I/O over binaries whose version it already asked for, and
+    /// a reader that merely returned `None` could not tell that apart from not being called.
+    fn digest_reader_that_must_not_be_consulted(path: &Path) -> Option<String> {
+        panic!(
+            "the planner hashed {} — a component that answers `--version` is established by its \
+             probe, not by measuring it",
+            path.display()
+        )
+    }
+
+    /// A digest reader answering `hex` for EVERY path (`None` = nothing readable installed there).
+    fn digest_reader(hex: Option<&str>) -> impl Fn(&Path) -> Option<String> + '_ {
+        move |_: &Path| hex.map(str::to_string)
+    }
+
+    /// A probe that answers honestly for `digstore` and PANICS if asked about ANY other destination.
     ///
     /// In production `detect` is not a lookup — it is `Command::new(dest).arg("--version")` run by a
     /// SYSTEM/root beacon, and for dig-app <= 3.3.0 that boots the identity agent, seals a master
@@ -729,11 +888,16 @@ mod tests {
     /// probe that merely returns a mute answer cannot express it: such a fixture passes whether or
     /// not the exec happened. Panicking makes the exec observable. digstore stays a truthful control,
     /// so a passing test also proves the planner still probes what it IS allowed to probe.
-    fn probe_that_refuses_to_run_dig_app(path: &Path) -> DetectedVersion {
+    ///
+    /// It ALLOW-LISTS the one destination it may answer for rather than rejecting dig-app by name,
+    /// which is what keeps it a gate: a component added to a fixture later is refused by default
+    /// instead of quietly inheriting permission to be executed at machine privilege.
+    fn probe_that_may_only_run_digstore(path: &Path) -> DetectedVersion {
         assert!(
-            !path.ends_with("dig-app"),
-            "the planner EXECUTED dig-app to decide whether to hold it — the privileged exec the \
-             hold exists to prevent (a SYSTEM boot of the identity agent on every pass)"
+            path.ends_with("digstore"),
+            "the planner EXECUTED {} — the privileged exec the evidence declaration exists to \
+             prevent (a SYSTEM boot of an installed binary on every pass)",
+            path.display()
         );
         DetectedVersion::Present("digstore 0.14.0".into())
     }
@@ -786,14 +950,10 @@ mod tests {
         let mut seen = 0;
         for target in cat.targets() {
             seen += 1;
-            let expected = if MAY_BE_EXECUTED.contains(&target.name.as_str()) {
-                VersionEvidence::SafeToProbe
-            } else {
-                VersionEvidence::UnsafeToProbe
-            };
+            let may_execute = MAY_BE_EXECUTED.contains(&target.name.as_str());
             assert_eq!(
-                target.evidence, expected,
-                "{} is declared {:?}; a component the beacon may execute at machine privilege must be named in MAY_BE_EXECUTED with a reason, and everything else must be UnsafeToProbe",
+                target.evidence.requires_execution(), may_execute,
+                "{} is declared {:?}; a component the beacon may execute at machine privilege must be named in MAY_BE_EXECUTED with a reason, and everything else must be established without running it",
                 target.name, target.evidence
             );
         }
@@ -802,21 +962,31 @@ mod tests {
             MAY_BE_EXECUTED.len() + 1,
             "the catalog should hold the executable set plus dig-app; if that changed, the new component's evidence declaration needs reviewing here"
         );
+        assert!(
+            !MAY_BE_EXECUTED.contains(&DIG_APP_COMPONENT_NAME),
+            "dig-app must never join the executable set: it boots its identity agent on any argument, \
+             and the 3.3.0-or-older population that does so is real and unobservable"
+        );
         assert_eq!(
             cat.target(DIG_APP_COMPONENT_NAME).unwrap().evidence,
-            VersionEvidence::UnsafeToProbe,
-            "dig-app boots its agent on any argument, so it must never be executed"
+            VersionEvidence::ArtifactDigest,
+            "dig-app is kept current by MEASURING it against the signed manifest, never by running it"
         );
     }
 
     #[test]
-    fn an_unsafe_to_probe_component_is_held_while_its_siblings_still_update() {
-        // The fail-closed core (dig_ecosystem#1746/#1749) AND the security property in one fixture:
-        // dig-app is declared unsafe to probe, so it is HELD **without ever being executed** — the
-        // probe panics if asked about it — and gets no plan entry, hence nothing the applier could
-        // install, health-gate or roll back. digstore, the truthful control, is on 0.14.0 against a
-        // 0.15.0 manifest and MUST still be probed and planned as an Update: holding one component
-        // must neither abandon the pass nor stop the beacon probing what it may.
+    fn a_digest_evidenced_component_is_planned_without_ever_being_executed() {
+        // dig_ecosystem#1803, THE CORE PROPERTY. dig-app's installed build is established by hashing
+        // its destination against the signed manifest artifact's `sha256`, so it is planned like any
+        // other component — reaching `plan.components`, never `plan.held` — while NEVER being run.
+        //
+        // The fixture is built so a WRONG PLACEMENT of the digest branch cannot pass. Asserting only
+        // "dig-app is planned as Skip" would also hold for an implementation that probed first and
+        // then overrode the answer with the digest; the panicking probe is what distinguishes those,
+        // because it makes the exec itself observable rather than only its effect on the outcome.
+        // digstore stays a TRUTHFUL control on 0.14.0 against a 0.15.0 manifest, so the same run also
+        // proves the planner still probes what it IS allowed to probe — a fixture in which every
+        // component were digest-evidenced could not see a probe path that had stopped working.
         let m = manifest_of(&[
             ("digstore", "0.15.0", 15_000),
             ("dig-app", "3.4.0", 3_004_000),
@@ -829,7 +999,190 @@ mod tests {
             ],
             &catalog_with_dig_app(),
             &platform(),
-            &probe_that_refuses_to_run_dig_app,
+            &probe_that_may_only_run_digstore,
+            &digest_reader(Some(FIXTURE_DIGEST)),
+        )
+        .unwrap();
+
+        assert!(
+            plan.held.is_empty(),
+            "content-digest evidence needs no execution, so there is nothing to hold from: {:?}",
+            plan.held
+        );
+        let dig_app = plan
+            .components
+            .iter()
+            .find(|c| c.name == DIG_APP_COMPONENT_NAME)
+            .expect("dig-app is PLANNED now, not held (dig_ecosystem#1803)");
+        assert_eq!(
+            dig_app.action,
+            UpdateAction::Skip,
+            "the installed bytes hash to the manifest artifact's digest, so the current build IS \
+             installed: {}",
+            dig_app.summary
+        );
+        assert_eq!(
+            dig_app.installed_build,
+            Some(3_004_000),
+            "a digest match ages the install on the same packed scale as every other component"
+        );
+        assert_eq!(
+            dig_app.evidence,
+            VersionEvidence::ArtifactDigest,
+            "the evidence class must reach the applier, or its health gate would fall back to a probe"
+        );
+
+        let digstore = plan
+            .components
+            .iter()
+            .find(|c| c.name == "digstore")
+            .expect("the control component is still planned");
+        assert_eq!(
+            digstore.action,
+            UpdateAction::Update,
+            "the probe path must keep working: digstore is on 0.14.0 against a 0.15.0 manifest"
+        );
+    }
+
+    #[test]
+    fn a_digest_mismatch_plans_an_update_and_leaves_the_install_unageable() {
+        // The mismatch arm. SOMETHING is installed but its build is not established, so the shared
+        // matrix must reinstall the verified artifact — and `installed_build` must stay `None`, which
+        // is what makes a cross-pass rollback refuse the anti-downgrade floor rather than reinstate
+        // bytes whose age nobody can bound. The digest differs from the manifest's by ONE nibble, so
+        // the test cannot pass on a comparison that only checks the length or the prefix.
+        let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
+        let plan = Plan::build(
+            &m,
+            &[staged("dig-app", "/staging/dig-app")],
+            &catalog_with_dig_app(),
+            &platform(),
+            &|path| {
+                panic!(
+                    "the planner executed {} to establish a version",
+                    path.display()
+                )
+            },
+            &digest_reader(Some("deadbeee")),
+        )
+        .unwrap();
+
+        assert_eq!(plan.components[0].action, UpdateAction::Update);
+        assert_eq!(
+            plan.components[0].installed_build, None,
+            "an unestablished build must be UN-AGEABLE, so a rollback declines rather than guesses"
+        );
+    }
+
+    #[test]
+    fn a_digest_match_is_case_insensitive_across_the_manifests_hex_casing() {
+        // The digest is hex, and hex casing is not semantically meaningful. A case-sensitive compare
+        // would report a spurious mismatch — reinstalling a perfectly current dig-app on EVERY pass,
+        // which is the failure mode that looks like success in a report.
+        let m = manifest_one("dig-app", "3.4.0", 3_004_000, "DEADBEEF");
+        let plan = Plan::build(
+            &m,
+            &[staged("dig-app", "/staging/dig-app")],
+            &catalog_with_dig_app(),
+            &platform(),
+            &|path| {
+                panic!(
+                    "the planner executed {} to establish a version",
+                    path.display()
+                )
+            },
+            &digest_reader(Some("deadbeef")),
+        )
+        .unwrap();
+        assert_eq!(plan.components[0].action, UpdateAction::Skip);
+    }
+
+    #[test]
+    fn an_absent_digest_evidenced_component_is_planned_install() {
+        // The absent arm: no readable file at the destination — which also covers an unreadable one
+        // and a refused symlink, since the reader collapses all three to `None`. Nothing is
+        // established there, so the component is INSTALLED rather than held or skipped.
+        let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
+        let plan = Plan::build(
+            &m,
+            &[staged("dig-app", "/staging/dig-app")],
+            &catalog_with_dig_app(),
+            &platform(),
+            &|path| {
+                panic!(
+                    "the planner executed {} to establish a version",
+                    path.display()
+                )
+            },
+            &digest_reader(None),
+        )
+        .unwrap();
+        assert_eq!(plan.components[0].action, UpdateAction::Install);
+        assert_eq!(plan.components[0].installed_build, None);
+    }
+
+    #[test]
+    fn a_digest_evidenced_component_that_claims_aliases_is_held_fail_closed() {
+        // Content-digest evidence says nothing about an ALIAS: an alias is not named in the manifest,
+        // so it carries no artifact digest of its own, and its freshness could only be established by
+        // running it. Rather than silently skip the alias check every other component gets — which
+        // would let an alias sit frozen at its install-time build while the pass reported success
+        // (the #666 Bug A shape) — such a declaration is HELD.
+        //
+        // This is asserted rather than left to a "dig-app happens to declare no aliases" test, because
+        // the latter pins today's catalog instead of the rule a future component would be added under.
+        let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
+        let with_alias = Catalog::new(vec![ComponentTarget {
+            name: DIG_APP_COMPONENT_NAME.into(),
+            method: InstallMethod::RawBinary,
+            dest: PathBuf::from("/opt/dig/dig-app"),
+            aliases: vec![PathBuf::from("/opt/dig/dig-app-alias")],
+            service: None,
+            evidence: VersionEvidence::ArtifactDigest,
+        }]);
+        let plan = Plan::build(
+            &m,
+            &[staged("dig-app", "/staging/dig-app")],
+            &with_alias,
+            &platform(),
+            &|path| panic!("the planner executed {}", path.display()),
+            &digest_reader_that_must_not_be_consulted,
+        )
+        .expect("an unreconcilable declaration is a hold, not a failed plan");
+
+        assert!(plan.components.is_empty());
+        assert_eq!(plan.held.len(), 1);
+        assert!(
+            plan.held[0].reason.contains("alias"),
+            "the hold must name the alias as its cause: {}",
+            plan.held[0].reason
+        );
+    }
+
+    #[test]
+    fn an_unsafe_to_probe_component_is_held_while_its_siblings_still_update() {
+        // The fail-closed core (dig_ecosystem#1746/#1749) AND the security property in one fixture,
+        // now carried by a SYNTHETIC component rather than by dig-app: the hold is the default every
+        // component added later inherits, so it must stay under test after dig-app moved to digest
+        // evidence. It is declared unsafe to probe, so it is HELD **without ever being executed** —
+        // the probe panics if asked about it — and gets no plan entry, hence nothing the applier could
+        // install, health-gate or roll back. digstore, the truthful control, is on 0.14.0 against a
+        // 0.15.0 manifest and MUST still be probed and planned as an Update: holding one component
+        // must neither abandon the pass nor stop the beacon probing what it may.
+        let m = manifest_of(&[
+            ("digstore", "0.15.0", 15_000),
+            (FUTURE_UNKNOWN_COMPONENT, "1.0.0", 1_000_000),
+        ]);
+        let plan = Plan::build(
+            &m,
+            &[
+                staged("digstore", "/staging/digstore"),
+                staged(FUTURE_UNKNOWN_COMPONENT, "/staging/future"),
+            ],
+            &catalog_with_an_unevidenced_component(),
+            &platform(),
+            &probe_that_may_only_run_digstore,
+            &digest_reader_that_must_not_be_consulted,
         )
         .unwrap();
 
@@ -844,8 +1197,8 @@ mod tests {
         let held = plan
             .held
             .iter()
-            .find(|h| h.name == DIG_APP_COMPONENT_NAME)
-            .expect("dig-app is reported as HELD, never silently omitted");
+            .find(|h| h.name == FUTURE_UNKNOWN_COMPONENT)
+            .expect("an unevidenced component is reported as HELD, never silently omitted");
         assert!(
             held.reason.contains("--version"),
             "the hold must name its cause so a pass is never a vacuous success: {}",
@@ -858,14 +1211,16 @@ mod tests {
         // THE SECURITY PROPERTY, isolated. The unsafe component is the ONLY one in the manifest, so
         // nothing else could account for a probe call: any exec at all fails this test. A hold
         // decided from the probe's ANSWER — however correct its outcome — cannot pass here, which is
-        // exactly the point: that answer is unobtainable without the exec.
-        let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
+        // exactly the point: that answer is unobtainable without the exec. The digest reader panics
+        // too, so a hold must be decided from the DECLARATION and nothing else.
+        let m = manifest_of(&[(FUTURE_UNKNOWN_COMPONENT, "1.0.0", 1_000_000)]);
         let plan = Plan::build(
             &m,
-            &[staged("dig-app", "/staging/dig-app")],
-            &catalog_with_dig_app(),
+            &[staged(FUTURE_UNKNOWN_COMPONENT, "/staging/future")],
+            &catalog_with_an_unevidenced_component(),
             &platform(),
             &|path| panic!("the planner executed {} to decide a hold", path.display()),
+            &digest_reader_that_must_not_be_consulted,
         )
         .expect("holding a component never fails the plan");
 
@@ -879,26 +1234,19 @@ mod tests {
     }
 
     #[test]
-    fn declaring_a_component_safe_to_probe_makes_it_update_normally() {
-        // The flip is a ONE-LINE catalog change, and this proves the whole path behind it is complete:
-        // the reviewed decision to trust a component's `--version` is all that stands between dig-app
-        // and ordinary health-gated updates. An implementation that special-cased dig-app by NAME
-        // rather than by declaration would fail this.
+    fn the_evidence_class_drives_the_plan_by_declaration_not_by_component_name() {
+        // The whole mechanism must be declaration-driven: an implementation that special-cased dig-app
+        // BY NAME — the shortcut a "just make dig-app work" change invites — would fail this, because
+        // here dig-app is declared safe to probe and must then be probed and aged like any CLI.
         let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
-        let safe_dig_app = Catalog::new(vec![ComponentTarget {
-            name: DIG_APP_COMPONENT_NAME.into(),
-            method: InstallMethod::RawBinary,
-            dest: PathBuf::from("/opt/dig/dig-app"),
-            aliases: vec![],
-            service: None,
-            evidence: VersionEvidence::SafeToProbe, // the ONLY difference from the held fixture
-        }]);
+        let safe_dig_app = Catalog::new(vec![probeable("dig-app", "/opt/dig/dig-app")]);
         let plan = Plan::build(
             &m,
             &[staged("dig-app", "/staging/dig-app")],
             &safe_dig_app,
             &platform(),
             &|_| DetectedVersion::Present("dig-app 3.3.0".into()),
+            &digest_reader_that_must_not_be_consulted,
         )
         .unwrap();
         assert!(
@@ -951,6 +1299,7 @@ mod tests {
             &catalog_with_dig_app(),
             &platform(),
             &|_| DetectedVersion::Present(String::new()),
+            &digest_reader(Some(FIXTURE_DIGEST)),
         )
         .unwrap();
         assert!(plan.held.is_empty());
@@ -960,12 +1309,17 @@ mod tests {
     #[test]
     fn a_held_component_does_not_need_a_staged_artifact() {
         // The hold is decided BEFORE the staged-artifact lookup, because a component that will not be
-        // installed needs no bytes. Deciding it after would make a missing dig-app download fault the
-        // whole pass (`StagedArtifactMissing`) over a component nobody was going to touch.
-        let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
-        let plan = Plan::build(&m, &[], &catalog_with_dig_app(), &platform(), &|_| {
-            panic!("a held component is neither probed nor staged")
-        })
+        // installed needs no bytes. Deciding it after would make a missing download fault the whole
+        // pass (`StagedArtifactMissing`) over a component nobody was going to touch.
+        let m = manifest_of(&[(FUTURE_UNKNOWN_COMPONENT, "1.0.0", 1_000_000)]);
+        let plan = Plan::build(
+            &m,
+            &[],
+            &catalog_with_an_unevidenced_component(),
+            &platform(),
+            &|_| panic!("a held component is neither probed nor staged"),
+            &digest_reader_that_must_not_be_consulted,
+        )
         .expect("a held component with no staged bytes is not a structurally incomplete plan");
         assert_eq!(plan.held.len(), 1);
     }
@@ -1026,6 +1380,7 @@ mod tests {
             &catalog(),
             &platform(),
             &|_| DetectedVersion::Absent,
+            &digest_reader_that_must_not_be_consulted,
         )
         .unwrap();
         assert_eq!(plan.components.len(), 1);
@@ -1044,6 +1399,7 @@ mod tests {
             &catalog(),
             &platform(),
             &|_| DetectedVersion::Present("digstore 0.15.0".into()),
+            &digest_reader_that_must_not_be_consulted,
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Skip);
@@ -1060,6 +1416,7 @@ mod tests {
             &catalog(),
             &platform(),
             &|_| DetectedVersion::Present("digstore 0.14.0".into()),
+            &digest_reader_that_must_not_be_consulted,
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Update);
@@ -1084,6 +1441,7 @@ mod tests {
                     DetectedVersion::Present("digstore 0.15.0".into()) // current primary
                 }
             },
+            &digest_reader_that_must_not_be_consulted,
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Update);
@@ -1100,6 +1458,7 @@ mod tests {
             &catalog(),
             &platform(),
             &|_| DetectedVersion::Present("digstore 0.15.0".into()),
+            &digest_reader_that_must_not_be_consulted,
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Skip);
@@ -1108,9 +1467,14 @@ mod tests {
     #[test]
     fn untracked_component_is_skipped_entirely() {
         let m = manifest_one("some-future-tool", "1.0.0", 1_000_000, "deadbeef");
-        let plan = Plan::build(&m, &[], &catalog(), &platform(), &|_| {
-            DetectedVersion::Absent
-        })
+        let plan = Plan::build(
+            &m,
+            &[],
+            &catalog(),
+            &platform(),
+            &|_| DetectedVersion::Absent,
+            &digest_reader_that_must_not_be_consulted,
+        )
         .unwrap();
         assert!(
             plan.components.is_empty(),
@@ -1122,9 +1486,14 @@ mod tests {
     fn missing_staged_artifact_is_an_error() {
         let m = manifest_one("digstore", "0.15.0", 15_000, "deadbeef");
         // The manifest names a linux-x64 digstore artifact, but nothing was staged for it.
-        let err = Plan::build(&m, &[], &catalog(), &platform(), &|_| {
-            DetectedVersion::Absent
-        })
+        let err = Plan::build(
+            &m,
+            &[],
+            &catalog(),
+            &platform(),
+            &|_| DetectedVersion::Absent,
+            &digest_reader_that_must_not_be_consulted,
+        )
         .expect_err("a manifest artifact with no staged file is incomplete");
         assert!(matches!(err, BrokerError::StagedArtifactMissing { .. }));
     }

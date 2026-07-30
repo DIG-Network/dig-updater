@@ -94,6 +94,9 @@ fn applying_dig_dns_also_refreshes_its_digd_alias_666a() {
         action: dig_release_resolver::UpdateAction::Update,
         summary: String::new(),
         installed_build: Some(13_002),
+        // dig-dns ships a CLI that answers `--version`, so its installed build is established by a
+        // probe — the evidence class that permits the alias set this test is about.
+        evidence: dig_updater_broker::VersionEvidence::SafeToProbe,
     };
 
     let private = private_target(&pc, dir.path());
