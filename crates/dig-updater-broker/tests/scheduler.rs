@@ -99,47 +99,141 @@ fn install_is_idempotent_and_uninstall_of_an_absent_schedule_succeeds() {
         .expect("uninstalling an already-absent schedule must succeed");
 }
 
+/// Where Task Scheduler keeps the registered task's XML definition on disk — the file whose
+/// security descriptor Task Scheduler OWNS (dig_ecosystem#1822).
+#[cfg(windows)]
+fn windows_definition_file() -> PathBuf {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    std::path::Path::new(&system_root)
+        .join("System32")
+        .join("Tasks")
+        .join("DIG")
+        .join("dig-updater")
+}
+
+/// The `icacls` listing of `path` — the access-control state a test asserts against.
+#[cfg(windows)]
+fn icacls_listing(path: &std::path::Path) -> String {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .output()
+        .expect("icacls runs from System32");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 #[cfg(windows)]
 #[test]
 #[ignore = "mutates real OS scheduler state; requires Administrator — run via `-- --ignored` in \
             the elevated scheduler CI job"]
-fn windows_task_definition_file_grants_only_admin_system_and_owner() {
-    use std::process::Command;
+fn install_must_not_rewrite_the_task_definition_security_descriptor() {
+    // dig_ecosystem#1822 — THE REGRESSION GATE. The `\DIG\dig-updater` task vanished from a host
+    // with no opt-out marker, i.e. nothing deliberately uninstalled it. The remover was the beacon's
+    // OWN `schedule install`, which used to follow `schtasks /Create` with
+    // `icacls <definition> /inheritance:r /grant:r Administrators,SYSTEM,OWNER`. That file is Task
+    // Scheduler's OWN store, and the authoritative copy of its security descriptor lives in
+    // `HKLM\...\Schedule\TaskCache`; a definition whose on-disk SD no longer matches is treated as
+    // tampered-with (0x80041321) and DISCARDED from the tree — taking the `\DIG` folder, its only
+    // child, with it. That is the folder-level disappearance the host reported.
+    //
+    // The property asserted is INHERITANCE, not a DACL comparison, because inheritance is exactly
+    // what `/inheritance:r` destroys and what every Task Scheduler store file carries: `icacls`
+    // marks an inherited ACE `(I)`. A test that merely compared two DACLs could pass on an
+    // equivalent-looking explicit rewrite that Task Scheduler would still reject.
+    let _guard = serialize();
+    let exe = fake_exe();
+    let state = state_dir();
+    let _ = scheduler::uninstall(state.path());
 
+    scheduler::install(&exe, state.path()).expect("install must succeed when run elevated");
+
+    let definition = windows_definition_file();
+    assert!(
+        definition.exists(),
+        "the task definition file must exist at {}",
+        definition.display()
+    );
+    let listing = icacls_listing(&definition);
+    assert!(
+        listing.contains("(I)"),
+        "the task definition's ACL MUST stay INHERITED from Task Scheduler's store — an explicit \
+         `/inheritance:r` rewrite makes Task Scheduler treat the task as tampered-with and discard \
+         it (dig_ecosystem#1822). Got:\n{listing}"
+    );
+
+    scheduler::uninstall(state.path()).expect("uninstall");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "mutates real OS scheduler state; requires Administrator — run via `-- --ignored` in \
+            the elevated scheduler CI job"]
+fn the_task_definition_file_is_not_writable_by_an_unprivileged_identity() {
+    // The security property the deleted `harden_state_dir` call CLAIMED to provide, asserted against
+    // the OS default instead of assumed away. Measured on a real Windows 11 host, the default DACL
+    // Task Scheduler applies to a definition file grants Administrators and SYSTEM Full, and
+    // Authenticated Users / LOCAL SERVICE / NETWORK SERVICE only READ — so the Admin/SYSTEM WRITE
+    // bar (SPEC §9.3) is already met without the beacon touching the SD.
+    //
+    // Read access is deliberately NOT asserted against: `schtasks /Query /XML` prints a task's whole
+    // definition to any user, so a readable definition file discloses nothing. WRITE is the bar that
+    // matters — a writable definition would let an unprivileged user re-point what SYSTEM executes.
     let _guard = serialize();
     let exe = fake_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
     scheduler::install(&exe, state.path()).expect("install");
 
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let definition = std::path::Path::new(&system_root)
-        .join("System32")
-        .join("Tasks")
-        .join("DIG")
-        .join("dig-updater");
+    let listing = icacls_listing(&windows_definition_file());
+    for principal in ["Everyone", r"BUILTIN\Users", "Authenticated Users"] {
+        for grant in ["(F)", "(M)", "(W)"] {
+            assert!(
+                !listing.contains(&format!("{principal}:{grant}")),
+                "{principal} must not hold {grant} on the task definition file:\n{listing}"
+            );
+        }
+    }
     assert!(
-        definition.exists(),
-        "the task definition file must exist at {}",
-        definition.display()
+        listing.contains(r"BUILTIN\Administrators:(F)") || listing.contains("S-1-5-32-544"),
+        "Administrators must hold Full Control:\n{listing}"
+    );
+    assert!(
+        listing.contains(r"NT AUTHORITY\SYSTEM:(F)") || listing.contains("S-1-5-18"),
+        "SYSTEM must hold Full Control:\n{listing}"
     );
 
-    let output = Command::new("icacls")
-        .arg(&definition)
+    scheduler::uninstall(state.path()).expect("uninstall");
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "mutates real OS scheduler state; requires Administrator — run via `-- --ignored` in \
+            the elevated scheduler CI job"]
+fn a_registered_task_is_still_readable_by_task_scheduler_after_install() {
+    // The corruption CONSEQUENCE, observed through Task Scheduler's own parser rather than through
+    // the filesystem: `schtasks /Query /XML` makes the service load and re-serialize the task, so a
+    // definition the service considers tampered-with fails here (0x80041321) even while the file is
+    // still sitting on disk. `/Query /TN` alone is a weaker check — it can answer from the registry
+    // cache — so the XML round-trip is the one that exercises the store.
+    //
+    // The full live proof is stronger still and is NOT a CI test: restart the `Schedule` service and
+    // re-query, which is the acceptance step recorded on the ticket. Restarting a hosted runner's
+    // Task Scheduler mid-job is not a safe thing to do to the machine running the job.
+    let _guard = serialize();
+    let exe = fake_exe();
+    let state = state_dir();
+    let _ = scheduler::uninstall(state.path());
+    scheduler::install(&exe, state.path()).expect("install");
+
+    let output = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", r"\DIG\dig-updater", "/XML"])
         .output()
-        .expect("icacls");
-    let listing = String::from_utf8_lossy(&output.stdout);
+        .expect("schtasks runs from System32");
     assert!(
-        !listing.contains("Everyone"),
-        "must not grant Everyone: {listing}"
-    );
-    assert!(
-        !listing.contains(r"BUILTIN\Users"),
-        "must not grant BUILTIN\\Users: {listing}"
-    );
-    assert!(
-        listing.contains("SYSTEM") || listing.contains("S-1-5-18"),
-        "must grant SYSTEM: {listing}"
+        output.status.success(),
+        "Task Scheduler must be able to load + serialize the task it was just given; a store it \
+         considers tampered-with fails this and then discards the task (dig_ecosystem#1822). \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
     );
 
     scheduler::uninstall(state.path()).expect("uninstall");
@@ -230,25 +324,41 @@ fn ensure_respects_a_deliberate_uninstall_and_install_re_enables() {
 #[test]
 #[ignore = "mutates real OS scheduler state; requires Administrator — run via `-- --ignored` in \
             the elevated scheduler CI job"]
-fn windows_uninstall_removes_the_orphan_dig_folder() {
-    // #546: after removing the task, the empty `\DIG` Task Scheduler folder must not linger and
-    // masquerade as a partial install.
+fn windows_uninstall_leaves_the_task_folder_to_task_scheduler() {
+    // The inverse of the pre-#1822 expectation, deliberately. The beacon used to `remove_dir` the
+    // `%SystemRoot%\System32\Tasks\DIG` folder itself after `schtasks /Delete` — a filesystem write
+    // BEHIND Task Scheduler's back, which orphans the matching `TaskCache\Tree\DIG` registry node.
+    // Tidying up a cosmetically-empty folder is not worth desynchronizing the store the service
+    // reads, so removal (if any) is Task Scheduler's own business now.
+    //
+    // The load-bearing assertion is that the TASK is gone, which is what `uninstall` promises; the
+    // folder's fate is explicitly not the beacon's concern, so nothing is asserted about it beyond
+    // the beacon not being the one to delete it.
     let _guard = serialize();
     let exe = fake_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
     scheduler::install(&exe, state.path()).expect("install");
 
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let dig_folder = std::path::Path::new(&system_root)
-        .join("System32")
-        .join("Tasks")
-        .join("DIG");
+    let dig_folder = windows_definition_file()
+        .parent()
+        .expect("the definition file has a containing folder")
+        .to_path_buf();
+    assert!(
+        dig_folder.exists(),
+        "sanity: Task Scheduler created {} for the registered task",
+        dig_folder.display()
+    );
 
     scheduler::uninstall(state.path()).expect("uninstall");
     assert!(
-        !dig_folder.exists(),
-        "the empty \\DIG task folder must be removed on uninstall: {}",
+        !scheduler::status().expect("status").installed(),
+        "the TASK must be gone — that is what uninstall promises"
+    );
+    assert!(
+        dig_folder.exists(),
+        "the beacon must NOT delete Task Scheduler's own folder out from under it \
+         (dig_ecosystem#1822): {}",
         dig_folder.display()
     );
 }
