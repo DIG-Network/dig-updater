@@ -439,11 +439,26 @@ machine identifiers are unchanged (the Windows task path, the systemd unit stem,
 stay canonical); the display name is a legibility label. `dig-updater status` and `dig-updater
 schedule status` MUST echo `DIG NETWORK: BEACON` so the beacon's identity + health are readable
 without inspecting the OS scheduler. A change to this display name is a cross-repo contract change
-coordinated with `SYSTEM.md` + the `canonical` skill. The Windows Task definition file, and (on Unix) the unit/plist files
-themselves, MUST be locked down to the same Admin/SYSTEM-or-root bar as every other guarded path
-this beacon depends on (§9.3) — Unix unit/plist files follow the platform convention of
-root-owned, mode `0644` (world-readable, root-writable only, matching how `systemctl status`/
-`launchctl print` are expected to work for any user).
+coordinated with `SYSTEM.md` + the `canonical` skill.
+
+**The OS scheduler OWNS its own store — the beacon MUST NOT write into it (Windows, MANDATORY).**
+On Windows the task definition file under `%SystemRoot%\System32\Tasks` and the folders containing it
+are Task Scheduler's on-disk store, and the AUTHORITATIVE copy of each task's security descriptor
+lives beside it in the registry (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache`).
+The service cross-checks the two and treats a definition whose on-disk descriptor no longer matches as
+tampered-with (`0x80041321`), DISCARDING the task — and with it the containing `\DIG` folder. The beacon
+therefore registers and removes tasks ONLY through the OS scheduler interface, and MUST NOT rewrite a
+task definition's security descriptor, MUST NOT strip its ACL inheritance, and MUST NOT create or delete
+a task folder directly on the filesystem. The Admin/SYSTEM-or-root bar of §9.3 is satisfied WITHOUT such
+a write: the default descriptor Task Scheduler applies already grants Full Control to Administrators and
+SYSTEM and READ ONLY to every other identity, and read access is not a concern because a task's whole
+definition is printable by any user (`schtasks /Query /XML`). WRITE access is the bar that matters, and
+it is already met.
+
+On Unix the unit/plist files are the beacon's OWN files in a root-owned directory, not another service's
+store, so it writes them directly and MUST make them root-owned, mode `0644` — world-readable,
+root-writable only, matching how `systemctl status` / `launchctl print` are expected to work for any
+user.
 
 **Self-heal (MANDATORY).** The artifact is registered by the installer, but a schedule that is
 registered exactly ONCE and never re-asserted dies permanently the moment it goes missing — after
@@ -460,8 +475,17 @@ e.g. access-denied — Windows `0x80070005` — when an unprivileged caller insp
 A status query MUST NOT report *undeterminable* as *absent*: the self-heal MUST re-register ONLY a
 *provably absent* artifact (never an *undeterminable* one, or it could clobber a present-but-
 unreadable task), and `schedule status` MUST NOT tell a user "NOT REGISTERED" when it merely could
-not read the task. Removing the artifact (`schedule uninstall`) MUST also remove the now-empty
-containing folder (Windows `\DIG`) so an empty folder cannot masquerade as a partial install.
+not read the task. Removing the artifact (`schedule uninstall`) removes the artifact and nothing else:
+on Windows it MUST NOT delete the containing `\DIG` folder, which belongs to Task Scheduler (above).
+
+**A deliberate removal records its intent FIRST (MANDATORY).** `schedule uninstall` MUST write the
+opt-out sentinel (§8.4's external re-arm, below) BEFORE removing the artifact, and MUST withdraw that
+record if the removal fails. Recording it afterwards leaves a window in which the artifact is already
+gone and no sentinel exists — and since writing the sentinel is itself privileged and can fail, a
+half-completed uninstall could persist that state. "Artifact absent AND no opt-out sentinel" MUST
+therefore be an impossible outcome of this operation, so that observing it is positive evidence that
+something OTHER than a deliberate uninstall removed the schedule. If the sentinel cannot be written, the
+artifact MUST be left in place.
 
 **External re-arm — the `schedule ensure` verb + the opt-out sentinel (MANDATORY).** The per-pass
 self-heal above only fires when the beacon RUNS — but a *dead schedule cannot run itself to re-arm*
@@ -665,12 +689,33 @@ wait.
   not the last. Trailing detail (`dig-app 3.4.0 (build abc123)`) is common, and taking the last token
   would leave a component un-ageable on a purely cosmetic change to its version line.
 
-**Therefore a component the beacon is to keep current MUST answer `--version` on stdout and EXIT.**
-A program that ignores its arguments and enters a long-running loop cannot be health-gated — it fails
-its gate by construction — and, because the probe is an EXECUTION, asking it is itself the harm. Such
-a component is declared unsafe to probe and HELD: not run, not installed on the hope that it will
-answer (§9.7(5)). Bounding the wait makes a MISBEHAVING probe survivable; it does not make an
-unanswering binary safe to run, and it is not what keeps the beacon from running one.
+**Therefore a component the beacon keeps current BY PROBING MUST answer `--version` on stdout and
+EXIT.** A program that ignores its arguments and enters a long-running loop cannot be health-gated by a
+probe — it fails its gate by construction — and, because the probe is an EXECUTION, asking it is itself
+the harm. Bounding the wait makes a MISBEHAVING probe survivable; it does not make an unanswering binary
+safe to run, and it is not what keeps the beacon from running one.
+
+**A component MAY instead be kept current with NO EXECUTION AT ALL, by CONTENT-DIGEST evidence, and
+that is the PREFERRED form** whenever a component's `--version` behaviour is not a property the beacon
+should have to vouch for. Such a component's installed build is established by hashing the file at its
+destination and comparing it to the `sha256` the re-verified manifest carries for that artifact
+(§5.2/§10.3):
+
+- **equal** — the current build IS installed (for a raw-binary component the verified artifact is
+  renamed into the destination, so equal bytes mean equal build): treated as the manifest's own version,
+  hence `skip`.
+- **different** — something is installed but its build is NOT established: treated as *installed but
+  unreadable*, hence `update`, and the install is left UN-AGEABLE so a cross-pass rollback declines the
+  §7.5 floor check rather than reinstating bytes whose age cannot be bounded.
+- **no readable file** (absent, unreadable, or a refused symlink) — nothing is established there, hence
+  `install`.
+
+This is strictly STRONGER than a probe rather than a relaxation of it: the evidence originates in the
+root-signed manifest instead of in the binary's own claim, so a component cannot misreport its version,
+and no startup behaviour has to be trusted. The digest MUST be read through the same symlink-refusing
+open every other privileged read uses (§8.3), so a link planted at the destination cannot redirect the
+measurement. A digest-evidenced component is NOT held and NOT exempt from the health gate — see
+§9.7(3) and §9.7(5).
 
 ### 9.7 Per-user daemon components (normative)
 
@@ -709,11 +754,21 @@ daemons:
 
 **(3) The health gate probes the INSTALLED FILE, never the running process.** Because activation is
 deferred (1), the process still running immediately after a successful install is the OLD build.
-Probing it would report the old version and roll back a correct install every pass. The gate is
-therefore satisfied by the newly installed binary at its destination reporting the expected version
-under §9.6 — evidence that the bytes on disk are a runnable build of the promised version. Rollback
-is the §9.5 path unchanged: the moved-aside image is reinstated, so a failed install never leaves
-the user without an app.
+Probing it would report the old version and roll back a correct install every pass. The gate therefore
+examines the newly installed FILE at its destination, in whichever form of evidence the component
+declares under (5):
+
+- a *safe to probe* component satisfies the gate by that file reporting the expected version under §9.6
+  — evidence that the bytes on disk are a runnable build of the promised version;
+- a *content-digest evidenced* component satisfies it by a RE-HASH of the installed bytes matching the
+  digest the re-verified manifest promised. The gate MUST NOT fall back to a probe: the side effects of
+  executing the component do not become acceptable merely because the bytes are now newer, and this is
+  the second of only two places the beacon could execute an installed component. A mismatch — a partial
+  write, a swap that did not land, bytes replaced after the install — fails the gate exactly like a
+  wrong version, so the re-hash is a real gate and not an exemption.
+
+Rollback is the §9.5 path unchanged: the moved-aside image is reinstated, so a failed install never
+leaves the user without an app.
 
 **(4) The artifact is the raw per-platform binary.** Such a component publishes
 `{name}-{version}-{os}-{arch}` (with `.exe` on Windows) and is declared `raw_binary` (§10.3). A
@@ -723,26 +778,44 @@ byte-identical alias, never a distinct sibling program. A sibling program that n
 own component, and MUST NOT be claimed by two components at once — two components resolving one
 installed filename would overwrite each other on every pass.
 
-**(5) Every tracked component declares whether it is SAFE TO PROBE, and one that is not is never
-EXECUTED.** The §9.6 probe runs the installed binary from a SYSTEM/root parent, so whether
-`--version` is a question or an action is a property of the binary, not of the beacon:
+**(5) Every tracked component declares WHAT ESTABLISHES its installed version, and a component the
+declaration does not permit executing is never EXECUTED.** The §9.6 probe runs the installed binary from
+a SYSTEM/root parent, so whether `--version` is a question or an action is a property of the binary, not
+of the beacon. There are exactly three declarations:
 
-- *safe to probe* (every CLI and service component, the default) — the binary is known to answer
-  `--version` and exit. It is probed, and an unreadable answer means corrupt or partial bytes,
-  repaired by reinstalling (§9.6). Unchanged behaviour.
-- *unsafe to probe* — executing the binary may have side effects. The beacon MUST NOT execute it,
+- *safe to probe* (every CLI and service component) — the binary is known to answer `--version` and
+  exit. It is probed, and an unreadable answer means corrupt or partial bytes, repaired by reinstalling
+  (§9.6). Unchanged behaviour.
+- *content-digest evidenced* — the installed build is established by hashing the destination against the
+  signed manifest artifact's digest (§9.6), so the binary is NEVER executed, at any version, on any
+  path, before or after install. The component is otherwise ORDINARY: planned, installed, health-gated
+  by a re-hash (3), and rolled back like every other. It is NOT held. Because an alias binary carries no
+  manifest artifact digest of its own, a digest-evidenced component MUST declare no aliases; a
+  declaration that does both is unreconcilable and MUST be HELD rather than have its alias check
+  silently skipped.
+- *unsafe to probe* — the version could only be learned by executing the binary, and executing it may
+  have side effects. This is the FAIL-CLOSED default a component with no established evidence carries.
+  The beacon MUST NOT execute it,
   and MUST NOT decide anything that requires executing it. The component is **HELD**: not probed, not
   downloaded over, not installed, not moved aside, not health-gated, not rolled back. The pass MUST
   report it as `held` with a reason stating that the binary was not run and what would make it
   updatable. A hold asserts nothing about the component except that the beacon left it alone — it is
   NOT `skipped`, which claims the component is already current.
 
-**The hold MUST be decided from the DECLARATION, never from the probe's answer.** Deciding it from the
-answer requires the very execution the declaration exists to prevent — the beacon would boot the
-component at machine privilege in order to conclude that it should leave it alone. There is no version
-evidence obtainable by running a binary not yet established as safe to run. A component therefore
-becomes updatable by a reviewed change of its declaration, once its released binary is known to print
-and exit; that review is the control, and its cost is deliberate.
+**Which evidence applies — and therefore whether the component is held — MUST be decided from the
+DECLARATION, never from the probe's answer.** Deciding it from the answer requires the very execution the
+declaration exists to prevent: the beacon would boot the component at machine privilege in order to
+conclude that it should leave it alone. There is no version evidence obtainable by running a binary not
+yet established as safe to run. So an unsafe-to-probe component becomes updatable by a reviewed change of
+its declaration — either to *safe to probe*, once its released binary is known to print and exit, or to
+*content-digest evidenced*, which requires nothing of the binary at all. That review is the control, and
+its cost is deliberate.
+
+**A self-reported or file-based version claim in a USER-WRITABLE location MUST NOT be accepted as
+evidence.** Where the shared install root is per-user (see (2)), any version sidecar or self-report
+beside the binary is forgeable: an unprivileged local user could claim a safe version next to an unsafe
+build and induce this SYSTEM/root beacon to execute it. Content-digest evidence is not vulnerable to that
+because the value it compares against comes from the root-signed manifest, not from the host.
 
 A hold MUST NOT block the pass: the other components install normally and the trust state still
 advances, because freezing every component's anti-rollback progress behind one unprobeable daemon
@@ -750,18 +823,21 @@ would turn a legible hold into a host-wide stall. A hold is therefore fail-close
 and fail-open for the pass — and never silent, which is what keeps it from becoming a vacuous success.
 
 **Tracked status.** `dig-app` is declared in the feed (§10.3) and IS in the broker's tracked catalog
-as a raw-binary, service-less, alias-less component declared *unsafe to probe* per (5). Its release
-also publishes `dign`, which is NOT part of its set: `dign` is already installed as dig-node's
+as a raw-binary, service-less, alias-less component declared *content-digest evidenced* per (5). Its
+release also publishes `dign`, which is NOT part of its set: `dign` is already installed as dig-node's
 byte-identical alias, and one installed filename claimed by two components would have them overwrite
 each other every pass per (4).
 
-`dig-app` <= 3.3.0 parses NO arguments — `main` builds its agent and mounts a tray event loop that owns
-the process — so `--version` boots the agent: on a first run it seals a fresh master seed and it binds
-a loopback identity/signing socket. Probed by the beacon, that would happen under SYSTEM/root on every
-pass. So every pass HOLDS dig-app, without running it, and reports the cause. `dig-app` 3.4.0 adds a
-`--version` that prints and exits (dig_ecosystem#1749); it becomes updatable when the catalog declares
-it safe to probe, which MUST NOT be done before a stable dig-app release carrying that behaviour is
-the version hosts actually have.
+`dig-app` is therefore updated on every pass and **NEVER EXECUTED BY THE BEACON, at any version**. It MUST
+NOT be declared *safe to probe*. `dig-app` <= 3.3.0 parses NO arguments — `main` builds its agent and
+mounts a tray event loop that owns the process — so `--version` boots the agent: on a first run it seals a
+fresh master seed and binds a loopback identity/signing socket, which under a probe would happen as
+SYSTEM/root on every pass. 3.4.0 added a `--version` that prints and exits (dig_ecosystem#1749), but that
+does not make probing safe, because the beacon cannot tell WHICH build is on a host without executing it:
+3.0.0, 3.2.0 and 3.3.0 are all published stable releases, and dig-installer 0.30.0 — the first release to
+carry dig-app in its payload — shipped roughly 16 hours BEFORE dig-app 3.4.0, so hosts installed in that
+window provably carry an argument-ignoring build. That population is not empty; it is unobservable. The
+exposure is closed by NOT EXECUTING, not by waiting for a version floor (dig_ecosystem#1803).
 
 ---
 
