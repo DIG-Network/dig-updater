@@ -192,6 +192,7 @@ fn a_service_backed_replace_lands_new_bytes_on_disk_before_health_666b() {
         action: dig_release_resolver::UpdateAction::Update,
         summary: String::new(),
         installed_build: Some(32_000),
+        evidence: target.evidence,
     };
 
     let private = private_target(&pc, dir.path());
