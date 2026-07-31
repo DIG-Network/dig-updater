@@ -52,6 +52,14 @@ impl std::fmt::Display for ElfParseError {
 /// What the dynamic linker will require of an ELF image before it runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ElfNeeds {
+    /// The machine the image is built for (`e_machine`, e.g. [`EM_X86_64`]). `0` (`EM_NONE`) means
+    /// the image names no machine, which is never treated as a mismatch.
+    ///
+    /// An artifact for the wrong machine dies at `execve` with `Exec format error` no matter how
+    /// resolvable its sonames are — and a `linux/arm64` build's sonames (`libc.so.6`,
+    /// `libgcc_s.so.1`) all resolve perfectly on an x86-64 host, so the soname check alone would
+    /// call it loadable.
+    pub machine: u16,
     /// The program interpreter (`PT_INTERP`, e.g. `/lib64/ld-linux-x86-64.so.2`) — `None` for a
     /// static image, which needs no loader at all.
     pub interp: Option<String>,
@@ -82,6 +90,34 @@ const DT_STRTAB: u64 = 5;
 const DT_STRSZ: u64 = 10;
 const DT_RPATH: u64 = 15;
 const DT_RUNPATH: u64 = 29;
+
+// --- the machine values this reader can name; every other value is compared numerically ---
+
+/// `EM_386` — 32-bit x86.
+pub const EM_386: u16 = 3;
+/// `EM_ARM` — 32-bit ARM.
+pub const EM_ARM: u16 = 40;
+/// `EM_X86_64` — 64-bit x86.
+pub const EM_X86_64: u16 = 62;
+/// `EM_AARCH64` — 64-bit ARM.
+pub const EM_AARCH64: u16 = 183;
+/// `EM_RISCV` — RISC-V.
+pub const EM_RISCV: u16 = 243;
+
+/// A ceiling on how many `DT_NEEDED` entries are resolved from one image.
+///
+/// This is what makes [`crate::loadable`]'s byte ceiling mean something. Without it the work is
+/// QUADRATIC in the file size: the dynamic array holds up to `size / 16` `DT_NEEDED` entries, and a
+/// string table that is one unterminated blob makes each of them resolve to a string up to `size`
+/// long — so a 200 KB artifact allocates tens of MB, inside the privileged pass. No real image links
+/// against thousands of libraries; a file that claims to is malformed, and an honest error is the
+/// right answer.
+const MAX_NEEDED_ENTRIES: usize = 512;
+
+/// A ceiling on the length of any single string resolved out of the dynamic string table. A soname or
+/// a runpath is a filesystem name; nothing legitimate is longer than this, and the bound is the other
+/// half of [`MAX_NEEDED_ENTRIES`]'s quadratic-allocation fix.
+const MAX_STRING_BYTES: usize = 4096;
 
 /// The ELF header size + program-header layout for the image's class (32- vs 64-bit). The two
 /// classes differ only in field WIDTHS and OFFSETS, so isolating those here keeps one parser body
@@ -148,6 +184,7 @@ pub fn parse_elf_needs(bytes: &[u8]) -> Result<ElfNeeds, ElfParseError> {
         ELF_CLASS_32 => &LAYOUT_32,
         _ => return Err(ElfParseError::Unsupported("unknown ELF class")),
     };
+    let machine = u16_at(bytes, 0x12)?;
     let e_type = u16_at(bytes, 0x10)?;
     if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfParseError::Unsupported(
@@ -166,6 +203,7 @@ pub fn parse_elf_needs(bytes: &[u8]) -> Result<ElfNeeds, ElfParseError> {
         // No `PT_DYNAMIC` — a static image. It requires nothing of the loader, which is a real,
         // affirmative answer rather than an absence of one.
         return Ok(ElfNeeds {
+            machine,
             interp,
             ..ElfNeeds::default()
         });
@@ -173,6 +211,7 @@ pub fn parse_elf_needs(bytes: &[u8]) -> Result<ElfNeeds, ElfParseError> {
     let entries = read_dynamic(bytes.get(dynamic).ok_or(ElfParseError::Truncated)?, layout);
     let strings = string_table(bytes, &entries, &segments.loads)?;
     Ok(ElfNeeds {
+        machine,
         interp,
         needed: resolve_all(strings, &entries.needed)?,
         runpath: read_runpath(strings, &entries)?,
@@ -329,7 +368,15 @@ fn read_runpath(strings: &[u8], entries: &DynamicEntries) -> Result<Vec<String>,
 }
 
 /// Resolve every string-table offset to its string, failing closed if any lies outside the table.
+///
+/// Refuses an image claiming more than [`MAX_NEEDED_ENTRIES`] requirements — see that constant for
+/// why the count, not just the file size, has to be bounded.
 fn resolve_all(strings: &[u8], offsets: &[u64]) -> Result<Vec<String>, ElfParseError> {
+    if offsets.len() > MAX_NEEDED_ENTRIES {
+        return Err(ElfParseError::Unsupported(
+            "more DT_NEEDED entries than any real image has",
+        ));
+    }
     offsets.iter().map(|off| string_at(strings, *off)).collect()
 }
 
@@ -341,12 +388,23 @@ fn string_at(strings: &[u8], offset: u64) -> Result<String, ElfParseError> {
 
 /// The NUL-terminated string at the start of `bytes`, as UTF-8 (lossy — a soname with non-UTF-8
 /// bytes still needs to be NAMED in a refusal, and lossy decoding cannot fail).
+///
+/// Two bounds, both load-bearing rather than tidy:
+///
+/// - the NUL is only looked for within [`MAX_STRING_BYTES`], so the allocation is bounded by a
+///   CONSTANT and not by how far away the next zero byte happens to be;
+/// - control characters are replaced, because these bytes are attacker-supplied and this string is
+///   about to be written to a root process's journal and an operator's terminal, where a bare `\r`
+///   or an ANSI CSI sequence can overwrite the line that reports the refusal.
 fn nul_terminated(bytes: &[u8]) -> Result<String, ElfParseError> {
-    let end = bytes
+    let searchable = bytes.get(..MAX_STRING_BYTES).unwrap_or(bytes);
+    let end = searchable
         .iter()
         .position(|b| *b == 0)
         .ok_or(ElfParseError::Truncated)?;
-    Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+    Ok(crate::display::without_control_chars(
+        &String::from_utf8_lossy(&bytes[..end]),
+    ))
 }
 
 // --- checked primitive reads; every one of these is why this parser cannot panic ---
@@ -387,15 +445,36 @@ fn fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], ElfPars
     Ok(raw)
 }
 
+/// Real ELF images, fabricated byte by byte, for tests in this crate.
+///
+/// `pub(crate)` deliberately: [`crate::loadable`]'s end-to-end tests must drive the PRODUCTION byte
+/// path — read the file, parse it, decide — over a genuine ELF image on disk. Injecting a
+/// pre-built [`ElfNeeds`] there would test the decision while leaving the read-and-parse half
+/// unexercised in any decisive direction, which is exactly how a neutered guard stays green.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixture {
     use super::*;
 
-    /// A synthetic, minimal ELF64 LE shared object carrying `needed` as `DT_NEEDED` entries, an
-    /// optional `DT_RUNPATH`, and an optional `PT_INTERP` — built so a single `PT_LOAD` maps the
-    /// whole file at `vaddr == offset`, which is what lets the fixture exercise the real
+    /// A synthetic, minimal ELF64 LE shared object for the host's own machine — see
+    /// [`synth_elf_for`].
+    pub(crate) fn synth_elf(
+        needed: &[&str],
+        runpath: Option<&str>,
+        interp: Option<&str>,
+    ) -> Vec<u8> {
+        synth_elf_for(EM_X86_64, needed, runpath, interp)
+    }
+
+    /// A synthetic, minimal ELF64 LE shared object for `machine`, carrying `needed` as `DT_NEEDED`
+    /// entries, an optional `DT_RUNPATH`, and an optional `PT_INTERP` — built so a single `PT_LOAD`
+    /// maps the whole file at `vaddr == offset`, which is what lets the fixture exercise the real
     /// virtual-address translation instead of bypassing it.
-    fn synth_elf(needed: &[&str], runpath: Option<&str>, interp: Option<&str>) -> Vec<u8> {
+    pub(crate) fn synth_elf_for(
+        machine: u16,
+        needed: &[&str],
+        runpath: Option<&str>,
+        interp: Option<&str>,
+    ) -> Vec<u8> {
         let phnum = 2 + usize::from(interp.is_some());
         let phoff = 64usize;
         let dyn_off = phoff + phnum * 56;
@@ -448,7 +527,7 @@ mod tests {
         out[EI_DATA] = ELF_DATA_LSB;
         out[6] = 1; // EI_VERSION
         out[0x10..0x12].copy_from_slice(&ET_DYN.to_le_bytes());
-        out[0x12..0x14].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        out[0x12..0x14].copy_from_slice(&machine.to_le_bytes());
         out[0x20..0x28].copy_from_slice(&(phoff as u64).to_le_bytes());
         out[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
         out[0x38..0x3a].copy_from_slice(&(phnum as u16).to_le_bytes());
@@ -476,6 +555,12 @@ mod tests {
         assert_eq!(out.len(), total, "the fixture's own layout must be exact");
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::{synth_elf, synth_elf_for};
+    use super::*;
 
     #[test]
     fn parse_elf_needs_reads_dt_needed_from_a_fabricated_elf64() {
@@ -589,6 +674,82 @@ mod tests {
         out[0x38..0x3a].copy_from_slice(&0u16.to_le_bytes());
         let needs = parse_elf_needs(&out).expect("a static image parses");
         assert!(needs.needed.is_empty() && needs.interp.is_none());
+    }
+
+    #[test]
+    fn the_images_own_machine_is_read_and_not_assumed() {
+        // An arm64 build landing in the `linux/x64` slot names sonames that all resolve on an x86-64
+        // host, so `e_machine` is the ONLY thing in the file that distinguishes it. Both directions
+        // are asserted, so a reader that returned a constant fails one of them.
+        for machine in [EM_X86_64, EM_AARCH64] {
+            let bytes = synth_elf_for(machine, &["libc.so.6"], None, None);
+            assert_eq!(parse_elf_needs(&bytes).expect("parse").machine, machine);
+        }
+    }
+
+    #[test]
+    fn a_soname_carrying_control_characters_cannot_forge_a_log_line() {
+        // These bytes are attacker-supplied and are about to be named in a root process's journal.
+        let bytes = synth_elf(&["lib\r\x1b[2Kpass applied.so.0", "libc.so.6"], None, None);
+        let needs = parse_elf_needs(&bytes).expect("parse");
+        assert!(
+            !needs.needed[0].contains('\r') && !needs.needed[0].contains('\u{1b}'),
+            "a control character reached the refusal detail: {:?}",
+            needs.needed[0]
+        );
+        assert_eq!(
+            needs.needed[1], "libc.so.6",
+            "an ordinary soname is untouched — the control is that real names still arrive intact"
+        );
+    }
+
+    #[test]
+    fn a_string_longer_than_the_ceiling_is_refused_rather_than_allocated() {
+        // Pinned from BOTH sides of MAX_STRING_BYTES: without a constant bound, resolving N entries
+        // out of an unterminated table allocates N * table-size — quadratic in the file, inside the
+        // privileged pass, however tight the byte ceiling above it is.
+        let at_bound = "a".repeat(MAX_STRING_BYTES - 1);
+        let bytes = synth_elf(&[&at_bound], None, None);
+        assert_eq!(
+            parse_elf_needs(&bytes)
+                .expect("at the bound it parses")
+                .needed,
+            vec![at_bound],
+            "a name that fits the ceiling must still be read"
+        );
+
+        let over = "a".repeat(MAX_STRING_BYTES + 1);
+        let bytes = synth_elf(&[&over], None, None);
+        assert_eq!(
+            parse_elf_needs(&bytes),
+            Err(ElfParseError::Truncated),
+            "one byte past the ceiling must not be read"
+        );
+    }
+
+    #[test]
+    fn more_dt_needed_entries_than_any_real_image_has_is_refused() {
+        let names: Vec<String> = (0..=MAX_NEEDED_ENTRIES)
+            .map(|i| format!("lib{i}.so.0"))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let at_bound = synth_elf(&refs[..MAX_NEEDED_ENTRIES], None, None);
+        assert_eq!(
+            parse_elf_needs(&at_bound)
+                .expect("at the bound it parses")
+                .needed
+                .len(),
+            MAX_NEEDED_ENTRIES
+        );
+
+        let over = synth_elf(&refs, None, None);
+        assert_eq!(
+            parse_elf_needs(&over),
+            Err(ElfParseError::Unsupported(
+                "more DT_NEEDED entries than any real image has"
+            ))
+        );
     }
 
     #[test]

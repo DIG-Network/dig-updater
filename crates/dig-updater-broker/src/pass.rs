@@ -488,24 +488,25 @@ impl Installer<'_> {
         // it, and refuse HERE if it cannot: before the rollback snapshot, before any service stop,
         // while the working binary at `dest` is still completely untouched. Placement is the whole
         // fix; a check after the install would only be able to undo damage it had already done.
-        let indeterminate = match (self.loadability)(&private) {
-            Loadability::Unloadable { missing } => {
-                let _ = std::fs::remove_file(&private);
-                let detail = unloadable_detail(&missing, &pc.dest);
-                eprintln!(
-                    "dig-updater: warning: {LOG_CODE_REFUSED}: {} {detail}",
-                    pc.name
-                );
-                return Ok(ComponentOutcome {
-                    component: pc.name.clone(),
-                    action: ACTION_REFUSE.to_string(),
-                    result: ComponentResult::Refused,
-                    detail,
-                });
-            }
-            // No answer is NOT a refusal (see [`crate::loadable`]): a `.deb`/`.msi` private copy, a
-            // musl host, a non-ELF platform. The install proceeds exactly as it did before this check
-            // existed, and the reason travels into the report so the silence is legible.
+        let loadability = (self.loadability)(&private);
+        if let Some(refusal) = loadability.refusal() {
+            let _ = std::fs::remove_file(&private);
+            let detail = unloadable_detail(&refusal, &pc.dest);
+            eprintln!(
+                "dig-updater: warning: {LOG_CODE_REFUSED}: {} {detail}",
+                pc.name
+            );
+            return Ok(ComponentOutcome {
+                component: pc.name.clone(),
+                action: ACTION_REFUSE.to_string(),
+                result: ComponentResult::Refused,
+                detail,
+            });
+        }
+        // No answer is NOT a refusal (see [`crate::loadable`]): a `.deb`/`.msi` private copy, a
+        // musl host, a non-ELF platform. The install proceeds exactly as it did before this check
+        // existed, and the reason travels into the report so the silence is legible.
+        let indeterminate = match loadability {
             Loadability::Indeterminate { why } => {
                 eprintln!(
                     "dig-updater: warning: {} loadability unknown: {why}",
@@ -513,7 +514,7 @@ impl Installer<'_> {
                 );
                 Some(why)
             }
-            Loadability::Loadable => None,
+            _ => None,
         };
 
         // Snapshot the WHOLE binary set (primary + every alias) so a failed health gate reverts the
@@ -572,7 +573,20 @@ impl Installer<'_> {
     /// Deliberately best-effort: this record is a planning aid, not a trust mark, so a write failure
     /// warns and lets an otherwise-correct on-disk state stand rather than turning a good install into
     /// a failed pass. The anti-rollback floor lives in [`crate::state`] and is unaffected.
+    ///
+    /// Records NOTHING when the feed ladder was overridden, for the same reason the trust state does
+    /// not advance then (#621 item 1): the record file is keyed on the TRACKED channel, while an
+    /// overridden feed's builds are on whatever scale that feed numbers on. A single
+    /// `--feed-base <nightly>` pass on a stable host would file a nightly's `20260731` as stable's
+    /// installed build, and every later stable pass would then see `20260731 > 3004000` and Skip —
+    /// permanently, reported as the benign "already newer than the feed". The component holding the
+    /// sealed master seed would never update again, including for security fixes, with nothing
+    /// visibly wrong. The cross-CHANNEL form of this hazard is closed by the per-channel file name
+    /// ([`crate::installed`]); this is the within-channel form.
     fn record_installed_build(&self, pc: &PlannedComponent, result: ComponentResult) {
+        if self.suppress_state_advance {
+            return;
+        }
         let build = match result {
             ComponentResult::Installed => Some(pc.build),
             ComponentResult::RolledBack => pc.installed_build,
@@ -818,17 +832,16 @@ fn verified_install_detail(component: &str, detected: &DetectedVersion) -> Strin
     }
 }
 
-/// The detail a REFUSED component reports: the sonames this host lacks, NAMED, plus the fact that the
-/// binary already installed was left running (dig_ecosystem#1870).
+/// The detail a REFUSED component reports: WHY the host could not load it — the sonames it lacks, or
+/// the machine mismatch — plus the fact that the binary already installed was left running
+/// (dig_ecosystem#1870).
 ///
-/// Naming the libraries is the requirement, not a nicety: "refused" alone tells an operator nothing
-/// they can act on, whereas `libgtk-3.so.0` tells them either to install GTK or to expect this
-/// component to stay at its current build on a headless host.
-fn unloadable_detail(missing: &[String], dest: &Path) -> String {
+/// Naming the cause is the requirement, not a nicety: "refused" alone tells an operator nothing they
+/// can act on, whereas `libgtk-3.so.0` tells them either to install GTK or to expect this component to
+/// stay at its current build on a headless host.
+fn unloadable_detail(refusal: &str, dest: &Path) -> String {
     format!(
-        "needs shared libraries this host does not provide ({}); the working build at {} was left in \
-         place and nothing was installed",
-        missing.join(", "),
+        "{refusal}; the working build at {} was left in place and nothing was installed",
         dest.display()
     )
 }

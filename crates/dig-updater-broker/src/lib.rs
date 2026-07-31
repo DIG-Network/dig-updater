@@ -50,6 +50,7 @@
 //! other module — and every other crate — is safe.
 
 pub mod config;
+pub mod display;
 pub mod elevation;
 pub mod elf;
 mod error;
@@ -98,7 +99,7 @@ pub use hashing::{installed_digest_hex, DigestReader};
 pub use health::VersionProbe;
 pub use install::RetryPolicy;
 pub use installed::{InstalledBuildStore, InstalledBuilds};
-pub use loadable::{host_check, Loadability, LoadabilityCheck};
+pub use loadable::{host_checker, Host, Loadability, LoadabilityCheck};
 pub use pass::{ComponentOutcome, ComponentResult, Installer, PassReport};
 pub use plan::{
     Catalog, ComponentTarget, HeldComponent, InstallMethod, Plan, PlannedComponent,
@@ -486,6 +487,11 @@ impl Broker {
         let loaded = store.load()?;
         let report = self.fetch_and_verify(feed_sources, loaded.state, sandbox)?;
 
+        // dig_ecosystem#1870: enumerate this host's shared libraries ONCE per pass, not once per
+        // component — the scan reads seven-plus directories and shells out to `ldconfig`, and the
+        // answer cannot change meaningfully mid-pass.
+        let host_check = loadable::host_checker();
+
         let installer = Installer {
             store: &store,
             catalog: &Catalog::alpha_defaults(&Platform::current()),
@@ -502,7 +508,7 @@ impl Broker {
             digest: &hashing::installed_digest_hex,
             // dig_ecosystem#1870: refuse, pre-apply, an artifact this host could not load — the check
             // that makes "the digest verified" stop meaning "the binary will run here".
-            loadability: &loadable::host_check,
+            loadability: host_check.as_ref(),
             // dig_ecosystem#1858: what this beacon last installed, so a host running AHEAD of the feed
             // is not pushed backwards by a digest that can only say "not these bytes".
             installed_builds: &installed::InstalledBuildStore::for_channel(

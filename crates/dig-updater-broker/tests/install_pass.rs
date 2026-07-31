@@ -540,6 +540,62 @@ fn an_overridden_feed_installs_the_bytes_but_never_advances_the_tracked_channel_
 }
 
 #[test]
+fn an_overridden_feed_pass_records_no_installed_build_for_the_tracked_channel() {
+    // The #1858 record is keyed on the TRACKED channel, and an overridden feed's builds are on
+    // whatever scale THAT feed numbers on — exactly why the trust state does not advance either.
+    // Recording a nightly's `20260731` as stable's installed build makes every later stable pass see
+    // `20260731 > 3004000` and Skip, permanently, reported as the benign "already newer than the
+    // feed". The component holding the sealed master seed would never update again.
+    //
+    // Both passes are driven so the assertion is not vacuous: the OVERRIDDEN one must record nothing
+    // and the ORDINARY one must still record, over the same fixture and the same build number.
+    let artifact = b"a-digstore-binary-whose-build-number-is-off-scale";
+    let build = 20_260_731;
+    let run = |suppress: bool| -> (tempfile::TempDir, Option<u64>) {
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("bin").join("digstore");
+        let srv = Server::bind();
+        let m = manifest(&srv.base, "0.2.0", build, 0, artifact);
+        let _guard = srv.serve(routes(&m, artifact));
+        let report = stage(&srv.base, &home.path().join("staging"));
+        let detect = |_: &Path| DetectedVersion::Absent;
+        let health = |_: &Path| DetectedVersion::Present("digstore 0.2.0".to_string());
+        let result = apply_with_suppress(
+            &test_root().verifying_key(),
+            &report,
+            home.path(),
+            &dest,
+            &detect,
+            &health,
+            suppress,
+        )
+        .expect("apply succeeds either way");
+        assert_eq!(
+            result.components[0].result,
+            ComponentResult::Installed,
+            "the bytes must really land in both passes, or nothing is being asserted"
+        );
+        let recorded = InstalledBuildStore::for_channel(home.path(), Channel::Stable)
+            .load()
+            .build_of("digstore");
+        (home, recorded)
+    };
+
+    let (_overridden_home, overridden) = run(true);
+    assert_eq!(
+        overridden, None,
+        "an off-scale build must never be filed as the tracked channel's installed build"
+    );
+
+    let (_ordinary_home, ordinary) = run(false);
+    assert_eq!(
+        ordinary,
+        Some(build),
+        "an ordinary pass still records what it installed — the record is not simply disabled"
+    );
+}
+
+#[test]
 fn update_replaces_an_older_binary() {
     let home = tempfile::tempdir().unwrap();
     let dest = home.path().join("digstore");
@@ -1765,6 +1821,27 @@ fn an_unloadable_artifact_is_refused_before_the_live_binary_is_touched() {
         calls.lock().unwrap().is_empty(),
         "a refusal precedes the service stop entirely: {:?}",
         calls.lock().unwrap()
+    );
+    // The DIRECT placement witness. "The bytes at `dest` are unchanged" is satisfied identically by a
+    // guard placed AFTER the snapshot and install, because the failing health gate then rolls the same
+    // bytes back — so on its own it pins a coincidence. A last-known-good entry, by contrast, exists
+    // if and only if the snapshot ran, and a snapshot means the install path was entered: the refusal
+    // was not where it claims to be. It also witnesses that the health gate never ran, since only a
+    // completed install reaches it.
+    assert!(
+        !f.home.path().join("lkg").join("dig-app").exists(),
+        "a last-known-good snapshot was taken, so the refusal happened INSIDE the install path"
+    );
+    let staged_privately: Vec<String> = std::fs::read_dir(f.home.path().join("apply"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("dig-app"))
+        .collect();
+    assert!(
+        staged_privately.is_empty(),
+        "the refused private copy must not be left behind, executable, in the apply dir: \
+         {staged_privately:?}"
     );
     let leftovers: Vec<String> = std::fs::read_dir(f.dig_app_dest.parent().unwrap())
         .unwrap()
