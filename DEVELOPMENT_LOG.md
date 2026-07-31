@@ -468,3 +468,59 @@ one and it still fails on the next:
   self-update could repair it. A defect in the pass PRELUDE (paths, permissions, locks, the ACL
   self-check) is categorically not auto-recoverable and can only reach existing installs through a
   reinstall channel. Worth weighing whenever code moves earlier in the pass than the self-update step.
+
+## "Hash verified" and "safe to install" are INDEPENDENT facts (#1870, v0.24.0)
+
+- **A digest-evidenced component's health gate proves the WRONG thing.** dig-app is declared
+  `VersionEvidence::ArtifactDigest`, so both its enumeration and its post-install health gate are a
+  SHA-256 re-hash of the file at its destination. That is a real gate — it catches a partial write or a
+  swap that did not land — but it establishes only WHICH BUILD is there. It never establishes that the
+  build can START, because nothing on that path ever executes the binary. So the beacon could download,
+  verify, install and report success on a binary that dies inside the dynamic linker before `main`, and
+  the report was not lying about anything it had actually checked. The manifest offers exactly ONE
+  `linux/x64` artifact per component, and for dig-app that is the GTK-linked desktop build
+  (`libgtk-3.so.0`, `libgdk-3.so.0`, `libgdk_pixbuf-2.0.so.0`, `libcairo.so.2`, …) — absent on a stock
+  headless server. Same failure class as `libxdo.so.3` at install time (#1753). The lesson generalizes
+  past this crate: whenever a verification step is a re-measurement of the SAME evidence the decision was
+  made from, ask what fact it does NOT carry.
+- **Loadability can be proven WITHOUT executing a binary you are forbidden to execute.** The obvious
+  check — run it, or `ldd` it — is unavailable here: `dig-app <= 3.3.0` parses no arguments, so under the
+  SYSTEM/root beacon `--version` boots the identity agent, seals a master seed and binds a loopback
+  signing socket, and `ldd` is itself a loader invocation on attacker-adjacent bytes. But the requirements
+  are IN the file: `DT_NEEDED` (plus `DT_RUNPATH`/`DT_RPATH`, `$ORIGIN`-expanded) read out of the ELF
+  dynamic section, resolved against the host's library set from `ldconfig -p`. ~150 LOC, no new crate, no
+  exec. A second benefit is falsifiability: a decision made by spawning a process would live behind
+  `#[cfg(unix)]` and be unfalsifiable on a Windows dev host, whereas a pure parse + a pure decision are
+  asserted identically on every runner (the `#[cfg(unix)]`-unfalsifiable-guard trap, seen before).
+- **Every read of a downloaded artifact must be bounds-checked, and that is a SECURITY property.** The
+  parse runs inside the privileged pass. A panic there aborts the pass, so ONE malformed artifact would
+  stop the host updating at all — a denial of service on the update channel itself, worse than the bug
+  being fixed. Hence `slice::get(..)` everywhere, no allocation sized from a length read out of the file,
+  and a test that feeds EVERY prefix of a valid image through the parser.
+- **`Indeterminate` must APPLY, not refuse — a guard that cannot prove harm must not act.** Refusing what
+  the check cannot establish reads like the safe default and is the worse bug: every native-package
+  private copy (`.deb`/`.msi`/`.pkg` is not an ELF image), every musl/Alpine host, and every non-Linux
+  platform would refuse every component forever — a fleet-wide update freeze that would also block the
+  security updates the beacon exists to deliver. So the answer is three-valued and deliberately
+  asymmetric, and the whole check can only ever make the beacon install LESS, never more.
+- **Placement is the fix; the outcome alone is a coincidence.** The gate sits after the staging digest
+  re-verify and BEFORE the rollback snapshot and any service stop, so a refusal never touches the live
+  binary. A guard placed later satisfies "result == Refused" identically while having already moved the
+  working binary aside — which is why the test asserts the bytes at the destination, the absent
+  `.dig-updater-old` sibling, ZERO service-control calls and the cleaned-up private copy, not just the
+  reported result.
+- **A refusal must be VISIBLE without being a FAULT.** On a headless host the refusal is permanent and
+  correct. Making it a fault would put the nightly systemd unit permanently red — the exact inverse of
+  #1747's lesson, where a green unit hid a real nightly failure. So the pass stays `applied`,
+  `is_fault()` stays false, the trust-state advance is NOT withheld (a hold already reasons this way), and
+  the requirement is carried by reporting: a `refused` result naming the missing sonames, a `refused` list
+  on the pass report, and an additive `refused_components` in `status.json`.
+- **A hash cannot express "ahead of the feed" (#1858).** For digest evidence the only two answers are
+  "these are the promised bytes" and "these are not", and the second reads identically for a NEWER build
+  and an older one — so a host running ahead was planned as an Update and pushed backwards. The shared
+  matrix lives in the external `dig-release-resolver`, so the correction has to sit on its OUTPUT. Two
+  details that matter: the record is a SEPARATE `installed-builds-<channel>.json`, never a key in the
+  fail-closed `trust-state-<channel>.json` (a component-map problem must not escalate into trust-state
+  corruption, and that reader treats a missing mark as tampering); and it records the build ACTUALLY
+  PRESENT, so a rollback re-records the REINSTATED build — a high-water mark would remember the build that
+  was rolled away and skip the install that restores the host.
