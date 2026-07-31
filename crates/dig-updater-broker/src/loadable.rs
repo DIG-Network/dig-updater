@@ -223,7 +223,7 @@ fn ldconfig_sonames() -> Option<HashSet<String>> {
         // Each cache line is `\t<soname> (<flags>) => <path>`; the leading tab distinguishes an
         // entry from the header line, and the soname is its first whitespace-separated token.
         .filter(|line| line.starts_with('\t'))
-        .filter_map(|line| line.trim().split_whitespace().next())
+        .filter_map(|line| line.split_whitespace().next())
         .map(str::to_string)
         .collect();
     (!sonames.is_empty()).then_some(sonames)
