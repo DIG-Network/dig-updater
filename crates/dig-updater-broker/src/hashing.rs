@@ -54,6 +54,43 @@ pub fn open_no_symlink(path: &Path) -> Result<File, BrokerError> {
     }
 }
 
+/// Read an installed file's SHA-256 as lowercase hex, or `None` when there is no readable file
+/// there — the evidence source for a [`VersionEvidence::ArtifactDigest`][ev] component (SPEC §9.6).
+///
+/// This is how the beacon learns which build of a component is installed WITHOUT executing it: the
+/// answer comes from the file's own bytes measured against the signed manifest's artifact digest,
+/// rather than from the binary's self-report. Injected as a [`DigestReader`] wherever it is used, so
+/// planning and the health gate stay unit-testable without real files.
+///
+/// `None` collapses every "no digest available" case — absent, unreadable, a symlink refused by
+/// [`open_no_symlink`] — into the ONE answer the planner treats as "nothing established here". That
+/// is the fail-closed direction: a component whose digest cannot be read is planned as an
+/// (re)install of the verified artifact, never as current, and never as something to execute.
+///
+/// [ev]: crate::plan::VersionEvidence::ArtifactDigest
+#[must_use]
+pub fn installed_digest_hex(path: &Path) -> Option<String> {
+    let digest = sha256_file(path).ok()?;
+    Some(hex_lower(&digest))
+}
+
+/// A digest reader: given an installed file's path, report its SHA-256 as lowercase hex, or `None`.
+/// Production passes [`installed_digest_hex`]; tests pass a scripted reader so the match, mismatch
+/// and absent arms are all exercised deterministically.
+pub type DigestReader<'a> = dyn Fn(&Path) -> Option<String> + 'a;
+
+/// Render `bytes` as lowercase hex — the SAME casing the signed manifest's `sha256` fields carry, so
+/// a comparison against them is a plain string equality rather than a case-folding dance.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
 /// Stream-hash the file at `path` (symlink-safe) into its SHA-256, without loading it whole into
 /// memory.
 ///
@@ -94,6 +131,57 @@ mod tests {
     fn missing_file_is_an_io_error() {
         let missing = std::env::temp_dir().join("dig-updater-hashing-definitely-missing");
         assert!(matches!(sha256_file(&missing), Err(BrokerError::Io(_))));
+    }
+
+    #[test]
+    fn installed_digest_hex_is_the_lowercase_hex_of_the_files_sha256() {
+        // The manifest carries `sha256` as lowercase hex, so the reader must produce a string that
+        // compares equal to it directly. Cross-checked against the hasher rather than a transcribed
+        // literal, so the two can never drift.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dig-app");
+        std::fs::write(&path, b"the-installed-bytes").unwrap();
+        let expected: [u8; 32] = Sha256::digest(b"the-installed-bytes").into();
+
+        let hex = installed_digest_hex(&path).expect("a readable file has a digest");
+        assert_eq!(hex, hex_lower(&expected));
+        assert_eq!(hex.len(), 64, "a SHA-256 renders as 64 hex digits");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()),
+            "must be LOWERCASE hex to match the manifest's own casing: {hex}"
+        );
+    }
+
+    #[test]
+    fn installed_digest_hex_of_an_absent_file_is_none() {
+        // The fail-closed arm: no file => nothing established => the planner installs.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            installed_digest_hex(&dir.path().join("not-installed")),
+            None
+        );
+    }
+
+    #[test]
+    fn hex_lower_pads_every_byte_to_two_digits() {
+        // A byte below 0x10 must render as `0f`, not `f` — an unpadded rendering would silently
+        // shorten the string and never match a manifest digest.
+        assert_eq!(hex_lower(&[0x00, 0x0f, 0xff, 0xa5]), "000fffa5");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_digest_hex_of_a_symlink_is_none_not_the_targets_digest() {
+        // A symlink at the install destination must not let the beacon read some OTHER file's bytes
+        // and conclude the component is current. `sha256_file` refuses it, so the reader answers
+        // `None` (fail-closed → reinstall) rather than the link target's digest.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, b"bytes-outside-the-install-root").unwrap();
+        let link = dir.path().join("dig-app");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(installed_digest_hex(&link), None);
     }
 
     #[cfg(unix)]

@@ -91,6 +91,7 @@ pub use error::BrokerError;
 pub use ext_forcelist::{
     follow_channel_change, ExtFollow, ForcelistCommander, InstalledDigInstaller,
 };
+pub use hashing::{installed_digest_hex, DigestReader};
 pub use health::VersionProbe;
 pub use install::RetryPolicy;
 pub use pass::{ComponentOutcome, ComponentResult, Installer, PassReport};
@@ -491,6 +492,9 @@ impl Broker {
             now: now_unix_secs(),
             detect,
             health,
+            // Content-digest evidence (SPEC §9.6) — how a component that must never be EXECUTED has
+            // its installed build established, before and after install alike.
+            digest: &hashing::installed_digest_hex,
             service_ctl: &service::control,
             // #621 item 1: when the feed ladder was overridden (`--feed-base`/`$DIG_UPDATER_FEED_BASE`)
             // the fetched marks may be off the tracked channel's scale, so this pass installs but must

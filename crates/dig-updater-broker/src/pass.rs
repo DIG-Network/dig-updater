@@ -40,6 +40,7 @@ use dig_updater_trust::{
 use dig_updater_worker::{Platform, VerifiedPlan, WorkerReport};
 
 use crate::error::BrokerError;
+use crate::hashing::DigestReader;
 use crate::health::{check_health, VersionProbe};
 use crate::install::{
     contained_staged_path, install_from_private, private_target, stage_and_verify_private,
@@ -239,6 +240,10 @@ pub struct Installer<'a> {
     pub detect: &'a VersionProbe<'a>,
     /// Probe for the HEALTH step (what version is installed AFTER install).
     pub health: &'a VersionProbe<'a>,
+    /// Read an installed file's SHA-256 — the evidence source for a component declared
+    /// [`crate::plan::VersionEvidence::ArtifactDigest`], used for BOTH its enumeration and its health gate so
+    /// neither step ever executes it. Production wires [`crate::hashing::installed_digest_hex`].
+    pub digest: &'a DigestReader<'a>,
     /// Stop/start a service-backed component's OS service around its replace (#666 Bug B).
     /// Production wires [`crate::service::control`]; tests inject a recording fake so the
     /// stop→replace→restart ordering + failure handling are exercised without a real service.
@@ -288,6 +293,7 @@ impl Installer<'_> {
             self.catalog,
             self.platform,
             self.detect,
+            self.digest,
         )?;
 
         // 3. Apply every OTHER actionable component behind the health gate. The beacon's own
@@ -565,6 +571,13 @@ impl Installer<'_> {
     /// rolled back rather than falsely reported Installed. Returns the PRIMARY's observed version
     /// (what a later `status` read states, #582).
     fn check_binary_set(&self, pc: &PlannedComponent) -> Result<DetectedVersion, String> {
+        if !pc.evidence.requires_execution() {
+            // A component the planner refused to execute must not be executed AFTER installing it
+            // either — the side effects a probe would trigger do not become acceptable once the bytes
+            // are newer. The gate is the same measurement the plan was made from, re-taken against
+            // the same signed digest, so it still proves the installed bytes ARE the promised build.
+            return self.check_installed_digest(pc);
+        }
         let primary = check_health(&pc.dest, &pc.version, self.health)?;
         for alias in &pc.aliases {
             check_health(alias, &pc.version, self.health).map_err(|detail| {
@@ -575,6 +588,34 @@ impl Installer<'_> {
             })?;
         }
         Ok(primary)
+    }
+
+    /// Health-gate a [`crate::plan::VersionEvidence::ArtifactDigest`] component by RE-HASHING what now sits at its
+    /// destination against the digest the re-verified manifest promised (SPEC §9.7(3)).
+    ///
+    /// This is the post-install half of the never-execute guarantee, and it is a real gate rather than
+    /// an exemption: a partial write, a swap that silently did not land, or bytes replaced between the
+    /// install and this read all produce a different digest and roll the component back. The digest is
+    /// read through the same symlink-refusing path as every other broker read, so a link planted at
+    /// `dest` cannot redirect the measurement to bytes that would pass.
+    ///
+    /// A component with content-digest evidence declares no aliases (enforced in
+    /// [`crate::plan::hold_reason`]), so — unlike the probe path — there is no alias set to walk here.
+    fn check_installed_digest(&self, pc: &PlannedComponent) -> Result<DetectedVersion, String> {
+        match (self.digest)(&pc.dest) {
+            None => Err(format!(
+                "nothing readable installed at {}",
+                pc.dest.display()
+            )),
+            Some(found) if found.eq_ignore_ascii_case(&pc.expected_digest) => {
+                Ok(DetectedVersion::Present(pc.version.clone()))
+            }
+            Some(found) => Err(format!(
+                "post-install digest check failed: {} has sha256 {found}, expected {}",
+                pc.dest.display(),
+                pc.expected_digest
+            )),
+        }
     }
 
     /// Fold the accepted manifest's marks into the trust state and persist it — hardening the state

@@ -128,17 +128,62 @@ pub fn install(exe: &Path, state_dir: &Path) -> Result<(), BrokerError> {
 /// Remove the daily scheduler artifact and RECORD a deliberate opt-out. Idempotent: removing an
 /// already-absent schedule succeeds.
 ///
-/// The opt-out sentinel ([`crate::optout`]) is written only AFTER a successful removal, so an
-/// always-on driver (dig-node) never re-arms a schedule the operator DELIBERATELY removed — the
-/// distinction between an accidental deletion (re-arm) and this deliberate uninstall (respect).
+/// The opt-out sentinel ([`crate::optout`]) is what lets an always-on driver (dig-node) tell an
+/// ACCIDENTAL deletion — which it re-arms — from this DELIBERATE uninstall, which it respects.
+///
+/// **The intent is recorded BEFORE the removal, and rescinded if the removal fails**
+/// (dig_ecosystem#1822). Writing it afterwards left a window in which the task was already gone and
+/// no marker existed yet: any failure of the marker write — and it needs elevation, so it can fail —
+/// produced "schedule absent, no opt-out", which is EXACTLY the signature of the defect this ordering
+/// makes diagnosable. With the record first, that state can only ever mean something removed the task
+/// without going through this function, so it is a usable discriminator rather than an ambiguous one.
+/// The reverse window is harmless: a marker with the task still present merely suppresses the
+/// self-heal until the next `install` clears it, and never removes anything.
 ///
 /// # Errors
 ///
-/// [`BrokerError::Io`] if the caller lacks privilege, the underlying OS call fails for a reason
-/// other than "already absent", or the opt-out sentinel could not be written.
+/// [`BrokerError::Io`] if the caller lacks privilege, the opt-out sentinel could not be written, or
+/// the underlying OS call fails for a reason other than "already absent".
 pub fn uninstall(state_dir: &Path) -> Result<(), BrokerError> {
-    imp::uninstall()?;
-    crate::optout::set_opted_out(state_dir)
+    uninstall_recording_intent_first(&StateDirOptOut(state_dir), imp::uninstall)
+}
+
+/// The deliberate-opt-out ledger [`uninstall`] writes through — injected so the ORDERING is
+/// unit-testable on every OS without the elevation a real marker write demands (writing one claims
+/// privileged ownership, [`crate::optout::set_opted_out`]).
+trait OptOutLedger {
+    /// Record that the operator deliberately wants no daily schedule.
+    fn record(&self) -> Result<(), BrokerError>;
+    /// Withdraw a record that turned out not to describe what happened.
+    fn rescind(&self) -> Result<(), BrokerError>;
+}
+
+/// The production ledger: the opt-out sentinel inside the beacon's state directory.
+struct StateDirOptOut<'a>(&'a Path);
+
+impl OptOutLedger for StateDirOptOut<'_> {
+    fn record(&self) -> Result<(), BrokerError> {
+        crate::optout::set_opted_out(self.0)
+    }
+    fn rescind(&self) -> Result<(), BrokerError> {
+        crate::optout::clear_opted_out(self.0)
+    }
+}
+
+/// Record the opt-out, then remove the artifact — rescinding the record if the removal fails, so the
+/// two never disagree about whether the operator asked for this (see [`uninstall`]).
+///
+/// A failure to rescind is deliberately not propagated over the removal error it followed: the
+/// removal error is the one the caller must act on, and the leftover marker is the safe residue (it
+/// suppresses a re-arm of a schedule that is still there, which the next `install` clears).
+fn uninstall_recording_intent_first(
+    ledger: &dyn OptOutLedger,
+    remove: impl FnOnce() -> Result<(), BrokerError>,
+) -> Result<(), BrokerError> {
+    ledger.record()?;
+    remove().inspect_err(|_| {
+        let _ = ledger.rescind();
+    })
 }
 
 /// Report whether the daily schedule is currently registered.
@@ -199,6 +244,28 @@ fn ensure_decision(presence: SchedulePresence) -> EnsureAction {
 
 #[cfg(windows)]
 mod imp {
+    //! ## The task store belongs to Task Scheduler (dig_ecosystem#1822)
+    //!
+    //! Everything under `%SystemRoot%\System32\Tasks` — the definition files AND the folders that
+    //! hold them — is Task Scheduler's own on-disk store, and the AUTHORITATIVE copy of each task's
+    //! security descriptor lives beside it in `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\
+    //! Schedule\TaskCache`. The service cross-checks the two and treats a definition whose on-disk SD
+    //! no longer matches as tampered-with (`0x80041321`), DISCARDING the task from the tree — which
+    //! takes `\DIG`, its only child, with it. A privileged write into that store is therefore not
+    //! belt-and-suspenders hardening; it is a way to delete your own schedule.
+    //!
+    //! So this module registers and removes tasks THROUGH `schtasks` and makes no other write to the
+    //! store: no `icacls` over a definition file, no `remove_dir` of a task folder. The Admin/SYSTEM
+    //! WRITE bar of SPEC §9.3 is already met by the OS default DACL, which grants Administrators and
+    //! SYSTEM Full Control and every other identity READ ONLY (verified against a live Windows 11
+    //! task store and asserted by
+    //! `tests/scheduler.rs::the_task_definition_file_is_not_writable_by_an_unprivileged_identity`).
+    //! Read access is not a concern: `schtasks /Query /XML` prints any task's whole definition to any
+    //! user, so nothing is disclosed by a readable definition file.
+    //!
+    //! Unix is unaffected — a systemd unit / launchd plist is the beacon's OWN file in a root-owned
+    //! directory, so writing it root-owned mode `0644` remains correct.
+
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -208,7 +275,6 @@ mod imp {
     use crate::error::BrokerError;
     use crate::install::trusted_absolute;
     use crate::proc::HideConsole;
-    use crate::secure::harden_state_dir;
 
     /// The absolute, trusted path to `schtasks.exe` — never a bare name resolved through `PATH`.
     fn schtasks() -> Result<PathBuf, BrokerError> {
@@ -221,21 +287,6 @@ mod imp {
                 .join("schtasks.exe"),
         )
         .map_err(BrokerError::Io)
-    }
-
-    /// Where Task Scheduler stores the registered task's XML definition on disk — hardened
-    /// explicitly below as belt-and-suspenders on top of the OS's own default task-store ACLs.
-    fn definition_file() -> Result<PathBuf, BrokerError> {
-        let system_root = std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("windir"))
-            .ok_or_else(|| BrokerError::Io("neither %SystemRoot% nor %windir% is set".into()))?;
-        let relative = WINDOWS_TASK_PATH
-            .trim_start_matches('\\')
-            .replace('\\', "/");
-        Ok(PathBuf::from(system_root)
-            .join("System32")
-            .join("Tasks")
-            .join(relative))
     }
 
     pub(super) fn install(exe: &Path) -> Result<(), BrokerError> {
@@ -263,12 +314,8 @@ mod imp {
             )));
         }
 
-        // Belt-and-suspenders on top of Task Scheduler's own default task-store ACLs: explicitly
-        // restrict the definition file to Administrators + SYSTEM, matching every other guarded
-        // path in this crate (SPEC §9.3).
-        if let Ok(path) = definition_file() {
-            let _ = harden_state_dir(&path);
-        }
+        // NOTHING follows the registration. In particular the definition file's security descriptor
+        // is Task Scheduler's, and the beacon MUST NOT touch it — see this module's Windows note.
         Ok(())
     }
 
@@ -280,14 +327,12 @@ mod imp {
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run schtasks: {e}")))?;
         if output.status.success() {
-            remove_empty_task_folder();
             return Ok(());
         }
         // Idempotent: deleting an already-absent task is success, not an error. Only a PROVABLY
         // absent task counts — an access-denied query (`Unknown`) means we could neither delete nor
         // confirm removal, which is a real failure, not a benign no-op.
         if status()?.presence == SchedulePresence::Absent {
-            remove_empty_task_folder();
             return Ok(());
         }
         Err(BrokerError::Io(format!(
@@ -333,26 +378,6 @@ mod imp {
             ));
         }
         ScheduleStatus::absent(format!("no task registered at {WINDOWS_TASK_PATH}"))
-    }
-
-    /// Best-effort removal of the now-empty `\DIG` Task Scheduler FOLDER after the task itself is
-    /// deleted, so an empty folder can't masquerade as a partial install (#546).
-    ///
-    /// The folder is Task Scheduler's on-disk representation at `%SystemRoot%\System32\Tasks\DIG`;
-    /// once `schtasks /Delete` removed the task's definition file, removing its empty parent tidies
-    /// up. [`std::fs::remove_dir`] removes an EMPTY directory only — so if any OTHER DIG task lives
-    /// under `\DIG` this is a silent no-op (the safe behavior), and a guard restricts it to the
-    /// `DIG` subfolder so the `Tasks` root itself is never touched. Never fatal: a leftover empty
-    /// folder is cosmetic.
-    fn remove_empty_task_folder() {
-        let Ok(task_file) = definition_file() else {
-            return;
-        };
-        if let Some(folder) = task_file.parent() {
-            if folder.file_name().and_then(|n| n.to_str()) == Some("DIG") {
-                let _ = std::fs::remove_dir(folder);
-            }
-        }
     }
 
     /// Encode `text` as UTF-16LE bytes with a leading byte-order mark — the exact form
@@ -685,6 +710,120 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// What a test observed the ledger being asked to do, in order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LedgerCall {
+        Record,
+        Rescind,
+    }
+
+    /// A recording [`OptOutLedger`] whose `record` can be made to FAIL — the fixture that separates
+    /// "the marker write failed" from "the removal failed", which is the whole point of the ordering.
+    struct RecordingLedger {
+        calls: RefCell<Vec<LedgerCall>>,
+        record_fails: bool,
+    }
+
+    impl RecordingLedger {
+        fn working() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                record_fails: false,
+            }
+        }
+        fn that_cannot_record() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                record_fails: true,
+            }
+        }
+        fn calls(&self) -> Vec<LedgerCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl OptOutLedger for RecordingLedger {
+        fn record(&self) -> Result<(), BrokerError> {
+            self.calls.borrow_mut().push(LedgerCall::Record);
+            if self.record_fails {
+                return Err(BrokerError::Io(
+                    "not elevated enough to claim ownership".into(),
+                ));
+            }
+            Ok(())
+        }
+        fn rescind(&self) -> Result<(), BrokerError> {
+            self.calls.borrow_mut().push(LedgerCall::Rescind);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn uninstall_records_the_optout_before_it_removes_anything() {
+        // dig_ecosystem#1822: the marker must already exist by the time the artifact can vanish, so
+        // "absent schedule, no marker" can never be produced by a half-completed uninstall. Asserting
+        // the ORDER is what pins this — asserting only that both happened would pass on the old
+        // remove-then-record code, which is precisely the ordering being fixed.
+        let ledger = RecordingLedger::working();
+        let removed = RefCell::new(false);
+        uninstall_recording_intent_first(&ledger, || {
+            assert_eq!(
+                ledger.calls(),
+                vec![LedgerCall::Record],
+                "the opt-out must already be recorded when the removal runs"
+            );
+            *removed.borrow_mut() = true;
+            Ok(())
+        })
+        .expect("a successful removal after a successful record");
+
+        assert!(*removed.borrow(), "the artifact was removed");
+        assert_eq!(
+            ledger.calls(),
+            vec![LedgerCall::Record],
+            "a successful uninstall never rescinds its own record"
+        );
+    }
+
+    #[test]
+    fn uninstall_rescinds_the_optout_when_the_removal_is_the_step_that_fails() {
+        // The other half of the ordering: a recorded intent that turned out not to have happened must
+        // be withdrawn, or a failed uninstall would leave auto-updates suppressed for a schedule that
+        // is still registered — the self-heal silenced by a removal that never occurred.
+        let ledger = RecordingLedger::working();
+        let err = uninstall_recording_intent_first(&ledger, || {
+            Err(BrokerError::Io(
+                "schtasks /Delete failed: access is denied".into(),
+            ))
+        })
+        .expect_err("the removal failure reaches the caller");
+
+        assert!(
+            err.to_string().contains("schtasks"),
+            "the REMOVAL error is what the caller must act on, not a rescind error: {err}"
+        );
+        assert_eq!(
+            ledger.calls(),
+            vec![LedgerCall::Record, LedgerCall::Rescind]
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_nothing_when_the_optout_cannot_be_recorded() {
+        // Fail-closed on the marker: if the deliberate intent cannot be written down, the schedule
+        // stays. Removing it anyway would manufacture the exact undiagnosable state — task gone, no
+        // marker — that this ordering exists to make impossible.
+        let ledger = RecordingLedger::that_cannot_record();
+        let err = uninstall_recording_intent_first(&ledger, || {
+            panic!("the removal must not run when the opt-out could not be recorded")
+        })
+        .expect_err("an unrecordable opt-out fails the uninstall");
+
+        assert!(err.to_string().contains("ownership"), "{err}");
+        assert_eq!(ledger.calls(), vec![LedgerCall::Record]);
+    }
 
     #[test]
     fn ensure_re_registers_only_a_provably_absent_schedule() {
