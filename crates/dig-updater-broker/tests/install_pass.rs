@@ -28,7 +28,8 @@ use sha2::{Digest, Sha256};
 use dig_updater_broker::config::Channel;
 use dig_updater_broker::{
     BrokerError, Catalog, ComponentResult, ComponentTarget, DetectedVersion, InstallMethod,
-    Installer, LkgCache, PassReport, RetryPolicy, TrustStateStore, VersionEvidence,
+    InstalledBuildStore, Installer, LkgCache, Loadability, PassReport, RetryPolicy,
+    TrustStateStore, VersionEvidence,
 };
 use dig_updater_trust::{
     Artifact, Component, Delegation, Manifest, SignedDelegation, SignedManifest, TrustState,
@@ -104,6 +105,24 @@ impl Server {
             handle: Some(handle),
         }
     }
+}
+
+/// A host that can load anything — the honest default for every scenario whose subject is install
+/// MECHANICS rather than host capability (dig_ecosystem#1870).
+fn always_loadable(_: &Path) -> Loadability {
+    Loadability::Loadable
+}
+
+/// The #1858 record store belonging beside `store`'s own state file, so each harness records what it
+/// installs exactly where a production pass would.
+fn records_beside(store: &TrustStateStore) -> InstalledBuildStore {
+    InstalledBuildStore::for_channel(
+        store
+            .path()
+            .parent()
+            .expect("the state file has a directory"),
+        Channel::Stable,
+    )
 }
 
 /// A digest reader that PANICS if consulted — see the `digest:` field comment on each harness.
@@ -237,6 +256,10 @@ fn apply_with_suppress(
     let platform = Platform::current();
     let installer = Installer {
         store: &store,
+        // Every pre-#1870 scenario asserts install MECHANICS, so its host is declared able to load
+        // what it installs; the refusal branch has its own fixture below.
+        loadability: &always_loadable,
+        installed_builds: &records_beside(&store),
         catalog: &catalog,
         platform: &platform,
         lkg: &lkg,
@@ -297,6 +320,10 @@ fn apply_digest_evidenced(
     let platform = Platform::current();
     let installer = Installer {
         store: &store,
+        // Every pre-#1870 scenario asserts install MECHANICS, so its host is declared able to load
+        // what it installs; the refusal branch has its own fixture below.
+        loadability: &always_loadable,
+        installed_builds: &records_beside(&store),
         catalog: &catalog,
         platform: &platform,
         lkg: &lkg,
@@ -837,6 +864,10 @@ fn apply_self_and_other(
     };
     let installer = Installer {
         store: &store,
+        // Every pre-#1870 scenario asserts install MECHANICS, so its host is declared able to load
+        // what it installs; the refusal branch has its own fixture below.
+        loadability: &always_loadable,
+        installed_builds: &records_beside(&store),
         catalog: &catalog,
         platform: &platform,
         lkg: &lkg,
@@ -1022,6 +1053,10 @@ fn apply_with_service(
     let platform = Platform::current();
     let installer = Installer {
         store: &store,
+        // Every pre-#1870 scenario asserts install MECHANICS, so its host is declared able to load
+        // what it installs; the refusal branch has its own fixture below.
+        loadability: &always_loadable,
+        installed_builds: &records_beside(&store),
         catalog: &catalog,
         platform: &platform,
         lkg: &lkg,
@@ -1207,6 +1242,10 @@ fn apply_aliased(
     let platform = Platform::current();
     let installer = Installer {
         store: &store,
+        // Every pre-#1870 scenario asserts install MECHANICS, so its host is declared able to load
+        // what it installs; the refusal branch has its own fixture below.
+        loadability: &always_loadable,
+        installed_builds: &records_beside(&store),
         catalog: &catalog,
         platform: &platform,
         lkg: &lkg,
@@ -1448,6 +1487,10 @@ fn an_unsafe_to_probe_dig_app_is_held_unexecuted_while_its_stale_sibling_really_
     let platform = Platform::current();
     let installer = Installer {
         store: &store,
+        // Every pre-#1870 scenario asserts install MECHANICS, so its host is declared able to load
+        // what it installs; the refusal branch has its own fixture below.
+        loadability: &always_loadable,
+        installed_builds: &records_beside(&store),
         catalog: &catalog,
         platform: &platform,
         lkg: &lkg,
@@ -1511,5 +1554,490 @@ fn an_unsafe_to_probe_dig_app_is_held_unexecuted_while_its_stale_sibling_really_
     assert!(
         result.state_advanced,
         "one un-probeable per-user daemon must not freeze every other component's trust state"
+    );
+}
+
+// ====================== dig_ecosystem#1870 — an UNLOADABLE artifact is refused ======================
+
+/// The GTK sonames the real `dig-app` `linux/x64` artifact requires — the ones a stock headless
+/// server does not have, and the reason a "successful" update killed a working install.
+const MISSING_ON_A_HEADLESS_HOST: [&str; 2] = ["libgtk-3.so.0", "libgdk-3.so.0"];
+
+/// A host that cannot load ONE named artifact and can load everything else — the fixture shape that
+/// keeps a truthful control in the pass. A resolver that refused everything could not tell a
+/// correctly-placed refusal from a beacon that had simply stopped installing.
+fn host_missing_libs_for(unloadable: &Path) -> impl Fn(&Path) -> Loadability + '_ {
+    move |candidate: &Path| {
+        if candidate.file_stem() == unloadable.file_stem() {
+            Loadability::Unloadable {
+                missing: MISSING_ON_A_HEADLESS_HOST
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            }
+        } else {
+            Loadability::Loadable
+        }
+    }
+}
+
+/// Drive a REAL two-component pass — an ordinary `digstore` (probe-evidenced, genuinely stale) beside
+/// `dig-app` (digest-evidenced, dig-app's shipped class) — with the loadability check and the service
+/// controller both INJECTED, so the #1870 refusal is observable end to end on every OS runner.
+///
+/// `dig-app` is really on disk with known bytes before the pass, so "nothing was installed" is a
+/// statement about a file that EXISTS rather than an artefact of its absence, and both version probes
+/// refuse to execute it (dig_ecosystem#1803 still binds).
+fn apply_with_loadability(
+    f: &RefusalFixture,
+    loadability: &dyn Fn(&Path) -> Loadability,
+    service_ctl: &ServiceControl,
+    dig_app_digest: &dyn Fn(&Path) -> Option<String>,
+) -> PassReport {
+    let home = f.home.path();
+    let store = TrustStateStore::for_channel(home, Channel::Stable);
+    let loaded = store.load().expect("load state");
+    let lkg = LkgCache::at(home.join("lkg"));
+    let apply_dir = home.join("apply");
+    std::fs::create_dir_all(&apply_dir).expect("apply dir");
+    let catalog = Catalog::new(vec![
+        ComponentTarget {
+            name: "digstore".into(),
+            method: InstallMethod::RawBinary,
+            dest: f.digstore_dest.clone(),
+            aliases: vec![],
+            service: None,
+            evidence: VersionEvidence::SafeToProbe,
+        },
+        ComponentTarget {
+            name: "dig-app".into(),
+            method: InstallMethod::RawBinary,
+            dest: f.dig_app_dest.clone(),
+            aliases: vec![],
+            // A service id is declared PURELY so the refusal can be proven to precede the service
+            // stop: with none, "zero service calls" would hold trivially.
+            service: Some("net.dignetwork.dig-app-test".to_string()),
+            // dig-app's SHIPPED evidence class: its build is established by hashing, never by running
+            // it — which is exactly why the re-hash health gate cannot notice an unloadable binary.
+            evidence: VersionEvidence::ArtifactDigest,
+        },
+    ]);
+    // Both probes REFUSE to run dig-app (dig_ecosystem#1803 still binds — the exec itself is the
+    // hazard, so it has to stay observable), and answer honestly for the digstore control: stale at
+    // enumeration, current after its install, so the control genuinely completes its health gate.
+    let refuse_to_exec_dig_app = |p: &Path, stage: &str| {
+        assert!(
+            !p.ends_with("dig-app") && !p.ends_with("dig-app.exe"),
+            "the pass EXECUTED dig-app at {stage} — never permitted, at any version, on any path \
+             (dig_ecosystem#1803)"
+        );
+    };
+    let detect = |p: &Path| {
+        refuse_to_exec_dig_app(p, "enumeration");
+        DetectedVersion::Present("digstore 0.1.0".to_string())
+    };
+    let health = |p: &Path| {
+        refuse_to_exec_dig_app(p, "the health gate");
+        DetectedVersion::Present("digstore 0.2.0".to_string())
+    };
+    let platform = Platform::current();
+    let installer = Installer {
+        store: &store,
+        loadability,
+        installed_builds: &records_beside(&store),
+        catalog: &catalog,
+        platform: &platform,
+        lkg: &lkg,
+        staging_dir: &home.join("staging"),
+        apply_dir: &apply_dir,
+        retry: RetryPolicy {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        },
+        now: NOW,
+        detect: &detect,
+        health: &health,
+        digest: dig_app_digest,
+        service_ctl,
+        suppress_state_advance: false,
+    };
+    installer
+        .apply(&test_root().verifying_key(), &f.report, loaded)
+        .expect("a refusal never fails the pass")
+}
+
+/// The staged #1870 fixture: a served two-component feed, with `dig-app` ALREADY installed under
+/// known bytes so "the working build survived" is a claim about a real file.
+struct RefusalFixture {
+    home: tempfile::TempDir,
+    digstore_dest: std::path::PathBuf,
+    dig_app_dest: std::path::PathBuf,
+    digstore_artifact: &'static [u8],
+    report: WorkerReport,
+    _guard: Guard,
+    _server: Server,
+}
+
+/// The bytes of the dig-app build that WORKS on this host — what must still be at the destination
+/// after a refusal.
+const RUNNING_DIG_APP_BYTES: &[u8] = b"the-running-dig-app-3.4.0-binary-that-actually-works";
+
+fn refusal_fixture() -> RefusalFixture {
+    let home = tempfile::tempdir().unwrap();
+    let digstore_dest = home.path().join("bin").join("digstore");
+    let dig_app_dest = home.path().join("bin").join("dig-app");
+    let digstore_artifact: &'static [u8] = b"the-new-digstore-0.2.0-binary";
+    let dig_app_artifact: &'static [u8] = b"the-new-gtk-linked-dig-app-3.4.0-binary";
+
+    let server = Server::bind();
+    let m = manifest_with_dig_app(&server.base, digstore_artifact, dig_app_artifact);
+    let guard = server.serve(routes_with_self_and_other(
+        &m,
+        dig_app_artifact,
+        digstore_artifact,
+    ));
+    let report = stage(&server.base, &home.path().join("staging"));
+
+    std::fs::create_dir_all(dig_app_dest.parent().unwrap()).unwrap();
+    std::fs::write(&dig_app_dest, RUNNING_DIG_APP_BYTES).unwrap();
+    RefusalFixture {
+        home,
+        digstore_dest,
+        dig_app_dest,
+        digstore_artifact,
+        report,
+        _guard: guard,
+        _server: server,
+    }
+}
+
+/// A digest reader answering a value that matches NOTHING, so the digest-evidenced component is
+/// planned as an Update — the state a host is in when the feed offers it different bytes.
+fn digest_of_something_else(_: &Path) -> Option<String> {
+    Some("0000".to_string())
+}
+
+#[test]
+fn an_unloadable_artifact_is_refused_before_the_live_binary_is_touched() {
+    // dig_ecosystem#1870, the whole point: the artifact is signed, downloaded and digest-verified —
+    // and it names libraries this host does not have, so installing it would replace a WORKING
+    // binary with one that dies in the dynamic linker before `main`, while the pass reported success.
+    //
+    // The assertions pin the PLACEMENT, not merely the outcome. A refusal decided anywhere AFTER the
+    // snapshot/install would satisfy "result == Refused" identically while having already moved the
+    // live binary aside and stopped the service — so the bytes at `dest`, the absent move-aside
+    // sibling, the ZERO service calls and the cleaned-up private copy are each a separate way for a
+    // mis-placed guard to fail. digstore is a truthful control on a loadable artifact.
+    let f = refusal_fixture();
+    let calls = Mutex::new(Vec::new());
+    let ctl = |_: &str, action: ServiceAction| {
+        calls.lock().unwrap().push(action);
+        Ok(())
+    };
+
+    let result = apply_with_loadability(
+        &f,
+        &host_missing_libs_for(&f.dig_app_dest),
+        &ctl,
+        &digest_of_something_else,
+    );
+
+    let dig_app = result
+        .components
+        .iter()
+        .find(|c| c.component == "dig-app")
+        .expect("a refused component is REPORTED, never silently dropped");
+    assert_eq!(dig_app.result, ComponentResult::Refused);
+    assert_eq!(
+        dig_app.action, "refuse",
+        "the planned action was overtaken; reporting it as carried out would be a lie"
+    );
+    assert_eq!(
+        std::fs::read(&f.dig_app_dest).unwrap(),
+        RUNNING_DIG_APP_BYTES,
+        "the WORKING binary is byte-identical — never installed over, never even moved aside"
+    );
+    assert!(
+        !f.dig_app_dest.with_extension("dig-updater-old").exists(),
+        "no move-aside swap was attempted, so the refusal happened BEFORE the install"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a refusal precedes the service stop entirely: {:?}",
+        calls.lock().unwrap()
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(f.dig_app_dest.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("dig-app") && name != "dig-app" && name != "dig-app.exe")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the broker-private copy was cleaned up rather than left installable beside the target: \
+         {leftovers:?}"
+    );
+
+    let digstore = result
+        .components
+        .iter()
+        .find(|c| c.component == "digstore")
+        .expect("the control component is reported");
+    assert_eq!(
+        digstore.result,
+        ComponentResult::Installed,
+        "one host-incompatible component must not stop the others: {}",
+        digstore.detail
+    );
+    assert_eq!(
+        std::fs::read(&f.digstore_dest).unwrap(),
+        f.digstore_artifact,
+        "the loadable component's verified bytes really landed"
+    );
+}
+
+#[test]
+fn a_refusal_names_the_missing_libraries_in_its_detail() {
+    // "Refused" alone is unactionable. The detail must name the sonames, so an operator can either
+    // install them or knowingly accept that this component stays at its current build.
+    let f = refusal_fixture();
+    let result = apply_with_loadability(
+        &f,
+        &host_missing_libs_for(&f.dig_app_dest),
+        &|_, _| Ok(()),
+        &digest_of_something_else,
+    );
+    let detail = &result
+        .components
+        .iter()
+        .find(|c| c.component == "dig-app")
+        .expect("dig-app is reported")
+        .detail;
+    for soname in MISSING_ON_A_HEADLESS_HOST {
+        assert!(
+            detail.contains(soname),
+            "the refusal must NAME {soname}: {detail}"
+        );
+    }
+    assert!(
+        detail.contains("left in place") && detail.contains("nothing was installed"),
+        "and must state that the working build survived: {detail}"
+    );
+}
+
+#[test]
+fn a_refusal_does_not_withhold_the_state_advance() {
+    // On a host that lacks the libraries the refusal is PERMANENT, so treating it as a failure would
+    // freeze the monotonic trust state — and with it the anti-rollback floor — for every OTHER
+    // component, forever. One Refused beside one Installed must still advance AND persist the state.
+    let f = refusal_fixture();
+    let result = apply_with_loadability(
+        &f,
+        &host_missing_libs_for(&f.dig_app_dest),
+        &|_, _| Ok(()),
+        &digest_of_something_else,
+    );
+    assert!(
+        result.state_advanced,
+        "a permanent, correct refusal must not stall the channel"
+    );
+    let persisted = TrustStateStore::for_channel(f.home.path(), Channel::Stable)
+        .load()
+        .expect("load state");
+    assert!(
+        persisted.state.sequence > 0,
+        "and the advance was actually WRITTEN, not merely reported"
+    );
+}
+
+#[test]
+fn a_refused_pass_is_applied_and_not_a_fault_but_is_visible() {
+    // The #1747 lesson in the opposite direction: a nightly unit that goes permanently red on a
+    // correct, unchangeable condition trains an operator to ignore it. So a refusal is APPLIED and is
+    // not a fault — and the requirement is carried by VISIBILITY instead.
+    let f = refusal_fixture();
+    let result = apply_with_loadability(
+        &f,
+        &host_missing_libs_for(&f.dig_app_dest),
+        &|_, _| Ok(()),
+        &digest_of_something_else,
+    );
+    assert!(
+        result.applied,
+        "the pass DID apply — one component was refused, the other installed"
+    );
+    assert!(
+        !result.is_fault(),
+        "a host that lacks GTK is not a beacon fault"
+    );
+    assert!(result.has_refusals(), "but the refusal must be visible");
+    assert_eq!(result.refused, vec!["dig-app".to_string()]);
+}
+
+#[test]
+fn a_loadable_or_indeterminate_artifact_installs_exactly_as_before() {
+    // The no-regression anchor, in BOTH permitting directions. `Loadable` installs, and so does
+    // `Indeterminate` — the fail-OPEN case that keeps every `.deb`/`.msi` private copy and every musl
+    // host updating. A guard that refused what it could not prove would freeze the fleet.
+    for (label, answer) in [
+        ("loadable", Loadability::Loadable),
+        (
+            "indeterminate",
+            Loadability::Indeterminate {
+                why: "not an ELF image".to_string(),
+            },
+        ),
+    ] {
+        let f = refusal_fixture();
+        let result = apply_with_loadability(
+            &f,
+            &|_: &Path| answer.clone(),
+            &|_, _| Ok(()),
+            // The honest PRODUCTION digest reader: the health gate re-hashes what landed, so this can
+            // only pass because the promised bytes really are at the destination.
+            &dig_updater_broker::installed_digest_hex,
+        );
+        let dig_app = result
+            .components
+            .iter()
+            .find(|c| c.component == "dig-app")
+            .expect("dig-app is reported");
+        assert_eq!(
+            dig_app.result,
+            ComponentResult::Installed,
+            "[{label}] must install exactly as it did before #1870: {}",
+            dig_app.detail
+        );
+        assert_ne!(
+            std::fs::read(&f.dig_app_dest).unwrap(),
+            RUNNING_DIG_APP_BYTES,
+            "[{label}] the new verified bytes really replaced the old ones"
+        );
+        assert!(
+            !result.has_refusals(),
+            "[{label}] nothing was refused: {:?}",
+            result.refused
+        );
+    }
+}
+
+// ============ dig_ecosystem#1858 — what this beacon installed is remembered per component ============
+
+#[test]
+fn a_successful_install_records_the_manifest_build() {
+    // The record the #1858 guard later reads. Without it a digest-evidenced host has NO way to know it
+    // is ahead of the feed, because a hash can only ever say "not these bytes".
+    let f = refusal_fixture();
+    let result = apply_with_loadability(
+        &f,
+        &|_: &Path| Loadability::Loadable,
+        &|_, _| Ok(()),
+        &dig_updater_broker::installed_digest_hex,
+    );
+    assert!(result
+        .components
+        .iter()
+        .all(|c| c.result == ComponentResult::Installed));
+    let recorded = InstalledBuildStore::for_channel(f.home.path(), Channel::Stable).load();
+    assert_eq!(
+        recorded.build_of("dig-app"),
+        Some(3_004_000),
+        "the build the manifest promised is what is now on disk"
+    );
+    assert_eq!(recorded.build_of("digstore"), Some(2_000));
+}
+
+#[test]
+fn a_refused_component_records_nothing() {
+    // Nothing was installed, so nothing about the destination changed — recording the ATTEMPTED build
+    // would make the next pass believe an unloadable binary is installed and skip it forever.
+    let f = refusal_fixture();
+    apply_with_loadability(
+        &f,
+        &host_missing_libs_for(&f.dig_app_dest),
+        &|_, _| Ok(()),
+        &digest_of_something_else,
+    );
+    let recorded = InstalledBuildStore::for_channel(f.home.path(), Channel::Stable).load();
+    assert_eq!(recorded.build_of("dig-app"), None);
+    assert_eq!(
+        recorded.build_of("digstore"),
+        Some(2_000),
+        "the component that DID install is still recorded"
+    );
+}
+
+#[test]
+fn a_rollback_re_records_the_reinstated_build_not_the_attempted_one() {
+    // A high-water mark would remember the build that FAILED its health gate and was rolled away, so
+    // the next pass would skip the install that restores the host — stranding it on the rolled-back
+    // build forever. The record must track what is ACTUALLY present.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("digstore");
+    // A prior 0.1.0 is installed, so there IS a build to reinstate on rollback.
+    std::fs::write(&dest, b"the-old-digstore-0.1.0-binary").unwrap();
+
+    let artifact = b"the-new-digstore-0.2.0-binary";
+    let srv = Server::bind();
+    let m = manifest(&srv.base, "0.2.0", 2_000, 0, artifact);
+    let _guard = srv.serve(routes(&m, artifact));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let detect = |_: &Path| DetectedVersion::Present("digstore 0.1.0".to_string());
+    // The install lands, then the health gate still sees the OLD version — the rollback path.
+    let health = |_: &Path| DetectedVersion::Present("digstore 0.1.0".to_string());
+    let result = apply(
+        &test_root().verifying_key(),
+        &report,
+        home.path(),
+        &dest,
+        &detect,
+        &health,
+    )
+    .expect("apply completes");
+    assert_eq!(result.components[0].result, ComponentResult::RolledBack);
+
+    let recorded = InstalledBuildStore::for_channel(home.path(), Channel::Stable).load();
+    assert_eq!(
+        recorded.build_of("digstore"),
+        Some(1_000),
+        "the REINSTATED 0.1.0 build is recorded, never the 0.2.0 that was rolled away"
+    );
+}
+
+#[test]
+fn a_rollback_removes_the_entry_when_nothing_was_installed_before() {
+    // The other rollback shape: a FRESH placement that fails its health gate is REMOVED, so there is
+    // no build at the destination at all — and therefore nothing to remember. A stale entry would
+    // later be compared against the feed as though a build were installed.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("digstore");
+    let store = InstalledBuildStore::for_channel(home.path(), Channel::Stable);
+    store
+        .record("digstore", Some(1_000))
+        .expect("seed a stale record");
+
+    let artifact = b"the-new-digstore-0.2.0-binary";
+    let srv = Server::bind();
+    let m = manifest(&srv.base, "0.2.0", 2_000, 0, artifact);
+    let _guard = srv.serve(routes(&m, artifact));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let absent = |_: &Path| DetectedVersion::Absent;
+    let result = apply(
+        &test_root().verifying_key(),
+        &report,
+        home.path(),
+        &dest,
+        &absent,
+        &absent,
+    )
+    .expect("apply completes");
+    assert_eq!(result.components[0].result, ComponentResult::RolledBack);
+    assert!(!dest.exists(), "the freshly-placed binary was removed");
+    assert_eq!(
+        store.load().build_of("digstore"),
+        None,
+        "with nothing installed there, nothing is remembered"
     );
 }

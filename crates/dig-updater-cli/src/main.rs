@@ -1183,6 +1183,7 @@ mod tests {
                 },
             ],
             state_advanced: true,
+            refused: Vec::new(),
         }
     }
 
@@ -1219,6 +1220,7 @@ mod tests {
             detail: Some("staging I/O error: Permission denied (os error 13)".into()),
             components: Vec::new(),
             state_advanced: false,
+            refused: Vec::new(),
         }
     }
 
