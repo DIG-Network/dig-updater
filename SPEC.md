@@ -789,6 +789,12 @@ last successfully installed, and MUST NOT install a component whose recorded bui
 - The recorded value is the build ACTUALLY PRESENT, never a high-water mark. A rollback MUST re-record
   the REINSTATED build, or REMOVE the entry when no prior build existed; remembering a build that was
   rolled away would skip the very install that restores the host.
+- A pass whose feed ladder was OVERRIDDEN out of band MUST record NOTHING, for the same reason it does
+  not advance the trust state (§9 step 7): the record is keyed on the TRACKED channel, while an overridden
+  feed's builds are on whatever scale that feed numbers on. Filing an off-scale build against the tracked
+  channel makes every later pass see it as newer than the feed and `skip` — permanently, and reported as
+  a benign "already newer" rather than as a fault. The per-channel file name closes the cross-channel form
+  of that hazard; this closes the within-channel form.
 
 The comparison MAY only turn an `update` into a `skip`. It MUST NOT cause an install the shared decision
 matrix (§12) did not already ask for, so no local record — stale, absent or wrong — can induce an install.
@@ -886,11 +892,20 @@ Installing it there replaces a working binary with one that terminates inside th
 The broker MUST therefore establish, for each actionable component, whether THIS host can load the
 artifact, and MUST do so:
 
-1. **Without executing anything.** The artifact's dynamic requirements (`DT_NEEDED`, plus `DT_RUNPATH`/
-   `DT_RPATH` and `PT_INTERP`) are read from its own bytes, and each required soname is resolved against
-   the host's library set. The artifact MUST NOT be run, and no loader (`ld.so`, `ldd`) may be invoked on
-   it. Every read of those bytes MUST be bounds-checked and MUST NOT panic: this is downloaded input
-   parsed inside the privileged pass, and an abort there would stop the host updating at all.
+1. **Without executing anything.** The artifact's requirements are read from its own bytes and each is
+   checked against the host. The artifact MUST NOT be run, and no loader (`ld.so`, `ldd`) may be invoked
+   on it. Every read of those bytes MUST be bounds-checked, MUST NOT panic, and MUST bound its
+   allocation by a CONSTANT rather than by a length read out of the file: this is downloaded input parsed
+   inside the privileged pass, and either an abort or a memory blow-up there would stop the host updating
+   at all. Three requirements are checked, because each terminates the process before `main` while every
+   signature and digest check passes:
+   - `e_machine` — the image MUST name the host's machine (an image naming no machine is not a
+     mismatch). An artifact for another architecture terminates at `execve`, and its sonames may all
+     resolve on this host.
+   - `PT_INTERP` — when present, the named program interpreter MUST exist as a file. An absent
+     interpreter terminates at `execve` before any library is looked up.
+   - `DT_NEEDED` — each soname MUST resolve against the host's library set, or against a directory of
+     the image's own `DT_RUNPATH`/`DT_RPATH` (with `$ORIGIN` expanded to the artifact's directory).
 2. **Before touching anything on disk.** The check runs AFTER the staging digest re-verify (§8.3) and
    BEFORE the rollback snapshot, before any service stop, and before the replace. On a refusal the
    destination MUST be byte-untouched, no snapshot MUST be taken, no service MUST be stopped, and the
@@ -900,15 +915,30 @@ artifact, and MUST do so:
 
 The answer is three-valued and deliberately ASYMMETRIC:
 
-- **unloadable** — a required soname resolves nowhere on this host. The component MUST be REFUSED: not
+- **unloadable** — a requirement above is unsatisfiable on this host. The component MUST be REFUSED: not
   installed, not snapshotted, not rolled back. It is reported as `refused` (§13.2) with a detail NAMING
-  the missing sonames and stating that the existing build was left in place.
+  the cause — the missing files, or the machine mismatch — and stating that the existing build was left
+  in place. Text taken from the artifact's own bytes MUST have its control characters neutralised before
+  it is logged or rendered, so a name cannot forge a line in a privileged process's log.
 - **loadable** — every requirement resolves. The install proceeds unchanged.
 - **indeterminate** — no answer could be established (a native-package artifact such as a `.deb`/`.msi`/
-  `.pkg`, an unparseable image, a host whose library set cannot be enumerated, a non-ELF platform). The
+  `.pkg`, an unparseable image, a host whose library set cannot be ESTABLISHED, a non-ELF platform). The
   install MUST proceed exactly as if the check did not exist, with the reason reported. Refusing what
   cannot be proven would freeze every native-package component and every host with no enumerable library
   set — a worse failure than the one this check prevents.
+
+**A host library set MUST be ESTABLISHED, not merely non-empty, before it may justify a refusal.** A set
+is established only when it is anchored by a positive completeness witness (a C library present in it);
+otherwise the answer is **indeterminate**. Enumerating a host's libraries MUST cover the multiarch
+directories of the host's OWN architecture, derived from the filesystem rather than assumed, and MUST NOT
+count a library of another architecture or ABI as resolvable. Without the anchor, a partially-enumerable
+host — one whose libraries the beacon looked for in the wrong place — refuses EVERY component on EVERY
+pass, including the beacon's own update, which no subsequent release could then repair.
+
+Any program the broker consults to enumerate the host's libraries MUST be invoked by absolute, verified
+path (the §8.3/§9.5 rule — never a bare name resolved through `PATH`), with a cleared environment, a bounded
+output and a deadline. Such a program is an optimisation only: its absence or failure MUST leave the
+check working from the directory scan alone.
 
 A refusal is NOT a pass fault (§13.3.1) and MUST NOT withhold the trust-state advance (§9 step 7): on a
 host that lacks the libraries it is permanent and correct, so reporting it as a failure would both train
