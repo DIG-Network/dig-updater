@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use dig_updater_broker::config::{Channel, UpdaterConfig};
+use dig_updater_broker::display::without_control_chars;
 use dig_updater_broker::paths::default_state_dir;
 use dig_updater_broker::status::StatusSnapshot;
 use dig_updater_broker::{elevation, scheduler, Broker, BrokerError, PassReport};
@@ -652,9 +653,15 @@ fn render_pass_report(report: &PassReport, json: bool) -> String {
         if report.state_advanced { "" } else { "NOT " }
     );
     for c in &report.components {
+        // The detail can quote an artifact's own DT_NEEDED bytes, so it is neutralised before it
+        // reaches a terminal: a bare CR plus an ANSI CSI is enough to overwrite the line above and
+        // forge a reassuring one (dig_ecosystem#1870 hardening).
         out.push_str(&format!(
             "\n  {} [{}] {:?}: {}",
-            c.component, c.action, c.result, c.detail
+            c.component,
+            c.action,
+            c.result,
+            without_control_chars(&c.detail)
         ));
     }
     out
@@ -710,9 +717,14 @@ fn render_status(status: &StatusSnapshot, json: bool) -> String {
         status.paused
     );
     for c in &status.components {
+        // Same reason as `render_pass_report`: this detail is attacker-influenced text on its way to
+        // an operator's terminal.
         out.push_str(&format!(
             "\n  {} [{}] {}: {}",
-            c.component, c.action, c.result, c.detail
+            c.component,
+            c.action,
+            c.result,
+            without_control_chars(&c.detail)
         ));
     }
     out
@@ -1183,6 +1195,7 @@ mod tests {
                 },
             ],
             state_advanced: true,
+            refused: Vec::new(),
         }
     }
 
@@ -1219,6 +1232,7 @@ mod tests {
             detail: Some("staging I/O error: Permission denied (os error 13)".into()),
             components: Vec::new(),
             state_advanced: false,
+            refused: Vec::new(),
         }
     }
 

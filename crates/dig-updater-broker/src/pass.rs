@@ -46,6 +46,8 @@ use crate::install::{
     contained_staged_path, install_from_private, private_target, stage_and_verify_private,
     InstallOutcome, RetryPolicy,
 };
+use crate::installed::InstalledBuildStore;
+use crate::loadable::{Loadability, LoadabilityCheck};
 use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONENT_NAME};
 use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
@@ -70,6 +72,12 @@ pub enum ComponentResult {
     /// ([`crate::plan::HeldComponent`]). Distinct from `Skipped`, which asserts the component is
     /// already current; a hold asserts nothing about it except that the beacon left it alone.
     Held,
+    /// The verified artifact was REFUSED before anything on disk was touched: this host cannot LOAD
+    /// it (dig_ecosystem#1870 — [`crate::loadable`]). The bytes passed every signature and digest
+    /// check; they simply require shared libraries this host does not provide, so installing them
+    /// would replace a WORKING binary with one that dies in the dynamic linker before `main`. The
+    /// live binary was never moved aside, no snapshot was taken, and no service was stopped.
+    Refused,
 }
 
 impl ComponentResult {
@@ -85,6 +93,7 @@ impl ComponentResult {
             Self::Deferred => "deferred",
             Self::RolledBack => "rolled_back",
             Self::Held => "held",
+            Self::Refused => "refused",
         }
     }
 }
@@ -131,11 +140,30 @@ pub struct PassReport {
     pub components: Vec<ComponentOutcome>,
     /// Whether the monotonic trust state advanced (only when every actionable component succeeded).
     pub state_advanced: bool,
+    /// The components whose artifact this host cannot load, and which were therefore REFUSED
+    /// ([`ComponentResult::Refused`], dig_ecosystem#1870).
+    ///
+    /// A refusal is deliberately NOT a fault ([`Self::is_fault`]) — it is a permanent, correct
+    /// property of a host that lacks the libraries, and a nightly unit that goes permanently red
+    /// trains an operator to ignore it (#1747). Visibility carries the requirement instead: this list,
+    /// the per-component `refused` line, and the mirrored `refused_components` in
+    /// [`crate::status::StatusSnapshot`].
+    #[serde(default)]
+    pub refused: Vec<String>,
 }
 
 /// The `action` a HELD component's report line carries — it had no Install/Update/Skip decision to
 /// report, because the planner stopped before deciding one ([`crate::plan::HeldComponent`]).
 const ACTION_HOLD: &str = "hold";
+
+/// The `action` a REFUSED component's report line carries: the planner's Install/Update decision was
+/// overtaken by the host's inability to load the artifact, so reporting that decision as though it had
+/// been carried out would be a lie (dig_ecosystem#1870).
+const ACTION_REFUSE: &str = "refuse";
+
+/// The stable machine code logged when a component is refused as unloadable — greppable in a host's
+/// beacon output without parsing the human sentence around it.
+const LOG_CODE_REFUSED: &str = "update_refused_unloadable";
 
 /// The rejection code [`PassReport::already_running`] carries.
 const REASON_ALREADY_RUNNING: &str = "already_running";
@@ -176,6 +204,14 @@ impl PassReport {
             .is_some_and(|reason| BENIGN_NO_OP_REASONS.contains(&reason))
     }
 
+    /// Whether any component's artifact was refused as unloadable on this host
+    /// (dig_ecosystem#1870). Exists so a caller can surface the refusal without pattern-matching every
+    /// component outcome — the refusal is not a fault, so it needs its own way of being SEEN.
+    #[must_use]
+    pub fn has_refusals(&self) -> bool {
+        !self.refused.is_empty()
+    }
+
     /// A fail-closed no-op pass: the worker verified nothing installable.
     fn nothing_to_do(reason: &str, detail: &str) -> Self {
         Self {
@@ -184,6 +220,7 @@ impl PassReport {
             detail: Some(detail.to_string()),
             components: Vec::new(),
             state_advanced: false,
+            refused: Vec::new(),
         }
     }
 
@@ -244,6 +281,14 @@ pub struct Installer<'a> {
     /// [`crate::plan::VersionEvidence::ArtifactDigest`], used for BOTH its enumeration and its health gate so
     /// neither step ever executes it. Production wires [`crate::hashing::installed_digest_hex`].
     pub digest: &'a DigestReader<'a>,
+    /// Decide whether THIS host can actually load a verified artifact, BEFORE it is installed
+    /// (dig_ecosystem#1870). Production wires [`crate::loadable::host_check`]; tests inject a scripted
+    /// answer so the refuse / apply / indeterminate branches are all exercised on every OS runner.
+    pub loadability: &'a LoadabilityCheck<'a>,
+    /// What build of each component this beacon last installed, per channel — read to hold back an
+    /// update that would move a component BACKWARDS (dig_ecosystem#1858) and written after every
+    /// install or rollback ([`crate::installed`]).
+    pub installed_builds: &'a InstalledBuildStore,
     /// Stop/start a service-backed component's OS service around its replace (#666 Bug B).
     /// Production wires [`crate::service::control`]; tests inject a recording fake so the
     /// stop→replace→restart ordering + failure handling are exercised without a real service.
@@ -294,6 +339,7 @@ impl Installer<'_> {
             self.platform,
             self.detect,
             self.digest,
+            &self.installed_builds.load(),
         )?;
 
         // 3. Apply every OTHER actionable component behind the health gate. The beacon's own
@@ -315,7 +361,14 @@ impl Installer<'_> {
                 continue;
             }
             let outcome = self.apply_one(pc, manifest.rollback_floor_build)?;
-            if outcome.result != ComponentResult::Installed {
+            // A REFUSAL leaves `all_succeeded` alone, exactly as a HOLD does below (dig_ecosystem#1870).
+            // On a host that lacks the libraries the refusal is PERMANENT, so treating it as a failure
+            // would freeze the trust-state advance for every OTHER component forever — and with it the
+            // anti-rollback floor this beacon exists to raise.
+            if !matches!(
+                outcome.result,
+                ComponentResult::Installed | ComponentResult::Refused
+            ) {
                 all_succeeded = false;
             }
             components.push(outcome);
@@ -357,6 +410,7 @@ impl Installer<'_> {
             applied: true,
             reason: None,
             detail: None,
+            refused: refused_components(&components),
             components,
             state_advanced,
         })
@@ -429,6 +483,40 @@ impl Installer<'_> {
         let executable = pc.method == InstallMethod::RawBinary;
         stage_and_verify_private(&staged, &private, &pc.expected_digest, &pc.name, executable)?;
 
+        // dig_ecosystem#1870: verified bytes are not necessarily RUNNABLE bytes. Ask — of the exact
+        // private file `install_step` is about to move onto `dest` — whether this host can even load
+        // it, and refuse HERE if it cannot: before the rollback snapshot, before any service stop,
+        // while the working binary at `dest` is still completely untouched. Placement is the whole
+        // fix; a check after the install would only be able to undo damage it had already done.
+        let loadability = (self.loadability)(&private);
+        if let Some(refusal) = loadability.refusal() {
+            let _ = std::fs::remove_file(&private);
+            let detail = unloadable_detail(&refusal, &pc.dest);
+            eprintln!(
+                "dig-updater: warning: {LOG_CODE_REFUSED}: {} {detail}",
+                pc.name
+            );
+            return Ok(ComponentOutcome {
+                component: pc.name.clone(),
+                action: ACTION_REFUSE.to_string(),
+                result: ComponentResult::Refused,
+                detail,
+            });
+        }
+        // No answer is NOT a refusal (see [`crate::loadable`]): a `.deb`/`.msi` private copy, a
+        // musl host, a non-ELF platform. The install proceeds exactly as it did before this check
+        // existed, and the reason travels into the report so the silence is legible.
+        let indeterminate = match loadability {
+            Loadability::Indeterminate { why } => {
+                eprintln!(
+                    "dig-updater: warning: {} loadability unknown: {why}",
+                    pc.name
+                );
+                Some(why)
+            }
+            _ => None,
+        };
+
         // Snapshot the WHOLE binary set (primary + every alias) so a failed health gate reverts the
         // ENTIRE set together (#666 F2). `install_from_private` refreshes the aliases to the new
         // bytes too, so snapshotting only the primary would let a rollback leave primary-OLD /
@@ -468,7 +556,48 @@ impl Installer<'_> {
         // even when the rollback itself errors out (#666 F1).
         let outcome = install_step(&private, &self.retry);
         let install_result = self.finish_apply(pc, floor, snapshots, outcome);
-        restart_after(service.as_deref(), self.service_ctl, install_result)
+        let mut outcome = restart_after(service.as_deref(), self.service_ctl, install_result)?;
+        if let Some(why) = indeterminate {
+            outcome
+                .detail
+                .push_str(&format!(" (loadability not established: {why})"));
+        }
+        self.record_installed_build(pc, outcome.result);
+        Ok(outcome)
+    }
+
+    /// Remember what build of `pc` is ACTUALLY on disk now (dig_ecosystem#1858) — the manifest's build
+    /// after an install, the REINSTATED build after a rollback (or nothing, when there was no prior
+    /// build to reinstate). Every other outcome left the destination as it was, so it records nothing.
+    ///
+    /// Deliberately best-effort: this record is a planning aid, not a trust mark, so a write failure
+    /// warns and lets an otherwise-correct on-disk state stand rather than turning a good install into
+    /// a failed pass. The anti-rollback floor lives in [`crate::state`] and is unaffected.
+    ///
+    /// Records NOTHING when the feed ladder was overridden, for the same reason the trust state does
+    /// not advance then (#621 item 1): the record file is keyed on the TRACKED channel, while an
+    /// overridden feed's builds are on whatever scale that feed numbers on. A single
+    /// `--feed-base <nightly>` pass on a stable host would file a nightly's `20260731` as stable's
+    /// installed build, and every later stable pass would then see `20260731 > 3004000` and Skip —
+    /// permanently, reported as the benign "already newer than the feed". The component holding the
+    /// sealed master seed would never update again, including for security fixes, with nothing
+    /// visibly wrong. The cross-CHANNEL form of this hazard is closed by the per-channel file name
+    /// ([`crate::installed`]); this is the within-channel form.
+    fn record_installed_build(&self, pc: &PlannedComponent, result: ComponentResult) {
+        if self.suppress_state_advance {
+            return;
+        }
+        let build = match result {
+            ComponentResult::Installed => Some(pc.build),
+            ComponentResult::RolledBack => pc.installed_build,
+            _ => return,
+        };
+        if let Err(e) = self.installed_builds.record(&pc.name, build) {
+            eprintln!(
+                "dig-updater: warning: could not record {}'s installed build: {e}",
+                pc.name
+            );
+        }
     }
 
     /// Turn one component's [`InstallOutcome`] into its [`ComponentOutcome`], running the health gate
@@ -703,6 +832,30 @@ fn verified_install_detail(component: &str, detected: &DetectedVersion) -> Strin
     }
 }
 
+/// The detail a REFUSED component reports: WHY the host could not load it — the sonames it lacks, or
+/// the machine mismatch — plus the fact that the binary already installed was left running
+/// (dig_ecosystem#1870).
+///
+/// Naming the cause is the requirement, not a nicety: "refused" alone tells an operator nothing they
+/// can act on, whereas `libgtk-3.so.0` tells them either to install GTK or to expect this component to
+/// stay at its current build on a headless host.
+fn unloadable_detail(refusal: &str, dest: &Path) -> String {
+    format!(
+        "{refusal}; the working build at {} was left in place and nothing was installed",
+        dest.display()
+    )
+}
+
+/// The names of the components a pass REFUSED — the summary [`PassReport::refused`] carries so a
+/// refusal is visible without walking every component outcome.
+fn refused_components(components: &[ComponentOutcome]) -> Vec<String> {
+    components
+        .iter()
+        .filter(|c| c.result == ComponentResult::Refused)
+        .map(|c| c.component.clone())
+        .collect()
+}
+
 /// Map a trust rejection during the broker's independent re-verify to a distinct broker error.
 fn reverify_err(e: TrustError) -> BrokerError {
     BrokerError::ReverifyFailed(format!("{e} ({})", e.code()))
@@ -789,6 +942,11 @@ mod tests {
             (ComponentResult::Skipped, "skipped"),
             (ComponentResult::Deferred, "deferred"),
             (ComponentResult::RolledBack, "rolled_back"),
+            // `Held` was missing from this table, so nothing pinned its token to its serde rename;
+            // `Refused` (dig_ecosystem#1870) joins it. Every variant belongs here — an unpinned token is
+            // a JSON contract a rename could break silently (SPEC §13.2).
+            (ComponentResult::Held, "held"),
+            (ComponentResult::Refused, "refused"),
         ] {
             assert_eq!(result.as_str(), token);
             let serialized = serde_json::to_string(&result).unwrap();

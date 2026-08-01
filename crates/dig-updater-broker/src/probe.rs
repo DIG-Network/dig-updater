@@ -182,7 +182,7 @@ fn bounded_probe(
 ///
 /// `Some(true)` = exited successfully, `Some(false)` = exited unsuccessfully (or its status could
 /// not be read), `None` = still running when the budget elapsed.
-fn wait_within(child: &mut Child, budget: Duration) -> Option<bool> {
+pub(crate) fn wait_within(child: &mut Child, budget: Duration) -> Option<bool> {
     let deadline = Instant::now() + budget;
     loop {
         match child.try_wait() {
@@ -201,7 +201,7 @@ fn wait_within(child: &mut Child, budget: Duration) -> Option<bool> {
 /// Kill a probe that outlasted its budget and reap it, so a bounded probe leaves no orphan behind.
 /// Both calls are best-effort: the child may have exited in the race between the deadline check and
 /// here, and a failure to signal an already-dead process is not an error worth reporting.
-fn kill_and_reap(child: &mut Child) {
+pub(crate) fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }

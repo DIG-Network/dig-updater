@@ -544,8 +544,11 @@ the first failure:
    a hard size cap of `min(4 × artifact.size, 2 GiB)`: a stream exceeding the cap is rejected
    before the disk can be filled (a disk-fill DoS guard against a hostile CDN). Because it streams
    with a fixed buffer, the beacon's memory does not grow with artifact size.
-7. **On success:** install (§9.5), then advance `S` (§6) and persist it. `S` MUST NOT be
-   advanced before a successful, health-gated install. (A `check --dry-run` performs steps 1–6 —
+7. **On success:** install (§9.5) — subject to the host-loadability precondition (§9.8) — then
+   advance `S` (§6) and persist it. `S` MUST NOT be advanced before a successful, health-gated
+   install. A component that was HELD (§9.7(5)) or REFUSED as unloadable (§9.8) MUST NOT withhold
+   that advance: each is a declared, permanent state of that one component, and blocking the advance
+   behind either would freeze every OTHER component's anti-rollback progress on that host. (A `check --dry-run` performs steps 1–6 —
    including staging + digest verification — but NEVER installs and NEVER advances `S`.)
 
 Every rejection MUST be a distinct, catalogued reason (bad signature, expired, sequence
@@ -717,6 +720,11 @@ open every other privileged read uses (§8.3), so a link planted at the destinat
 measurement. A digest-evidenced component is NOT held and NOT exempt from the health gate — see
 §9.7(3) and §9.7(5).
 
+A digest gate establishes WHICH BUILD is installed, never that the build can RUN: for a
+digest-evidenced component no step of the pass executes the binary, so nothing here establishes that
+the host can even load it. That is a separate, pre-apply precondition carrying its own distinct result
+token — `refused`, neither `installed` nor `rolled_back` — specified in §9.8.
+
 ### 9.7 Per-user daemon components (normative)
 
 A component may be a **per-user daemon with a login autostart** rather than a service or a CLI —
@@ -767,6 +775,34 @@ declares under (5):
   write, a swap that did not land, bytes replaced after the install — fails the gate exactly like a
   wrong version, so the re-hash is a real gate and not an exemption.
 
+**Build monotonicity for digest evidence.** A digest answers only "these are the promised bytes" or
+"these are not", so a build NEWER than the feed's is indistinguishable from an older one and would be
+installed BACKWARDS. The beacon MUST therefore record, per channel and per component, the `build` it
+last successfully installed, and MUST NOT install a component whose recorded build is GREATER than the
+`build` the manifest offers — that component is `skip`. Three requirements bind that record:
+
+- It is a SEPARATE per-channel file (`installed-builds-<channel>.json`) in the Admin/SYSTEM-only state
+  directory (§13), never a field of `trust-state-<channel>.json`: the trust state is the fail-closed
+  anti-rollback core (§6), and a component-map problem MUST NOT escalate into trust-state corruption.
+- Reading it MUST be infallible: an absent or malformed record file MUST load as EMPTY, and the pass MUST
+  then plan exactly as a beacon that had recorded nothing. It is planning evidence, not a trust mark.
+- The recorded value is the build ACTUALLY PRESENT, never a high-water mark. A rollback MUST re-record
+  the REINSTATED build, or REMOVE the entry when no prior build existed; remembering a build that was
+  rolled away would skip the very install that restores the host.
+- A pass whose feed ladder was OVERRIDDEN out of band MUST record NOTHING, for the same reason it does
+  not advance the trust state (§9 step 7): the record is keyed on the TRACKED channel, while an overridden
+  feed's builds are on whatever scale that feed numbers on. Filing an off-scale build against the tracked
+  channel makes every later pass see it as newer than the feed and `skip` — permanently, and reported as
+  a benign "already newer" rather than as a fault. The per-channel file name closes the cross-channel form
+  of that hazard; this closes the within-channel form.
+
+The comparison MAY only turn an `update` into a `skip`. It MUST NOT cause an install the shared decision
+matrix (§12) did not already ask for, so no local record — stale, absent or wrong — can induce an install.
+
+**Loadability precondition.** An install MUST NOT proceed while §9.8's host-loadability check REFUSES the
+artifact. For a digest-evidenced component that check is the only step of the pass establishing anything
+about whether the binary can start.
+
 Rollback is the §9.5 path unchanged: the moved-aside image is reinstated, so a failed install never
 leaves the user without an app.
 
@@ -811,6 +847,12 @@ its declaration — either to *safe to probe*, once its released binary is known
 *content-digest evidenced*, which requires nothing of the binary at all. That review is the control, and
 its cost is deliberate.
 
+**Host loadability is established WITHOUT EXECUTION, for every declaration class.** Whether the host
+can load an artifact (§9.8) MUST be decided by reading the artifact's own bytes — never by running it,
+and never by invoking a loader on it (no `ld.so`, no `ldd`). This binds a *safe to probe* component too:
+the check runs BEFORE the install, when the artifact is a staged file rather than an installed program,
+and a declaration grants permission to probe an INSTALLED build, not to execute downloaded bytes.
+
 **A self-reported or file-based version claim in a USER-WRITABLE location MUST NOT be accepted as
 evidence.** Where the shared install root is per-user (see (2)), any version sidecar or self-report
 beside the binary is forgeable: an unprivileged local user could claim a safe version next to an unsafe
@@ -838,6 +880,72 @@ does not make probing safe, because the beacon cannot tell WHICH build is on a h
 carry dig-app in its payload — shipped roughly 16 hours BEFORE dig-app 3.4.0, so hosts installed in that
 window provably carry an argument-ignoring build. That population is not empty; it is unobservable. The
 exposure is closed by NOT EXECUTING, not by waiting for a version floor (dig_ecosystem#1803).
+
+### 9.8 Host loadability (normative)
+
+A verified artifact is not necessarily a RUNNABLE artifact. The manifest offers exactly ONE artifact per
+`(component, os, arch)` (§5.2), and that one build may require shared libraries a given host does not
+provide — a desktop-linked build on a headless server requires GTK sonames that are simply absent.
+Installing it there replaces a working binary with one that terminates inside the dynamic linker before
+`main`, while every signature and digest check passes.
+
+The broker MUST therefore establish, for each actionable component, whether THIS host can load the
+artifact, and MUST do so:
+
+1. **Without executing anything.** The artifact's requirements are read from its own bytes and each is
+   checked against the host. The artifact MUST NOT be run, and no loader (`ld.so`, `ldd`) may be invoked
+   on it. Every read of those bytes MUST be bounds-checked, MUST NOT panic, and MUST bound its
+   allocation by a CONSTANT rather than by a length read out of the file: this is downloaded input parsed
+   inside the privileged pass, and either an abort or a memory blow-up there would stop the host updating
+   at all. Three requirements are checked, because each terminates the process before `main` while every
+   signature and digest check passes:
+   - `e_machine` — the image MUST name the host's machine (an image naming no machine is not a
+     mismatch). An artifact for another architecture terminates at `execve`, and its sonames may all
+     resolve on this host.
+   - `PT_INTERP` — when present, the named program interpreter MUST exist as a file. An absent
+     interpreter terminates at `execve` before any library is looked up.
+   - `DT_NEEDED` — each soname MUST resolve against the host's library set, or against a directory of
+     the image's own `DT_RUNPATH`/`DT_RPATH` (with `$ORIGIN` expanded to the artifact's directory).
+2. **Before touching anything on disk.** The check runs AFTER the staging digest re-verify (§8.3) and
+   BEFORE the rollback snapshot, before any service stop, and before the replace. On a refusal the
+   destination MUST be byte-untouched, no snapshot MUST be taken, no service MUST be stopped, and the
+   broker-private verified copy MUST be removed.
+3. **For EVERY component.** This is a property of the host, not of a component's identity or evidence
+   class.
+
+The answer is three-valued and deliberately ASYMMETRIC:
+
+- **unloadable** — a requirement above is unsatisfiable on this host. The component MUST be REFUSED: not
+  installed, not snapshotted, not rolled back. It is reported as `refused` (§13.2) with a detail NAMING
+  the cause — the missing files, or the machine mismatch — and stating that the existing build was left
+  in place. Text taken from the artifact's own bytes MUST have its control characters neutralised before
+  it is logged or rendered, so a name cannot forge a line in a privileged process's log.
+- **loadable** — every requirement resolves. The install proceeds unchanged.
+- **indeterminate** — no answer could be established (a native-package artifact such as a `.deb`/`.msi`/
+  `.pkg`, an unparseable image, a host whose library set cannot be ESTABLISHED, a non-ELF platform). The
+  install MUST proceed exactly as if the check did not exist, with the reason reported. Refusing what
+  cannot be proven would freeze every native-package component and every host with no enumerable library
+  set — a worse failure than the one this check prevents.
+
+**A host library set MUST be ESTABLISHED, not merely non-empty, before it may justify a refusal.** A set
+is established only when it is anchored by a positive completeness witness (a C library present in it);
+otherwise the answer is **indeterminate**. Enumerating a host's libraries MUST cover the multiarch
+directories of the host's OWN architecture, derived from the filesystem rather than assumed, and MUST NOT
+count a library of another architecture or ABI as resolvable. Without the anchor, a partially-enumerable
+host — one whose libraries the beacon looked for in the wrong place — refuses EVERY component on EVERY
+pass, including the beacon's own update, which no subsequent release could then repair.
+
+Any program the broker consults to enumerate the host's libraries MUST be invoked by absolute, verified
+path (the §8.3/§9.5 rule — never a bare name resolved through `PATH`), with a cleared environment, a bounded
+output and a deadline. Such a program is an optimisation only: its absence or failure MUST leave the
+check working from the directory scan alone.
+
+A refusal is NOT a pass fault (§13.3.1) and MUST NOT withhold the trust-state advance (§9 step 7): on a
+host that lacks the libraries it is permanent and correct, so reporting it as a failure would both train
+an operator to ignore the beacon's status and stall the channel. The requirement is carried by VISIBILITY
+instead — the component's `refused` result line, the pass report's refusal list, and the
+`refused_components` mirror in `status.json` (§13.2). This check can only ever make the beacon install
+LESS than it otherwise would; it never relaxes a signature, digest or floor check.
 
 ---
 
@@ -1216,13 +1324,18 @@ Administrator/root.
                                            // reports its plan action ("install"/"update"/"skip",
                                            // or "hold" for a held component, §9.7(5))
       "result":    "installed",           // a dry check reports "staged"; a full pass reports
-                                           // "installed"/"skipped"/"deferred"/"rolled_back"/"held"
+                                           // "installed"/"skipped"/"deferred"/"rolled_back"/"held"/
+                                           // "refused" (§9.8 — the host cannot LOAD the artifact,
+                                           // so nothing was installed; `action` is then "refuse")
       "detail":    "dig-node now reports dig-node 0.26.0"
     }
   ],
   "next_wake":  1731076400,               // a best-effort ESTIMATE (now + 24h) if the daily
                                            // schedule is registered, else null — not a parse of
                                            // the OS scheduler's own next-run time
+  "refused_components": [],               // ADDITIVE (§9.8): the components this host cannot LOAD,
+                                           // so the last pass refused to install them. Defaults to
+                                           // empty when absent (a pre-#1870 mirror)
   "schedule_opted_out": false,            // ADDITIVE (§8.4): true iff the Admin-only opt-out
                                            // sentinel is present (a deliberate `schedule
                                            // uninstall`), so the self-heal leaves it removed.
@@ -1255,6 +1368,14 @@ Administrator/root.
   operator reading `status.json` after the fact would be reading what the pass INTENDED, not what
   it verified actually happened. `last_check`/`last_check_kind` timestamp every snapshot, so a
   reader can always tell a persisted detail is only as current as that timestamp.
+- **A refusal MUST be mirrored, because it is not a fault.** A component the host cannot load (§9.8)
+  appears twice: as its own `components` entry with `"action": "refuse"`, `"result": "refused"` and a
+  detail NAMING the missing sonames, and as its name in the top-level `refused_components` array. Both
+  are required. The pass itself stays `"last_outcome": "applied"` and a zero exit status (§13.3.1) — the
+  condition is permanent and correct on that host, so surfacing it as a failure would train an operator
+  to ignore the beacon — which means the mirror is the ONLY place the refusal is observable. A reader
+  that shows update state (the `dig-node` updater RPC proxy, the Updates UI) SHOULD surface
+  `refused_components` distinctly from both "current" and "failed".
 - **Always answerable, never an error on absence.** A missing (or, for an unprivileged reader,
   inaccessible) `status.json` MUST be reported as a well-formed "never checked" snapshot — schema
   + version + the default channel/pause + every other field `null`/empty — NOT an error. Only a

@@ -105,6 +105,19 @@ pub struct StatusSnapshot {
     /// beacon still deserializes — an older mirror simply reports "not opted out".
     #[serde(default)]
     pub schedule_opted_out: bool,
+    /// The components whose artifact this host cannot LOAD, and which the last pass therefore REFUSED
+    /// to install (dig_ecosystem#1870 — [`crate::loadable`]). Empty on a host that can load everything
+    /// the feed offers it.
+    ///
+    /// This is how a refusal stays visible: it is deliberately not a pass FAULT (a headless host's
+    /// refusal is permanent and correct, and a permanently-red nightly unit is ignored — #1747), so the
+    /// requirement is carried by being reported instead. The per-component `refused` result line beside
+    /// it names the missing libraries.
+    ///
+    /// ADDITIVE (SPEC §5.1 / §13.2): defaults to empty so a `status.json` written by a pre-#1870
+    /// beacon still deserializes — an older mirror simply reports no refusals.
+    #[serde(default)]
+    pub refused_components: Vec<String>,
 }
 
 fn current_status_schema() -> u32 {
@@ -131,6 +144,7 @@ impl StatusSnapshot {
             next_wake: None,
             trust_state: TrustState::initial(),
             schedule_opted_out: false,
+            refused_components: Vec::new(),
         }
     }
 
@@ -162,7 +176,7 @@ impl StatusSnapshot {
                 ("rejected", Some(reason.clone()), detail.clone(), Vec::new())
             }
         };
-        Self::base(ctx, "dry", outcome, reason, Some(detail), components)
+        Self::base(ctx, "dry", outcome, reason, Some(detail), components).with_refusals(Vec::new())
     }
 
     /// Build the snapshot to persist after a FULL pass ([`crate::Broker::run_once_with_feed`]):
@@ -192,6 +206,16 @@ impl StatusSnapshot {
             report.detail.clone(),
             components,
         )
+        .with_refusals(report.refused.clone())
+    }
+
+    /// Attach the components a pass REFUSED (dig_ecosystem#1870). Separate from [`Self::base`] because
+    /// only a FULL pass can refuse anything — a dry check never reaches an apply — so a shared builder
+    /// argument would have to be `Vec::new()` at the dry call site and read like an oversight.
+    #[must_use]
+    fn with_refusals(mut self, refused_components: Vec<String>) -> Self {
+        self.refused_components = refused_components;
+        self
     }
 
     /// The fields every builder shares: the mirrored config/trust-state + the caller-supplied
@@ -219,6 +243,7 @@ impl StatusSnapshot {
             next_wake: ctx.next_wake,
             trust_state: ctx.trust_state,
             schedule_opted_out: ctx.schedule_opted_out,
+            refused_components: Vec::new(),
         }
     }
 }
@@ -436,9 +461,80 @@ mod tests {
                 detail: "v0.1.0 -> v0.2.0".into(),
             }],
             state_advanced: true,
+            refused: Vec::new(),
         };
         let snapshot = StatusSnapshot::from_pass(&report, &ctx);
         assert_eq!(snapshot.last_outcome.as_deref(), Some("applied"));
         assert_eq!(snapshot.components[0].result, "installed");
+        assert!(
+            snapshot.refused_components.is_empty(),
+            "a pass that refused nothing mirrors no refusals"
+        );
+    }
+
+    #[test]
+    fn status_json_mirrors_a_refusal_as_refused_with_the_component_named() {
+        // dig_ecosystem#1870: the refusal is not a fault, so the ONLY thing that carries the
+        // requirement is its visibility. The unprivileged mirror must name the component in
+        // `refused_components`, report its per-component result as the `refused` token, and keep the
+        // missing sonames in the detail — all three are what an operator (or the Updates UI) reads.
+        use crate::{ComponentOutcome, ComponentResult};
+        let config = UpdaterConfig::default();
+        let ctx = StatusContext::for_test(&config);
+        let report = PassReport {
+            applied: true,
+            reason: None,
+            detail: None,
+            components: vec![
+                ComponentOutcome {
+                    component: "dig-app".into(),
+                    action: "refuse".into(),
+                    result: ComponentResult::Refused,
+                    detail: "needs shared libraries this host does not provide (libgtk-3.so.0)"
+                        .into(),
+                },
+                ComponentOutcome {
+                    component: "digstore".into(),
+                    action: "update".into(),
+                    result: ComponentResult::Installed,
+                    detail: "digstore now reports 0.19.3".into(),
+                },
+            ],
+            state_advanced: true,
+            refused: vec!["dig-app".into()],
+        };
+        let snapshot = StatusSnapshot::from_pass(&report, &ctx);
+        assert_eq!(snapshot.refused_components, vec!["dig-app".to_string()]);
+
+        let json = serde_json::to_value(&snapshot).expect("serialize");
+        assert_eq!(json["refused_components"][0], "dig-app");
+        assert_eq!(json["components"][0]["result"], "refused");
+        assert!(
+            json["components"][0]["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("libgtk-3.so.0"),
+            "the machine-readable mirror keeps the missing soname an operator must act on"
+        );
+        assert_eq!(
+            json["components"][1]["result"], "installed",
+            "the OTHER component still installed — a refusal is per-component, not a stalled pass"
+        );
+    }
+
+    #[test]
+    fn a_pre_1870_status_json_still_deserializes_with_no_refused_components() {
+        // The additive-field contract (SPEC §5.1 / §13.2): a mirror written by a beacon that predates
+        // #1870 has no `refused_components` key at all, and must load as "no refusals" rather than
+        // failing to parse — which would make `status` unanswerable on the very hosts mid-upgrade.
+        let mut older = serde_json::to_value(StatusSnapshot::never_checked()).expect("serialize");
+        older
+            .as_object_mut()
+            .expect("object")
+            .remove("refused_components")
+            .expect("the fixture must actually drop the new field");
+        let parsed: StatusSnapshot =
+            serde_json::from_value(older).expect("a pre-#1870 mirror loads");
+        assert!(parsed.refused_components.is_empty());
     }
 }

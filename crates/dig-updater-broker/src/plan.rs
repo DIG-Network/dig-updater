@@ -28,6 +28,7 @@ use dig_updater_worker::{Platform, StagedArtifact};
 
 use crate::error::BrokerError;
 use crate::hashing::DigestReader;
+use crate::installed::InstalledBuilds;
 
 /// The manifest component name the beacon tracks for ITSELF. The applier uses this to carve its
 /// own component out of the ordinary per-component loop and apply it LAST, via a platform-specific
@@ -453,6 +454,10 @@ impl Plan {
     /// [`VersionEvidence::SafeToProbe`], and `digest` (which only hashes it) for
     /// [`VersionEvidence::ArtifactDigest`].
     ///
+    /// `recorded` is what this beacon last INSTALLED per component ([`InstalledBuilds`]), consulted
+    /// ONLY to hold back an update that would move a digest-evidenced component BACKWARDS
+    /// ([`guard_newer_installed`]) — never to permit one.
+    ///
     /// Untracked components (not in the catalog) and components with no artifact for this platform
     /// are skipped entirely. A tracked, platform-relevant component whose artifact the worker did
     /// NOT stage is a [`BrokerError::StagedArtifactMissing`]: the plan is structurally incomplete
@@ -469,6 +474,7 @@ impl Plan {
         platform: &Platform,
         detect: &dyn Fn(&Path) -> DetectedVersion,
         digest: &DigestReader,
+        recorded: &InstalledBuilds,
     ) -> Result<Self, BrokerError> {
         let mut components = Vec::new();
         let mut held = Vec::new();
@@ -541,7 +547,19 @@ impl Plan {
                     detect,
                 )
             } else {
-                (decision.action, decision.summary)
+                // dig_ecosystem#1858: only the NON-probe path needs the build-monotonicity guard.
+                // A probe reports a version the shared matrix can compare directly, so a host ahead
+                // of the feed is already decided `Skip` there; a digest can only say "these are not
+                // the promised bytes", which reads identically for a newer build and an older one.
+                // Scoping the guard here — rather than over both paths — also keeps it clear of
+                // `redrive_for_stale_alias`, whose deliberate `Skip → Update` escalation exists to
+                // refresh a stale ALIAS (#666 Bug A) and must not be undone.
+                guard_newer_installed(
+                    decision.action,
+                    decision.summary,
+                    recorded.build_of(&component.name),
+                    component.build,
+                )
             };
             components.push(PlannedComponent {
                 name: component.name.clone(),
@@ -694,6 +712,43 @@ fn redrive_for_stale_alias(
     (primary_action, primary_summary)
 }
 
+/// Hold back an update that would move a component BACKWARDS, when this beacon's own record says the
+/// build already installed is NEWER than the one the feed offers (dig_ecosystem#1858).
+///
+/// Needed because a digest-evidenced component's enumeration cannot express "ahead of the feed": the
+/// only two answers a hash gives are "these are the promised bytes" and "these are not", and the second
+/// reads exactly the same for a newer build as for an older one — so a host running ahead was planned as
+/// an Update and pushed backwards. The shared decision matrix lives in the external
+/// `dig-release-resolver`, so the correction sits on its OUTPUT, here, where the beacon's own record is.
+///
+/// **The only transition this may make is `Update → Skip`.** It is a brake, never an accelerator: it can
+/// stop an install the resolver asked for, and it can never cause one the resolver did not — so no
+/// recorded value, however wrong or stale, can talk the beacon into installing something. An absent
+/// record (`None`) leaves the decision untouched, which is how every host starts and how a host with a
+/// corrupt record file behaves ([`InstalledBuilds`]).
+fn guard_newer_installed(
+    action: UpdateAction,
+    summary: String,
+    recorded_build: Option<u64>,
+    manifest_build: u64,
+) -> (UpdateAction, String) {
+    if action != UpdateAction::Update {
+        return (action, summary);
+    }
+    let Some(recorded) = recorded_build else {
+        return (action, summary);
+    };
+    if recorded <= manifest_build {
+        return (action, summary);
+    }
+    (
+        UpdateAction::Skip,
+        format!(
+            "installed build {recorded} is newer than the feed's {manifest_build} — nothing to do"
+        ),
+    )
+}
+
 /// Resolve the install root — the directory the beacon installs components INTO — from the running
 /// beacon's own executable path (#581).
 ///
@@ -736,6 +791,12 @@ mod tests {
             os: "linux".into(),
             arch: "x64".into(),
         }
+    }
+
+    /// The record set of a beacon that has never installed anything — the state every host starts in,
+    /// and the one every scenario that is not about build monotonicity (#1858) wants.
+    fn nothing_recorded() -> InstalledBuilds {
+        InstalledBuilds::default()
     }
 
     fn manifest_one(name: &str, version: &str, build: u64, digest: &str) -> Manifest {
@@ -1001,6 +1062,7 @@ mod tests {
             &platform(),
             &probe_that_may_only_run_digstore,
             &digest_reader(Some(FIXTURE_DIGEST)),
+            &nothing_recorded(),
         )
         .unwrap();
 
@@ -1064,6 +1126,7 @@ mod tests {
                 )
             },
             &digest_reader(Some("deadbeee")),
+            &nothing_recorded(),
         )
         .unwrap();
 
@@ -1092,6 +1155,7 @@ mod tests {
                 )
             },
             &digest_reader(Some("deadbeef")),
+            &nothing_recorded(),
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Skip);
@@ -1115,6 +1179,7 @@ mod tests {
                 )
             },
             &digest_reader(None),
+            &nothing_recorded(),
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Install);
@@ -1147,6 +1212,7 @@ mod tests {
             &platform(),
             &|path| panic!("the planner executed {}", path.display()),
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .expect("an unreconcilable declaration is a hold, not a failed plan");
 
@@ -1183,6 +1249,7 @@ mod tests {
             &platform(),
             &probe_that_may_only_run_digstore,
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .unwrap();
 
@@ -1221,6 +1288,7 @@ mod tests {
             &platform(),
             &|path| panic!("the planner executed {} to decide a hold", path.display()),
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .expect("holding a component never fails the plan");
 
@@ -1247,6 +1315,7 @@ mod tests {
             &platform(),
             &|_| DetectedVersion::Present("dig-app 3.3.0".into()),
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .unwrap();
         assert!(
@@ -1300,6 +1369,7 @@ mod tests {
             &platform(),
             &|_| DetectedVersion::Present(String::new()),
             &digest_reader(Some(FIXTURE_DIGEST)),
+            &nothing_recorded(),
         )
         .unwrap();
         assert!(plan.held.is_empty());
@@ -1319,6 +1389,7 @@ mod tests {
             &platform(),
             &|_| panic!("a held component is neither probed nor staged"),
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .expect("a held component with no staged bytes is not a structurally incomplete plan");
         assert_eq!(plan.held.len(), 1);
@@ -1381,6 +1452,7 @@ mod tests {
             &platform(),
             &|_| DetectedVersion::Absent,
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .unwrap();
         assert_eq!(plan.components.len(), 1);
@@ -1400,6 +1472,7 @@ mod tests {
             &platform(),
             &|_| DetectedVersion::Present("digstore 0.15.0".into()),
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Skip);
@@ -1417,6 +1490,7 @@ mod tests {
             &platform(),
             &|_| DetectedVersion::Present("digstore 0.14.0".into()),
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Update);
@@ -1442,6 +1516,7 @@ mod tests {
                 }
             },
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Update);
@@ -1459,6 +1534,7 @@ mod tests {
             &platform(),
             &|_| DetectedVersion::Present("digstore 0.15.0".into()),
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .unwrap();
         assert_eq!(plan.components[0].action, UpdateAction::Skip);
@@ -1474,6 +1550,7 @@ mod tests {
             &platform(),
             &|_| DetectedVersion::Absent,
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .unwrap();
         assert!(
@@ -1493,6 +1570,7 @@ mod tests {
             &platform(),
             &|_| DetectedVersion::Absent,
             &digest_reader_that_must_not_be_consulted,
+            &nothing_recorded(),
         )
         .expect_err("a manifest artifact with no staged file is incomplete");
         assert!(matches!(err, BrokerError::StagedArtifactMissing { .. }));
@@ -1651,5 +1729,148 @@ mod tests {
             cat.target("digstore").unwrap().method,
             InstallMethod::RawBinary
         );
+    }
+    // ===== dig_ecosystem#1858: an installed build NEWER than the feed's is not an update =====
+
+    #[test]
+    fn guard_forces_skip_when_the_recorded_build_exceeds_the_manifest_build() {
+        // The load-bearing #1858 case: this beacon installed 3.5.0 and the feed now offers 3.4.0. The
+        // digest differs, so the resolver said Update — which would install the OLDER build over the
+        // newer one. The guard converts exactly that into a Skip.
+        let (action, summary) = guard_newer_installed(
+            UpdateAction::Update,
+            "v3.4.0 (update)".to_string(),
+            Some(3_005_000),
+            3_004_000,
+        );
+        assert_eq!(action, UpdateAction::Skip);
+        assert!(
+            summary.contains("3005000") && summary.contains("3004000"),
+            "the summary must state BOTH builds so the skip is auditable: {summary}"
+        );
+    }
+
+    #[test]
+    fn guard_leaves_an_equal_or_lower_recorded_build_alone() {
+        // At the bound (equal) and below it, the resolver's Update must survive untouched — the
+        // ordinary case, and the one a `>=` comparison would silently break by refusing every
+        // re-install of the SAME build (the digest-mismatch repair path).
+        for recorded in [3_004_000u64, 3_003_000, 0] {
+            let (action, summary) = guard_newer_installed(
+                UpdateAction::Update,
+                "v3.4.0 (update)".to_string(),
+                Some(recorded),
+                3_004_000,
+            );
+            assert_eq!(
+                action,
+                UpdateAction::Update,
+                "recorded {recorded} is not newer than 3004000, so the update stands"
+            );
+            assert_eq!(summary, "v3.4.0 (update)", "and its summary is untouched");
+        }
+    }
+
+    #[test]
+    fn guard_never_turns_a_skip_into_an_update() {
+        // The guard is a BRAKE, never an accelerator. Across every (action, recorded) combination it
+        // may only ever produce `Update -> Skip`; no recorded value — absent, stale, lower, higher —
+        // may cause an install the resolver did not already ask for.
+        for action in [
+            UpdateAction::Skip,
+            UpdateAction::Install,
+            UpdateAction::Update,
+        ] {
+            for recorded in [None, Some(0u64), Some(3_004_000), Some(u64::MAX)] {
+                let (out, _) = guard_newer_installed(action, "s".to_string(), recorded, 3_004_000);
+                let legal =
+                    out == action || (action == UpdateAction::Update && out == UpdateAction::Skip);
+                assert!(
+                    legal,
+                    "{action:?} with recorded {recorded:?} became {out:?} — the only legal \
+                     transition is Update -> Skip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_recorded_build_is_never_consulted_to_permit_an_install() {
+        // Stated from the other side: an Install/Skip decision is returned VERBATIM, summary included,
+        // whatever the record says. A guard that could rewrite those would be able to install bytes
+        // the resolver had judged unnecessary, on the strength of a local, unsigned file.
+        for action in [UpdateAction::Install, UpdateAction::Skip] {
+            let (out, summary) =
+                guard_newer_installed(action, "verbatim".to_string(), Some(u64::MAX), 3_004_000);
+            assert_eq!(out, action);
+            assert_eq!(summary, "verbatim");
+        }
+    }
+
+    #[test]
+    fn a_digest_evidenced_component_recorded_newer_than_the_feed_is_planned_skip() {
+        // #1858 end to end through `Plan::build`, with dig-app's real evidence class. The digest on
+        // disk does NOT match the manifest's (so enumeration alone yields Update — the pre-fix
+        // behaviour), the beacon's own record says 3.5.0 is installed, and the feed offers 3.4.0.
+        //
+        // digstore stays a TRUTHFUL control on 0.14.0 against a 0.15.0 manifest with NOTHING recorded,
+        // so the same run proves the guard did not simply stop the planner updating things.
+        let m = manifest_of(&[
+            ("digstore", "0.15.0", 15_000),
+            ("dig-app", "3.4.0", 3_004_000),
+        ]);
+        let plan = Plan::build(
+            &m,
+            &[
+                staged("digstore", "/staging/digstore"),
+                staged("dig-app", "/staging/dig-app"),
+            ],
+            &catalog_with_dig_app(),
+            &platform(),
+            &probe_that_may_only_run_digstore,
+            &digest_reader(Some("00000000")),
+            &InstalledBuilds::from_pairs([("dig-app", 3_005_000u64)]),
+        )
+        .unwrap();
+
+        let dig_app = plan
+            .components
+            .iter()
+            .find(|c| c.name == DIG_APP_COMPONENT_NAME)
+            .expect("dig-app is planned, not held");
+        assert_eq!(
+            dig_app.action,
+            UpdateAction::Skip,
+            "the host is AHEAD of the feed; installing would be a downgrade: {}",
+            dig_app.summary
+        );
+        let digstore = plan
+            .components
+            .iter()
+            .find(|c| c.name == "digstore")
+            .expect("the control component is still planned");
+        assert_eq!(
+            digstore.action,
+            UpdateAction::Update,
+            "the control must still update — the guard is per-component, not a global brake"
+        );
+    }
+
+    #[test]
+    fn an_absent_record_plans_a_digest_evidenced_component_exactly_as_before() {
+        // The no-record baseline: with nothing recorded, a digest mismatch still plans an Update, so
+        // the guard cannot have made a fresh host stop updating.
+        let m = manifest_of(&[("dig-app", "3.4.0", 3_004_000)]);
+        let plan = Plan::build(
+            &m,
+            &[staged("dig-app", "/staging/dig-app")],
+            &catalog_with_dig_app(),
+            &platform(),
+            &probe_that_may_only_run_digstore,
+            &digest_reader(Some("00000000")),
+            &nothing_recorded(),
+        )
+        .unwrap();
+        assert_eq!(plan.components[0].action, UpdateAction::Update);
     }
 }
