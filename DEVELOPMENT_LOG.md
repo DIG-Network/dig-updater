@@ -547,3 +547,4 @@ one and it still fails on the next:
   corruption, and that reader treats a missing mark as tampering); and it records the build ACTUALLY
   PRESENT, so a rollback re-records the REINSTATED build — a high-water mark would remember the build that
   was rolled away and skip the install that restores the host.
+
