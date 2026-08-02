@@ -516,6 +516,41 @@ sentinel. (The driver MUST resolve the beacon binary only from an Admin-only ins
 user-writable beacon re-armed as a SYSTEM task would be a local-privilege-escalation vector; that
 constraint lives on the `dig-node` side.)
 
+### 8.5 Liveness — every attacker-adjacent read is time-bounded and fail-closed (MANDATORY)
+
+A pass holds the single-instance lock (§8.2) for its entire duration, so ANY unbounded blocking read
+in the pass is a permanent-wedge vector: a hostile or merely slow transport that never returns wedges
+the update channel, after which every later scheduled fire is an `already_running` no-op and the host
+never updates again. Bounding disk (the §9 size cap) is NOT sufficient — it is a space guard, not a
+time guard. Therefore every read that waits on an untrusted or attacker-adjacent producer MUST be
+bounded by a wall-clock deadline and MUST fail CLOSED (abort the pass, install nothing, release the
+lock, retry next wake) rather than block:
+
+- **The worker's network transport (untrusted CDN).** Every HTTP fetch — the delegation, the manifest,
+  and every artifact — MUST be performed through an agent carrying BOTH a per-read timeout AND an
+  overall request deadline, so a server that returns `200 OK` and then freezes or trickles the body
+  cannot block a read indefinitely. A fetch that exceeds its deadline MUST surface as a transport
+  error (the same fail-closed, retry-next-pass outcome as an unreachable feed), and any partially
+  written staging file MUST be discarded (verify-then-keep, §9 step 6). The artifact deadline MAY be
+  larger than the small-document deadline to admit a large-but-live download; both MUST be finite.
+- **The broker's IPC with the worker (untrusted after compromise).** The broker drives the worker to
+  completion under a wall-clock budget, draining the worker's stdout on a separate thread so the
+  deadline is real even if the worker never closes it. A worker still running when the budget elapses
+  MUST be killed and reaped and the pass MUST fail closed. The budget MUST exceed any legitimate
+  pass (the worker self-bounds its own fetches and stages at most a handful of artifacts) so it never
+  interrupts honest work — it is the backstop against a COMPROMISED worker that ignores its own
+  timeouts and hangs.
+- **The broker's read of the worker's stdout is CAPPED.** The broker MUST refuse to buffer more than
+  a finite cap of worker stdout and MUST fail closed on overflow, so a compromised worker cannot OOM
+  the privileged (root/SYSTEM) broker by writing without bound. The cap MUST be generous relative to
+  a legitimate report (two feed documents plus small staged-artifact records).
+- **Defence-in-depth, not the fix.** The systemd oneshot unit additionally carries a
+  `TimeoutStartSec=` backstop LARGER than the in-process budgets, so even a pass wedged in a path the
+  in-process guards do not cover cannot occupy the unit forever. This is secondary: an OS kill alone
+  would leave the channel stalled while the transport is, so the PRIMARY guarantee MUST be in-process
+  (the deadlines above), which is what makes the pass fail closed and the trust state able to advance
+  on a later wake.
+
 ---
 
 ## 9. Verification algorithm (normative)
