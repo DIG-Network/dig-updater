@@ -52,6 +52,7 @@ fn manifest(sequence: u64, generated: u64, artifact_bytes: &[u8]) -> Manifest {
                 url: "https://updates.dig.net/dig-node/0.26.0/linux-x64".to_string(),
                 sha256: hex::encode(Sha256::digest(artifact_bytes)),
                 size: artifact_bytes.len() as u64,
+                variant: None,
             }],
         }],
     }

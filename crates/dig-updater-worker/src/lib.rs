@@ -80,7 +80,12 @@ pub fn run(request: &WorkerRequest, root: &VerifyingKey) -> Result<VerifiedPlan,
     ensure_staging_dir(staging_dir)?;
     let mut artifacts = Vec::new();
     for component in &manifest.manifest.components {
-        if let Some(artifact) = component.artifact(&request.platform.os, &request.platform.arch) {
+        // Stage EVERY variant this platform ships (dig_ecosystem#1912), not just the first: a
+        // component such as dig-app publishes both a default (GTK-linked) and a `headless` linux/x64
+        // build, and the privileged broker — the only half that can inspect loadability — picks the
+        // one this host can actually load. The worker is catalog-blind and simply stages them all;
+        // the cost of an unused variant is bandwidth, never exposure.
+        for artifact in component.artifacts_for(&request.platform.os, &request.platform.arch) {
             artifacts.push(stage_artifact(staging_dir, component, artifact)?);
         }
     }
@@ -186,6 +191,7 @@ fn stage_artifact(
         build: component.build,
         os: artifact.os.clone(),
         arch: artifact.arch.clone(),
+        variant: artifact.variant.clone(),
         sha256: artifact.sha256.to_ascii_lowercase(),
         size: written,
         staged_path: dest.to_string_lossy().into_owned(),
@@ -196,13 +202,21 @@ fn stage_artifact(
 /// AFTER it verifies, but sanitizing the components into a single filename is defense-in-depth:
 /// even a compromised targets key cannot make the (unprivileged) worker write outside staging.
 fn staging_file_name(component: &Component, artifact: &Artifact) -> PathBuf {
-    let name = format!(
+    let mut name = format!(
         "{}-{}-{}-{}",
         sanitize(&component.name),
         sanitize(&component.version),
         sanitize(&artifact.os),
         sanitize(&artifact.arch),
     );
+    // Distinguish variants (dig_ecosystem#1912) so two builds for one `(os, arch)` never collide on a
+    // single staging path. The DEFAULT variant (`None`) appends nothing, keeping its staging name
+    // byte-identical to the pre-#1912 single-variant name; an alternative build appends `-{variant}`
+    // (e.g. `dig-app-3.5.0-linux-x64-headless`).
+    if let Some(variant) = &artifact.variant {
+        name.push('-');
+        name.push_str(&sanitize(variant));
+    }
     PathBuf::from(name)
 }
 
@@ -233,6 +247,7 @@ mod tests {
             url: "https://x/y".into(),
             sha256: "ab".into(),
             size: 1,
+            variant: None,
         }
     }
 
@@ -246,6 +261,42 @@ mod tests {
         };
         let name = staging_file_name(&c, &artifact());
         assert_eq!(name.to_str().unwrap(), "dig-node-0.26.0-linux-x64");
+    }
+
+    #[test]
+    fn each_variant_of_a_platform_gets_a_distinct_staging_name() {
+        // dig_ecosystem#1912: staging BOTH linux/x64 dig-app builds must not have them overwrite each
+        // other on one path. The default (no variant) keeps its pre-#1912 name byte-for-byte; the
+        // headless build appends `-headless`, so the two are staged side by side.
+        let c = Component {
+            name: "dig-app".into(),
+            version: "3.5.0".into(),
+            build: 3_005_000,
+            artifacts: vec![],
+        };
+        let default = staging_file_name(
+            &c,
+            &Artifact {
+                variant: None,
+                ..artifact()
+            },
+        );
+        let headless = staging_file_name(
+            &c,
+            &Artifact {
+                variant: Some("headless".into()),
+                ..artifact()
+            },
+        );
+        assert_eq!(default.to_str().unwrap(), "dig-app-3.5.0-linux-x64");
+        assert_eq!(
+            headless.to_str().unwrap(),
+            "dig-app-3.5.0-linux-x64-headless"
+        );
+        assert_ne!(
+            default, headless,
+            "two variants must never collide on one staging path"
+        );
     }
 
     #[test]

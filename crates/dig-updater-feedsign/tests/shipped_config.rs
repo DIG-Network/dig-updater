@@ -121,6 +121,50 @@ fn the_shipped_dig_app_entry_never_selects_the_sibling_dign_binaries() {
     }
 }
 
+/// dig_ecosystem#1912: the shipped dig-app entry declares the headless Linux variant, and when the
+/// release carries the `-headless` asset the feed resolves BOTH linux/x64 builds — the default and
+/// the headless — so a headless host has a loadable artifact to select.
+#[test]
+fn the_shipped_dig_app_entry_resolves_both_linux_variants_when_headless_is_published() {
+    let cfg = shipped_config();
+    let dig_app = cfg
+        .components
+        .iter()
+        .find(|c| c.name == "dig-app")
+        .expect("dig-app is a tracked component");
+    assert_eq!(
+        dig_app.variants.len(),
+        1,
+        "the shipped entry declares exactly the headless variant"
+    );
+    assert_eq!(dig_app.variants[0].variant, "headless");
+
+    // A future release that also ships the headless build.
+    let names = [
+        "dig-app-3.5.0-linux-x64",
+        "dig-app-3.5.0-linux-x64-headless",
+        "dig-app-3.5.0-macos-arm64",
+        "dig-app-3.5.0-macos-x64",
+        "dig-app-3.5.0-windows-x64.exe",
+    ];
+    let assets: Vec<String> = names
+        .iter()
+        .map(|name| {
+            format!(
+                r#"{{"name":"{name}","browser_download_url":"https://github.com/DIG-Network/dig-app/releases/download/v3.5.0/{name}"}}"#
+            )
+        })
+        .collect();
+    let json = format!(r#"{{"tag_name":"v3.5.0","assets":[{}]}}"#, assets.join(","));
+    let release = GithubRelease::from_json("https://api/x", &json).expect("parses");
+
+    let arts = select_artifacts(&release, dig_app, "3.5.0").expect("resolves");
+    let linux: Vec<_> = arts.iter().filter(|a| a.os == "linux").collect();
+    assert_eq!(linux.len(), 2, "both linux/x64 builds resolve");
+    assert_eq!(linux[0].variant, None);
+    assert_eq!(linux[1].variant.as_deref(), Some("headless"));
+}
+
 /// Every component in the shipped config must name a DIG-Network repository and a non-empty asset
 /// prefix — the two fields a resolution failure always traces back to.
 #[test]

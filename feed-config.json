@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "root_version": 1,
   "manifest_ttl_secs": 43200,
   "delegation_ttl_secs": 2592000,
@@ -12,6 +12,6 @@
     { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore" },
     { "name": "dig-updater", "repo": "DIG-Network/dig-updater", "asset_prefix": "dig-updater" },
     { "name": "dig-dns", "repo": "DIG-Network/dig-dns", "asset_prefix": "dig-dns" },
-    { "name": "dig-app", "repo": "DIG-Network/dig-app", "asset_prefix": "dig-app" }
+    { "name": "dig-app", "repo": "DIG-Network/dig-app", "asset_prefix": "dig-app", "variants": [ { "suffix": "-headless", "variant": "headless" } ] }
   ]
 }

@@ -98,6 +98,9 @@ pub struct ArtifactDigest {
     pub os: String,
     /// The artifact's arch token.
     pub arch: String,
+    /// The build variant within this `(os, arch)` (dig_ecosystem#1912): `None` for the default,
+    /// `Some("headless")` for an alternative — so the CI job summary distinguishes the two builds.
+    pub variant: Option<String>,
     /// The artifact's lowercase-hex SHA-256.
     pub sha256: String,
     /// The artifact's byte size.
@@ -148,6 +151,7 @@ pub fn produce_feed(
                 version: version_str.clone(),
                 os: artifact.os.clone(),
                 arch: artifact.arch.clone(),
+                variant: artifact.variant.clone(),
                 sha256: sha256.clone(),
                 size,
             });
@@ -157,6 +161,7 @@ pub fn produce_feed(
                 url: artifact.url,
                 sha256,
                 size,
+                variant: artifact.variant,
             });
         }
 

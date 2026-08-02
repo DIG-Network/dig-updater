@@ -85,6 +85,7 @@ mod tests {
                 url: "https://example.test/dig-node-0.29.0-linux-x64".into(),
                 sha256: "ab".repeat(32),
                 size: 100,
+                variant: None,
             }],
         }
     }
