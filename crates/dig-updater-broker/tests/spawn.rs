@@ -113,6 +113,7 @@ fn test_signed_routes() -> HashMap<String, Vec<u8>> {
                 url: "http://127.0.0.1:1/artifact".into(),
                 sha256: hex::encode(Sha256::digest(artifact)),
                 size: artifact.len() as u64,
+                variant: None,
             }],
         }],
     };

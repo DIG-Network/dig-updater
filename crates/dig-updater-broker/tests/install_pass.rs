@@ -173,6 +173,7 @@ fn manifest_for(
                 url: format!("{base}/artifact"),
                 sha256: hex(&Sha256::digest(artifact)),
                 size: artifact.len() as u64,
+                variant: None,
             }],
         }],
     }
@@ -833,6 +834,7 @@ fn manifest_with_self_and_other(
                     url: format!("{base}/self-artifact"),
                     sha256: hex(&Sha256::digest(self_artifact)),
                     size: self_artifact.len() as u64,
+                    variant: None,
                 }],
             },
             Component {
@@ -845,6 +847,7 @@ fn manifest_with_self_and_other(
                     url: format!("{base}/other-artifact"),
                     sha256: hex(&Sha256::digest(other_artifact)),
                     size: other_artifact.len() as u64,
+                    variant: None,
                 }],
             },
         ],
@@ -1442,6 +1445,7 @@ fn manifest_with_dig_app(base: &str, other_artifact: &[u8], dig_app_artifact: &[
                     url: format!("{base}/other-artifact"),
                     sha256: hex(&Sha256::digest(other_artifact)),
                     size: other_artifact.len() as u64,
+                    variant: None,
                 }],
             },
             Component {
@@ -1454,6 +1458,7 @@ fn manifest_with_dig_app(base: &str, other_artifact: &[u8], dig_app_artifact: &[
                     url: format!("{base}/self-artifact"),
                     sha256: hex(&Sha256::digest(dig_app_artifact)),
                     size: dig_app_artifact.len() as u64,
+                    variant: None,
                 }],
             },
         ],
