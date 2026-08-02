@@ -22,6 +22,29 @@ change diary.
   `saturating_mul` (an absurd advisory must not overflow). Distinct reject reason
   `artifact_too_large`.
 
+## Liveness — the two unbounded reads that were fail-OPEN (#1941)
+
+- **The repo bounded every attacker-adjacent subprocess read EXCEPT the two most important
+  channels.** `probe.rs` bounds the version probe; `loadable.rs` bounds `ldconfig` (deadline +
+  byte cap on a side thread). But the network fetch (`worker/net.rs` — `ureq::get().call()` with no
+  timeout) and the broker↔worker IPC (`sandbox.rs` — `read_to_end` / an unbounded `read_all` +
+  `WaitForSingleObject(INFINITE)`) were both UNBOUNDED. Because a pass holds the single-instance
+  flock for its whole duration, a stall on either is not a mere hang — it is a permanent-wedge,
+  fail-OPEN DoS on the update channel: the flock is never released, so every later daily fire is an
+  `already_running` no-op and the host never updates again. The size cap (`net.rs`) did not save it —
+  a cap bounds SPACE, not TIME, so it never trips on a slow-but-tiny trickle.
+- **A finite bound is the whole fix; the exact value is secondary.** Worker fetches now go through a
+  shared `ureq::Agent` with a per-read timeout AND an overall deadline. Gotcha: ureq's overall
+  `.timeout()` takes PRECEDENCE over `.timeout_read()` for body reads, so the overall deadline is the
+  effective wall-clock bound — set it per-path (tight for small feed JSON, generous for a large
+  artifact). The broker drives the worker under a wall-clock budget via `probe::wait_within` +
+  `kill_and_reap`, draining stdout on a side thread (so the deadline is real even if the worker never
+  closes it) and capping the buffer at 64 MiB (so a compromised worker cannot OOM the root broker).
+  The broker budget must EXCEED the worker's worst-case honest runtime — it is the backstop for a
+  compromised worker, not a limit on honest work. `TimeoutStartSec=` on the systemd unit is
+  defence-in-depth only: an OS kill leaves the channel stalled while the transport is, so the
+  fail-closed guarantee has to be in-process.
+
 ## Windows gotchas (bit us during -D)
 
 - **UAC installer-detection = error 740.** Windows auto-elevates any executable whose file name

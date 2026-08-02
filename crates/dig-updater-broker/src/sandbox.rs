@@ -19,8 +19,26 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::BrokerError;
+
+/// The largest worker report the broker will buffer from the worker's stdout: 64 MiB.
+///
+/// A legitimate report is two feed JSON documents (delegation + manifest, each capped well under
+/// 10 MiB) plus small per-artifact staged records, so this is generous headroom. Its sole purpose
+/// is to stop a COMPROMISED worker from OOMing the privileged (root/SYSTEM) broker by writing to
+/// stdout without bound (dig_ecosystem#1941) — mirroring `loadable::LDCONFIG_OUTPUT_CAP`.
+pub const WORKER_STDOUT_CAP: u64 = 64 * 1024 * 1024;
+
+/// Wall-clock the broker waits for the worker to finish ONE pass before killing it.
+///
+/// Deliberately generous: larger than any legitimate pass (the worker self-bounds each network
+/// fetch and downloads at most a handful of artifacts), so it never interrupts honest work. It is
+/// the BACKSTOP for a compromised worker that ignores its own timeouts and hangs forever — without
+/// it, the worker could wedge the broker and hold the single-instance lock indefinitely, so the
+/// update channel would never make progress again (dig_ecosystem#1941).
+const WORKER_IPC_BUDGET: Duration = Duration::from_secs(30 * 60);
 
 /// How much privilege the spawned worker should hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +64,7 @@ pub fn spawn_worker_process(
     input: &[u8],
     sandbox: Sandbox,
 ) -> Result<(i32, Vec<u8>), BrokerError> {
-    imp::spawn(worker, input, sandbox).map_err(|e| BrokerError::Spawn(e.to_string()))
+    imp::spawn(worker, input, sandbox)
 }
 
 /// Prepare a directory the (possibly privilege-dropped) worker must WRITE into — the staging
@@ -145,7 +163,11 @@ mod imp {
         }
     }
 
-    pub fn spawn(worker: &Path, input: &[u8], sandbox: Sandbox) -> io::Result<(i32, Vec<u8>)> {
+    pub fn spawn(
+        worker: &Path,
+        input: &[u8],
+        sandbox: Sandbox,
+    ) -> Result<(i32, Vec<u8>), BrokerError> {
         let mut cmd = Command::new(worker);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -203,7 +225,7 @@ mod imp {
 
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_BROKEN_PIPE, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
+        CloseHandle, ERROR_BROKEN_PIPE, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_TIMEOUT,
     };
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::Win32::Security::{
@@ -215,13 +237,18 @@ mod imp {
     use windows::Win32::System::Pipes::CreatePipe;
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess,
-        OpenProcessToken, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION,
-        STARTF_USESTDHANDLES, STARTUPINFOW,
+        OpenProcessToken, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
 
-    pub fn spawn(worker: &Path, input: &[u8], sandbox: Sandbox) -> io::Result<(i32, Vec<u8>)> {
+    pub fn spawn(
+        worker: &Path,
+        input: &[u8],
+        sandbox: Sandbox,
+    ) -> Result<(i32, Vec<u8>), BrokerError> {
         match sandbox {
-            // A non-privileged broker (tests): a normal spawn, with clean std pipe IPC.
+            // A non-privileged broker (tests): a normal spawn, with clean std pipe IPC. Goes
+            // through the shared bounded `communicate`, so it inherits the deadline + stdout cap.
             Sandbox::Inherit => {
                 let mut cmd = Command::new(worker);
                 cmd.stdin(Stdio::piped())
@@ -231,7 +258,9 @@ mod imp {
                 communicate(cmd, input)
             }
             // The production posture: run under a restricted token.
-            Sandbox::Restricted => spawn_restricted(worker, input),
+            Sandbox::Restricted => {
+                spawn_restricted(worker, input).map_err(|e| BrokerError::Spawn(e.to_string()))
+            }
         }
     }
 
@@ -293,10 +322,19 @@ mod imp {
             write_all(our_stdin_wr, input)?;
             let _ = CloseHandle(our_stdin_wr);
 
-            let stdout = read_all(our_stdout_rd)?;
+            let stdout = read_all(our_stdout_rd, WORKER_STDOUT_CAP)?;
             let _ = CloseHandle(our_stdout_rd);
 
-            WaitForSingleObject(pi.hProcess, u32::MAX);
+            // Bound the wait so a worker that closed stdout but never exits cannot wedge the broker.
+            // A worker that never closes stdout is a residual Windows gap (the blocking `read_all`
+            // above): the live permanent-wedge defect is the Unix/macOS `communicate` path, which is
+            // fully bounded; a stall-deadline for this restricted-token read is a follow-up needing
+            // overlapped/peeked pipe I/O (dig_ecosystem#1941).
+            let budget_ms = u32::try_from(WORKER_IPC_BUDGET.as_millis()).unwrap_or(u32::MAX);
+            if WaitForSingleObject(pi.hProcess, budget_ms) == WAIT_TIMEOUT {
+                let _ = TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, u32::MAX);
+            }
             let mut code: u32 = 0;
             GetExitCodeProcess(pi.hProcess, &mut code).map_err(win_io)?;
             let _ = CloseHandle(pi.hProcess);
@@ -394,7 +432,9 @@ mod imp {
         Ok(())
     }
 
-    unsafe fn read_all(handle: HANDLE) -> io::Result<Vec<u8>> {
+    /// Read the child's stdout to EOF, refusing to buffer more than `cap` bytes so a compromised
+    /// worker cannot OOM the privileged broker (dig_ecosystem#1941). More than `cap` fails closed.
+    unsafe fn read_all(handle: HANDLE, cap: u64) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -405,6 +445,12 @@ mod imp {
                         break; // EOF
                     }
                     out.extend_from_slice(&buf[..read as usize]);
+                    if out.len() as u64 > cap {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("worker stdout exceeded the {cap}-byte cap"),
+                        ));
+                    }
                 }
                 Err(e) if e.code() == ERROR_BROKEN_PIPE.to_hresult() => break, // child closed
                 Err(e) => return Err(win_io(e)),
@@ -449,16 +495,162 @@ mod imp {
 /// Write `input` to the child's stdin, close it, wait, and return `(exit_code, stdout)`. Used by
 /// the Unix path and the Windows `Inherit` path (both go through `std::process::Command`).
 #[cfg(any(unix, windows))]
-fn communicate(mut cmd: std::process::Command, input: &[u8]) -> std::io::Result<(i32, Vec<u8>)> {
-    let mut child = cmd.spawn()?;
+fn communicate(cmd: std::process::Command, input: &[u8]) -> Result<(i32, Vec<u8>), BrokerError> {
+    communicate_bounded(cmd, input, WORKER_IPC_BUDGET, WORKER_STDOUT_CAP)
+}
+
+/// The body of [`communicate`], with the wall-clock `budget` and stdout `cap` INJECTED so both the
+/// hang path and the overflow path can be exercised against real child processes under tiny values
+/// (the same injection idiom [`crate::probe::bounded_probe`] and [`crate::loadable`] use).
+///
+/// Two properties this guarantees against an untrusted/compromised worker:
+/// - **it cannot hang the broker forever** — stdout is drained on a side thread so the deadline is
+///   real even if the worker never closes it, and a worker still running at `budget` is killed and
+///   reaped, failing closed with [`BrokerError::WorkerTimedOut`];
+/// - **it cannot OOM the broker** — the side thread reads at most `cap + 1` bytes, and more than
+///   `cap` fails closed with [`BrokerError::WorkerStdoutTooLarge`].
+#[cfg(any(unix, windows))]
+fn communicate_bounded(
+    mut cmd: std::process::Command,
+    input: &[u8],
+    budget: Duration,
+    cap: u64,
+) -> Result<(i32, Vec<u8>), BrokerError> {
+    let mut child = cmd.spawn().map_err(|e| BrokerError::Spawn(e.to_string()))?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input)?;
+        // A worker that dies before reading its whole request breaks this pipe; that is not fatal
+        // on its own — the exit code / unparseable report surfaces it — so the write is best effort.
+        let _ = stdin.write_all(input);
         // `stdin` drops here, sending EOF so the worker starts producing its report.
     }
-    let mut stdout = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_end(&mut stdout)?;
+
+    // Drain stdout on a side thread, bounded to `cap + 1` bytes, so a worker that writes forever
+    // can never make the broker buffer without bound AND so this read can never block the deadline
+    // below: a worker that never writes and never exits is caught by `wait_within`, not stuck here.
+    let reader = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.by_ref().take(cap + 1).read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    if crate::probe::wait_within(&mut child, budget).is_none() {
+        crate::probe::kill_and_reap(&mut child);
+        return Err(BrokerError::WorkerTimedOut(format!(
+            "worker still running after {}s; killed and reaped",
+            budget.as_secs()
+        )));
     }
-    let status = child.wait()?;
-    Ok((status.code().unwrap_or(-1), stdout))
+
+    // The child has exited (`wait_within` reaped it via `try_wait`); its status is cached, so this
+    // returns the code without blocking.
+    let code = child
+        .wait()
+        .map(|status| status.code().unwrap_or(-1))
+        .unwrap_or(-1);
+
+    let stdout = match reader {
+        Some(handle) => handle
+            .join()
+            .map_err(|_| BrokerError::Spawn("the worker stdout reader thread panicked".into()))?,
+        None => Vec::new(),
+    };
+    if stdout.len() as u64 > cap {
+        return Err(BrokerError::WorkerStdoutTooLarge { limit: cap });
+    }
+    Ok((code, stdout))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    /// Build a `sh -c <script>` command wired for the bounded IPC path (piped stdin+stdout).
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        cmd
+    }
+
+    /// THE POINT (dig_ecosystem#1941): a worker that prints a partial report and then HANGS forever
+    /// must not wedge the broker. The unbounded `read_to_end` this replaces would block here until
+    /// the process died, holding the single-instance lock the whole time; the deadline makes it fail
+    /// closed. The child outlives the test's budget (a 300s sleep) so a pass can only mean the broker
+    /// killed it — no real 300s wait occurs because the assertion returns as soon as the budget fires.
+    #[test]
+    fn a_worker_that_hangs_after_partial_output_times_out() {
+        let started = std::time::Instant::now();
+        let result = communicate_bounded(
+            sh("printf '{\"partial\":'; sleep 300"),
+            b"request",
+            Duration::from_millis(300),
+            WORKER_STDOUT_CAP,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(BrokerError::WorkerTimedOut(_))),
+            "a hanging worker must fail closed with WorkerTimedOut, got: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "communicate returned only after {elapsed:?}; it is not bounded by its budget"
+        );
+    }
+
+    /// A COMPROMISED worker that floods stdout must not OOM the privileged broker: more than the cap
+    /// fails closed with `WorkerStdoutTooLarge` rather than buffering without bound. The child writes
+    /// well over the (tiny, injected) cap but far under a pipe buffer, then exits, so the overflow is
+    /// detected deterministically rather than racing the deadline.
+    #[test]
+    fn a_worker_that_floods_stdout_is_rejected_not_buffered() {
+        let cap = 1024;
+        let result = communicate_bounded(
+            sh("head -c 8192 /dev/zero"),
+            b"request",
+            Duration::from_secs(30),
+            cap,
+        );
+        assert!(
+            matches!(result, Err(BrokerError::WorkerStdoutTooLarge { limit }) if limit == cap),
+            "an over-cap worker must fail closed with WorkerStdoutTooLarge, got: {result:?}"
+        );
+    }
+
+    /// The common case is untouched: a well-behaved worker that echoes its request-derived report
+    /// and exits is read verbatim with its exit code, so bounding costs honest workers nothing.
+    #[test]
+    fn a_well_behaved_worker_is_read_verbatim() {
+        let result = communicate_bounded(
+            sh("printf '{\"ok\":true}'; exit 0"),
+            b"request",
+            Duration::from_secs(30),
+            WORKER_STDOUT_CAP,
+        );
+        let (code, stdout) = result.expect("a prompt small report must succeed");
+        assert_eq!(code, 0);
+        assert_eq!(stdout, b"{\"ok\":true}");
+    }
+
+    /// A report exactly at the cap is accepted — the bound rejects only STRICTLY-over-cap output, so
+    /// a legitimate maximal report is not lost. Pins the boundary from the passing side (the flood
+    /// test pins it from the failing side).
+    #[test]
+    fn a_report_exactly_at_the_cap_is_accepted() {
+        let cap = 1024;
+        let result = communicate_bounded(
+            sh("head -c 1024 /dev/zero"),
+            b"request",
+            Duration::from_secs(30),
+            cap,
+        );
+        let (_code, stdout) = result.expect("output exactly at the cap must be accepted");
+        assert_eq!(stdout.len() as u64, cap);
+    }
 }

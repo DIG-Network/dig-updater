@@ -126,10 +126,22 @@ pub fn systemd_service_unit(exe: &Path) -> String {
          \n\
          [Service]\n\
          Type=oneshot\n\
-         ExecStart={} run\n",
-        exe,
+         ExecStart={} run\n\
+         TimeoutStartSec={}\n",
+        exe, SYSTEMD_TIMEOUT_START_SECS,
     )
 }
+
+/// Outer, OS-level backstop on how long the oneshot beacon pass may run before systemd kills it.
+///
+/// Defence-in-depth ONLY — the primary guard is in-process (the worker's per-fetch timeouts and the
+/// broker's worker-IPC deadline, which make a stalled pass fail CLOSED and release the
+/// single-instance lock, dig_ecosystem#1941). This is deliberately LARGER than that in-process
+/// budget so systemd never interrupts an honest pass before the in-process guard does; it exists so
+/// that even a pass wedged in some path the in-process budgets do not cover cannot occupy the unit
+/// forever. A systemd kill alone would leave the channel stalled while the transport is, which is
+/// why it is the outer layer, not the fix.
+const SYSTEMD_TIMEOUT_START_SECS: u64 = 45 * 60;
 
 /// The systemd `dig-updater.timer` unit: daily, `RandomizedDelaySec` spread, and
 /// `Persistent=true` so a missed run (the machine was off) catches up at the next boot (SPEC
@@ -267,6 +279,11 @@ mod tests {
         assert!(unit.contains("Type=oneshot"));
         // Path is quoted for proper shell-like semantics in ExecStart
         assert!(unit.contains("ExecStart=\"/usr/local/bin/dig-updater\" run"));
+        // A wall-clock backstop (dig_ecosystem#1941): a wedged pass cannot occupy the unit forever.
+        assert!(
+            unit.contains(&format!("TimeoutStartSec={SYSTEMD_TIMEOUT_START_SECS}")),
+            "the oneshot unit must carry an outer timeout backstop"
+        );
     }
 
     #[test]

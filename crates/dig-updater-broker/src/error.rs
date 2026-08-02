@@ -24,6 +24,20 @@ pub enum BrokerError {
     /// The worker returned output the broker could not parse as a report.
     #[error("worker returned an unparseable report: {0}")]
     WorkerReportUnparseable(String),
+    /// The worker did not finish within the broker's wall-clock budget and was killed. A wedged or
+    /// COMPROMISED worker that deliberately hangs must never hold the privileged broker — and the
+    /// single-instance lock it owns for the whole pass — open forever, which would wedge the update
+    /// channel so every later daily fire is an `already_running` no-op (SPEC §8.3, dig_ecosystem#1941).
+    #[error("worker did not complete within its time budget: {0}")]
+    WorkerTimedOut(String),
+    /// The worker wrote more than the broker will buffer from its stdout. Fails closed rather than
+    /// letting a COMPROMISED worker exhaust the root/SYSTEM broker's memory by printing without
+    /// bound (dig_ecosystem#1941).
+    #[error("worker stdout exceeded the {limit}-byte cap")]
+    WorkerStdoutTooLarge {
+        /// The byte cap that was exceeded.
+        limit: u64,
+    },
     /// A guarded path (the beacon binary, the state dir, the staging dir, …) is writable by a
     /// non-privileged identity and could not be repaired. The pass ABORTS fail-closed rather than
     /// installing while an unprivileged process could tamper with what is installed (SPEC §8.3,
