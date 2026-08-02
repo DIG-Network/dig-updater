@@ -95,6 +95,7 @@ fn test_feed() -> HashMap<String, Vec<u8>> {
                 url: "http://127.0.0.1:1/artifact".into(),
                 sha256: hex::encode(Sha256::digest(b"x")),
                 size: 1,
+                variant: None,
             }],
         }],
     };

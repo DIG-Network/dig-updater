@@ -38,6 +38,12 @@ pub struct StagedArtifact {
     pub os: String,
     /// The artifact's arch token.
     pub arch: String,
+    /// The build VARIANT within this `(os, arch)`, carried from the manifest artifact
+    /// (dig_ecosystem#1912): `None` for the default build, `Some("headless")` for an alternative the
+    /// broker may select instead. Additive + backward-compatible — an older report omits it and it
+    /// deserializes to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     /// The verified lowercase-hex SHA-256 (equals the signed manifest's digest).
     pub sha256: String,
     /// The number of bytes written to staging (the actual downloaded size).

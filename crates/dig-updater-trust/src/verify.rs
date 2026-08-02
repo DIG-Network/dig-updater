@@ -374,6 +374,7 @@ mod tests {
                     url: "https://updates.dig.net/dig-node/0.26.0/linux-x64".to_string(),
                     sha256: hex::encode(Sha256::digest(b"the-artifact-bytes")),
                     size: 18,
+                    variant: None,
                 }],
             }],
         }

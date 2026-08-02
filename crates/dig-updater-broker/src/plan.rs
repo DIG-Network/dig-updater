@@ -381,6 +381,23 @@ impl Catalog {
     }
 }
 
+/// One build VARIANT of a component staged for this platform (dig_ecosystem#1912): the token that
+/// names it, the manifest digest that authenticates it, and the staged file to install from.
+///
+/// A component with a single build has exactly one of these (the default, `variant == None`); a
+/// component such as dig-app that ships a headless Linux build alongside the default has two, and the
+/// applier picks the one this host can LOAD ([`crate::pass`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedVariant {
+    /// The build variant token, or `None` for the default build.
+    pub variant: Option<String>,
+    /// The digest from the RE-VERIFIED manifest — the authority the staged bytes are re-hashed
+    /// against immediately before install (SPEC §8.3), NOT the digest the worker reported.
+    pub expected_digest: String,
+    /// The staged, worker-downloaded file to install from.
+    pub staged_path: PathBuf,
+}
+
 /// One component's planned action for this pass: what to do, and everything needed to do it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedComponent {
@@ -398,11 +415,11 @@ pub struct PlannedComponent {
     pub version: String,
     /// The manifest's monotonic build number.
     pub build: u64,
-    /// The digest from the RE-VERIFIED manifest — the authority the staged bytes are re-hashed
-    /// against immediately before install (SPEC §8.3), NOT the digest the worker reported.
-    pub expected_digest: String,
-    /// The staged, worker-downloaded file to install from.
-    pub staged_path: PathBuf,
+    /// The staged build variants for this platform, in SELECTION PREFERENCE order — the default
+    /// (`variant == None`) FIRST (dig_ecosystem#1912). Always non-empty: `Plan::build` skips a
+    /// component with no artifact for this platform. A single-build component has exactly one entry,
+    /// so the applier's selection loop reduces to installing it, unchanged.
+    pub variants: Vec<PlannedVariant>,
     /// Install / Update / Skip, from the shared decision matrix.
     pub action: UpdateAction,
     /// The human-readable version transition (e.g. `"v0.14.0 → v0.15.0 (update)"`).
@@ -415,6 +432,17 @@ pub struct PlannedComponent {
     /// planner did. Without it the gate would fall back to a version PROBE — re-introducing, after
     /// the install, exactly the privileged exec the planner avoided before it.
     pub evidence: VersionEvidence,
+}
+
+impl PlannedComponent {
+    /// The DEFAULT (preferred) staged variant — the first in [`Self::variants`], guaranteed to
+    /// exist because a component with no artifact for this platform is never planned.
+    #[must_use]
+    pub fn primary(&self) -> &PlannedVariant {
+        self.variants
+            .first()
+            .expect("a planned component always has at least its default variant")
+    }
 }
 
 /// A tracked component this pass will NOT act on, and why.
@@ -482,9 +510,14 @@ impl Plan {
             let Some(target) = catalog.target(&component.name) else {
                 continue; // a component this host does not track
             };
-            let Some(artifact) = component.artifact(&platform.os, &platform.arch) else {
+            // Every build variant for this platform, default first (dig_ecosystem#1912). Empty →
+            // nothing for this OS/arch, so the component is skipped exactly as before.
+            let artifacts: Vec<&_> = component
+                .artifacts_for(&platform.os, &platform.arch)
+                .collect();
+            if artifacts.is_empty() {
                 continue; // nothing for this OS/arch
-            };
+            }
 
             // Decide the HOLD FIRST, and — the security-critical part — decide it WITHOUT running
             // `detect`, because `detect` EXECUTES the installed binary (see [`hold_reason`]). A held
@@ -503,28 +536,47 @@ impl Plan {
             // Then choose the EVIDENCE, again from the declaration alone. `detect` is reached only
             // for a component whose declaration permits executing it; a digest-evidenced dest is
             // measured instead, so no exec site in this function can be reached with it.
+            //
+            // For a digest-evidenced component the measurement is against EVERY variant's digest
+            // (dig_ecosystem#1912): a host running the headless build has bytes that hash to the
+            // headless digest, not the default's, and that is still "the current build is installed"
+            // — so a match on ANY variant is a Skip, and only bytes matching no variant are an
+            // Update. All variants of one build share the same manifest version + build number.
             let detected = if target.evidence.requires_execution() {
                 detect(&target.dest)
             } else {
-                digest_evidence(&target.dest, &artifact.sha256, &component.version, digest)
+                let digests: Vec<&str> = artifacts.iter().map(|a| a.sha256.as_str()).collect();
+                digest_evidence_any(&target.dest, &digests, &component.version, digest)
             };
 
-            // The worker-reported `staged_path` is carried verbatim here and is NOT trusted: it is
-            // canonicalized + confined to the broker-owned staging dir by
+            // The worker-reported `staged_path` of EACH variant is carried verbatim here and is NOT
+            // trusted: it is canonicalized + confined to the broker-owned staging dir by
             // [`crate::install::contained_staged_path`] at install time (SPEC §8.3), before any byte
-            // is read. Keeping planning pure of filesystem I/O leaves that guard at the single
-            // point where the bytes are actually hashed + installed.
-            let staged_path = staged
-                .iter()
-                .find(|s| {
-                    s.component == component.name && s.os == platform.os && s.arch == platform.arch
-                })
-                .map(|s| PathBuf::from(&s.staged_path))
-                .ok_or_else(|| BrokerError::StagedArtifactMissing {
-                    component: component.name.clone(),
-                    os: platform.os.clone(),
-                    arch: platform.arch.clone(),
-                })?;
+            // is read. Keeping planning pure of filesystem I/O leaves that guard at the single point
+            // where the bytes are actually hashed + installed. The default variant is first, so the
+            // applier's loadability selection prefers it (dig_ecosystem#1912).
+            let mut variants = Vec::with_capacity(artifacts.len());
+            for artifact in &artifacts {
+                let staged_path = staged
+                    .iter()
+                    .find(|s| {
+                        s.component == component.name
+                            && s.os == platform.os
+                            && s.arch == platform.arch
+                            && s.variant == artifact.variant
+                    })
+                    .map(|s| PathBuf::from(&s.staged_path))
+                    .ok_or_else(|| BrokerError::StagedArtifactMissing {
+                        component: component.name.clone(),
+                        os: platform.os.clone(),
+                        arch: platform.arch.clone(),
+                    })?;
+                variants.push(PlannedVariant {
+                    variant: artifact.variant.clone(),
+                    expected_digest: artifact.sha256.clone(),
+                    staged_path,
+                });
+            }
 
             let installed_build = installed_build(&detected);
             let decision = decide(&detected, &component.version);
@@ -568,8 +620,7 @@ impl Plan {
                 aliases: target.aliases.clone(),
                 version: component.version.clone(),
                 build: component.build,
-                expected_digest: artifact.sha256.clone(),
-                staged_path,
+                variants,
                 action,
                 summary,
                 installed_build,
@@ -578,6 +629,8 @@ impl Plan {
         }
         Ok(Self { components, held })
     }
+
+    // (see PlannedComponent below for the per-component variant accessors)
 
     /// The components this pass will actually act on (Install or Update) — Skip entries filtered
     /// out.
@@ -622,15 +675,22 @@ fn installed_build(detected: &DetectedVersion) -> Option<u64> {
 ///   reinstating bytes whose build nobody can bound.
 /// - NO digest (absent, unreadable, a refused symlink) → nothing is established there → Install.
 #[must_use]
-fn digest_evidence(
+fn digest_evidence_any(
     dest: &Path,
-    expected_digest: &str,
+    expected_digests: &[&str],
     manifest_version: &str,
     digest: &DigestReader,
 ) -> DetectedVersion {
     match digest(dest) {
         None => DetectedVersion::Absent,
-        Some(found) if found.eq_ignore_ascii_case(expected_digest) => {
+        // A match on ANY variant's digest is "the current build is installed" (dig_ecosystem#1912):
+        // a headless host runs bytes that hash to the headless variant, not the default, and that is
+        // still current. All variants share the manifest version, so the answer is the same either way.
+        Some(found)
+            if expected_digests
+                .iter()
+                .any(|d| found.eq_ignore_ascii_case(d)) =>
+        {
             DetectedVersion::Present(manifest_version.to_string())
         }
         Some(_) => DetectedVersion::Present(String::new()),
@@ -817,6 +877,7 @@ mod tests {
                     url: "https://x/y".into(),
                     sha256: digest.into(),
                     size: 1,
+                    variant: None,
                 }],
             }],
         }
@@ -829,9 +890,21 @@ mod tests {
             build: 15_000,
             os: "linux".into(),
             arch: "x64".into(),
+            variant: None,
             sha256: "deadbeef".into(),
             size: 1,
             staged_path: path.into(),
+        }
+    }
+
+    /// A staged artifact carrying a `variant` token, at a distinct path — the dig_ecosystem#1912
+    /// shape a headless build stages as.
+    fn staged_variant(name: &str, variant: &str, digest: &str, path: &str) -> StagedArtifact {
+        StagedArtifact {
+            variant: Some(variant.into()),
+            sha256: digest.into(),
+            staged_path: path.into(),
+            ..staged(name, path)
         }
     }
 
@@ -863,6 +936,7 @@ mod tests {
                         url: "https://x/y".into(),
                         sha256: "deadbeef".into(),
                         size: 1,
+                        variant: None,
                     }],
                 })
                 .collect(),
@@ -1186,6 +1260,105 @@ mod tests {
         assert_eq!(plan.components[0].installed_build, None);
     }
 
+    /// The digest of the DEFAULT dig-app build in these fixtures, and the digest of the HEADLESS one
+    /// — genuinely different, so a match on one is not a match on the other.
+    const DEFAULT_DIGEST: &str = "deadbeef";
+    const HEADLESS_DIGEST: &str = "feedface";
+
+    /// A dig-app manifest carrying BOTH linux/x64 builds — the default and the headless variant.
+    fn manifest_dig_app_two_variants() -> Manifest {
+        let mut m = manifest_one("dig-app", "3.5.0", 3_005_000, DEFAULT_DIGEST);
+        m.components[0].artifacts.push(Artifact {
+            os: "linux".into(),
+            arch: "x64".into(),
+            url: "https://x/headless".into(),
+            sha256: HEADLESS_DIGEST.into(),
+            size: 1,
+            variant: Some("headless".into()),
+        });
+        m
+    }
+
+    #[test]
+    fn a_multi_variant_component_plans_all_variants_default_first() {
+        // dig_ecosystem#1912: both linux/x64 builds must reach the applier as PlannedVariants, the
+        // default first (so selection prefers it), each carrying its OWN digest + staged path.
+        let m = manifest_dig_app_two_variants();
+        let plan = Plan::build(
+            &m,
+            &[
+                staged("dig-app", "/staging/dig-app"),
+                staged_variant(
+                    "dig-app",
+                    "headless",
+                    HEADLESS_DIGEST,
+                    "/staging/dig-app-headless",
+                ),
+            ],
+            &catalog_with_dig_app(),
+            &platform(),
+            &|path| panic!("the planner executed {} for a version", path.display()),
+            // The host has NEITHER build installed, so the component is a fresh Install.
+            &digest_reader(None),
+            &nothing_recorded(),
+        )
+        .unwrap();
+
+        let dig_app = &plan.components[0];
+        assert_eq!(dig_app.variants.len(), 2, "both builds are planned");
+        assert_eq!(dig_app.variants[0].variant, None, "the default is first");
+        assert_eq!(dig_app.variants[0].expected_digest, DEFAULT_DIGEST);
+        assert_eq!(
+            dig_app.variants[0].staged_path,
+            PathBuf::from("/staging/dig-app")
+        );
+        assert_eq!(dig_app.variants[1].variant.as_deref(), Some("headless"));
+        assert_eq!(dig_app.variants[1].expected_digest, HEADLESS_DIGEST);
+        assert_eq!(
+            dig_app.variants[1].staged_path,
+            PathBuf::from("/staging/dig-app-headless")
+        );
+        assert_eq!(dig_app.action, UpdateAction::Install);
+    }
+
+    #[test]
+    fn a_host_running_the_headless_build_is_current_not_reinstalled_every_pass() {
+        // The digest-evidence enumeration must recognise the host as CURRENT when its bytes hash to
+        // ANY variant's digest — here the HEADLESS one (dig_ecosystem#1912). Keying only on the
+        // default digest would report the headless host as an Update and reinstall it on every pass —
+        // the "success" that is really a churn loop. The reader returns the headless digest, which is
+        // NOT the default, so a default-only comparison would fail this.
+        let m = manifest_dig_app_two_variants();
+        let plan = Plan::build(
+            &m,
+            &[
+                staged("dig-app", "/staging/dig-app"),
+                staged_variant(
+                    "dig-app",
+                    "headless",
+                    HEADLESS_DIGEST,
+                    "/staging/dig-app-headless",
+                ),
+            ],
+            &catalog_with_dig_app(),
+            &platform(),
+            &|path| panic!("the planner executed {} for a version", path.display()),
+            &digest_reader(Some(HEADLESS_DIGEST)),
+            &nothing_recorded(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.components[0].action,
+            UpdateAction::Skip,
+            "a host whose bytes hash to the headless variant is on the current build"
+        );
+        assert_eq!(
+            plan.components[0].installed_build,
+            Some(3_005_000),
+            "and the install is aged on the same scale"
+        );
+    }
+
     #[test]
     fn a_digest_evidenced_component_that_claims_aliases_is_held_fail_closed() {
         // Content-digest evidence says nothing about an ALIAS: an alias is not named in the manifest,
@@ -1457,7 +1630,8 @@ mod tests {
         .unwrap();
         assert_eq!(plan.components.len(), 1);
         assert_eq!(plan.components[0].action, UpdateAction::Install);
-        assert_eq!(plan.components[0].expected_digest, "deadbeef");
+        assert_eq!(plan.components[0].primary().expected_digest, "deadbeef");
+        assert_eq!(plan.components[0].variants.len(), 1);
         assert_eq!(plan.components[0].installed_build, None);
         assert_eq!(plan.actionable().count(), 1);
     }

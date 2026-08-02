@@ -122,6 +122,7 @@ fn base_manifest(base: &str, artifact_bytes: &[u8], advisory_size: u64) -> Manif
                 url: format!("{base}/artifact"),
                 sha256: hex::encode(Sha256::digest(artifact_bytes)),
                 size: advisory_size,
+                variant: None,
             }],
         }],
     }

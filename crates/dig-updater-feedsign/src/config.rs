@@ -11,8 +11,10 @@ use serde::Deserialize;
 use crate::channel::Channel;
 use crate::error::FeedsignError;
 
-/// The manifest schema version this signer emits. Additive-only (SPEC §5.2).
-const DEFAULT_SCHEMA: u32 = 1;
+/// The manifest schema version this signer emits. Additive-only (SPEC §5.2). Raised 1 → 2 for the
+/// per-`(os, arch)` `variant` artifact slot (dig_ecosystem#1912); every older reader still verifies a
+/// schema-2 manifest, since the bump is additive and a single-variant manifest is byte-identical.
+const DEFAULT_SCHEMA: u32 = 2;
 /// The alpha delegation version (root == targets; a single generation). SPEC §4.3.
 const DEFAULT_ROOT_VERSION: u32 = 1;
 /// Default manifest lifetime: 12 hours (SPEC §7 heartbeat). With a 6-hour signing cadence this
@@ -104,6 +106,30 @@ pub struct ComponentConfig {
     /// config entry needs no change.
     #[serde(default)]
     pub asset_kind: AssetKind,
+    /// Additional per-`(os, arch)` build VARIANTS this component publishes beyond the default
+    /// (dig_ecosystem#1912). Empty for every single-build component (today's behaviour); dig-app
+    /// declares `[{ "suffix": "-headless", "variant": "headless" }]` so the feed also carries its
+    /// headless Linux build, which the beacon selects on a host that cannot load the default GTK one.
+    ///
+    /// Each variant's release asset is named `{default-asset-name}{suffix}` (so a `-headless` suffix
+    /// on `dig-app-3.5.0-linux-x64` matches `dig-app-3.5.0-linux-x64-headless`), and it is emitted as
+    /// an EXTRA [`crate::resolve::ResolvedArtifact`] carrying `variant`. The default artifact always
+    /// carries `variant: None`.
+    #[serde(default)]
+    pub variants: Vec<VariantSpec>,
+}
+
+/// One declared non-default build VARIANT of a component (dig_ecosystem#1912): the asset-name
+/// `suffix` that identifies it beside the default asset, and the `variant` token that names it in the
+/// signed manifest artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct VariantSpec {
+    /// The suffix appended to the default asset name to find this variant's release asset (e.g.
+    /// `"-headless"`).
+    pub suffix: String,
+    /// The manifest [`dig_updater_trust::Artifact::variant`] token this variant carries (e.g.
+    /// `"headless"`).
+    pub variant: String,
 }
 
 fn default_schema() -> u32 {
@@ -196,7 +222,10 @@ mod tests {
             ]
         }"#;
         let c = FeedConfig::from_json(json).unwrap();
-        assert_eq!(c.schema, 1);
+        assert_eq!(
+            c.schema, 2,
+            "the default schema is 2 since dig_ecosystem#1912"
+        );
         assert_eq!(c.root_version, 1);
         // Both channel floors default to 0 (nothing floored yet).
         assert_eq!(c.floor_for(Channel::Stable), 0);
@@ -218,6 +247,33 @@ mod tests {
         let c = FeedConfig::from_json(json).unwrap();
         assert_eq!(c.components[0].asset_kind, AssetKind::NativePackage);
         assert_eq!(c.components[1].asset_kind, AssetKind::RawBinary);
+    }
+
+    #[test]
+    fn parses_declared_variants_and_defaults_them_to_empty() {
+        // dig_ecosystem#1912: dig-app declares a headless variant; a component that omits `variants`
+        // (every other component) keeps an empty list, so its feed output is unchanged.
+        let json = r#"{
+            "components": [
+                {
+                    "name": "dig-app", "repo": "DIG-Network/dig-app", "asset_prefix": "dig-app",
+                    "variants": [ { "suffix": "-headless", "variant": "headless" } ]
+                },
+                { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore" }
+            ]
+        }"#;
+        let c = FeedConfig::from_json(json).unwrap();
+        assert_eq!(
+            c.components[0].variants,
+            vec![VariantSpec {
+                suffix: "-headless".into(),
+                variant: "headless".into()
+            }]
+        );
+        assert!(
+            c.components[1].variants.is_empty(),
+            "a component that declares no variants stays single-build"
+        );
     }
 
     #[test]

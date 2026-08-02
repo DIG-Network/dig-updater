@@ -102,7 +102,7 @@ pub use installed::{InstalledBuildStore, InstalledBuilds};
 pub use loadable::{host_checker, Host, Loadability, LoadabilityCheck};
 pub use pass::{ComponentOutcome, ComponentResult, Installer, PassReport};
 pub use plan::{
-    Catalog, ComponentTarget, HeldComponent, InstallMethod, Plan, PlannedComponent,
+    Catalog, ComponentTarget, HeldComponent, InstallMethod, Plan, PlannedComponent, PlannedVariant,
     VersionEvidence, BEACON_COMPONENT_NAME, DIG_APP_COMPONENT_NAME,
 };
 pub use rollback::{LkgCache, RestoreKind};

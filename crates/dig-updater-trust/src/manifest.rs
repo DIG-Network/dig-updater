@@ -296,10 +296,32 @@ pub struct Component {
 }
 
 impl Component {
-    /// Find the artifact for a given OS and architecture token.
+    /// Find the FIRST artifact for a given OS and architecture token.
+    ///
+    /// Back-compatible: where a platform ships a single build (every component but a
+    /// headless-capable dig-app), this is the only artifact. Where it ships several variants
+    /// (dig_ecosystem#1912), this returns the default one, because the feed lists the default
+    /// (`variant == None`) first — so a caller that predates variants keeps selecting the default
+    /// build unchanged. Callers that must choose among variants use [`Self::artifacts_for`].
     #[must_use]
     pub fn artifact(&self, os: &str, arch: &str) -> Option<&Artifact> {
         self.artifacts.iter().find(|a| a.os == os && a.arch == arch)
+    }
+
+    /// Every artifact for a given OS and architecture token — one per build [`Artifact::variant`]
+    /// (dig_ecosystem#1912), in the order the manifest lists them (the feed-signer emits the default
+    /// variant first, so a consumer that prefers the default simply takes the first).
+    ///
+    /// For a component that ships a single build this yields exactly one artifact — the same one
+    /// [`Self::artifact`] returns — so the multi-variant path is a strict superset of the old one.
+    pub fn artifacts_for<'a>(
+        &'a self,
+        os: &'a str,
+        arch: &'a str,
+    ) -> impl Iterator<Item = &'a Artifact> + 'a {
+        self.artifacts
+            .iter()
+            .filter(move |a| a.os == os && a.arch == arch)
     }
 }
 
@@ -325,6 +347,20 @@ pub struct Artifact {
     /// download: the worker refuses to stream more than `min(4 × size, 2 GiB)` (disk-fill DoS
     /// guard).
     pub size: u64,
+    /// The build VARIANT within one `(os, arch)`, when a platform ships more than one build of a
+    /// component that differ in what the host must be able to LOAD (dig_ecosystem#1912). The DEFAULT
+    /// build carries no variant (`None`) — the desktop/tray dig-app, and every single-build
+    /// component; an ALTERNATIVE build a host may need instead carries a token such as `"headless"`
+    /// (the headless Linux dig-app, which does not link GTK). The beacon selects among the variants
+    /// staged for its `(os, arch)` by loadability (`dig-updater-broker`'s ELF check), preferring the
+    /// default.
+    ///
+    /// Additive + backward-compatible (SPEC §5.1/§5.2): a pre-#1912 manifest has no `variant` key on
+    /// any artifact, which `#[serde(default)]` reads as `None`; `skip_serializing_if` omits the key
+    /// for the default variant, so a single-variant manifest serializes BYTE-IDENTICALLY to what a
+    /// pre-#1912 signer emitted, and its signature is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 #[cfg(test)]
@@ -355,6 +391,7 @@ mod tests {
                     url: "https://updates.dig.net/dig-node/0.26.0/linux-x64".to_string(),
                     sha256: hex::encode(Sha256::digest(b"artifact")),
                     size: 8,
+                    variant: None,
                 }],
             }],
         }
@@ -430,5 +467,102 @@ mod tests {
         let c = m.component("dig-node").unwrap();
         assert!(c.artifact("linux", "x64").is_some());
         assert!(c.artifact("windows", "x64").is_none());
+    }
+
+    /// A second linux/x64 artifact, carrying the `headless` variant token, for the multi-variant
+    /// tests — the exact shape the feed serves for dig-app under dig_ecosystem#1912.
+    fn headless_variant() -> Artifact {
+        Artifact {
+            os: "linux".to_string(),
+            arch: "x64".to_string(),
+            url: "https://updates.dig.net/dig-app/3.5.0/linux-x64-headless".to_string(),
+            sha256: hex::encode(Sha256::digest(b"headless-artifact")),
+            size: 17,
+            variant: Some("headless".to_string()),
+        }
+    }
+
+    /// `artifacts_for` returns EVERY variant of a platform (default first), while `artifact` keeps
+    /// returning just the default — so the multi-variant path is a strict superset of the old lookup.
+    #[test]
+    fn artifacts_for_returns_every_variant_default_first() {
+        let mut m = sample_manifest();
+        m.components[0].artifacts.push(headless_variant());
+        let c = &m.components[0];
+
+        let variants: Vec<Option<&str>> = c
+            .artifacts_for("linux", "x64")
+            .map(|a| a.variant.as_deref())
+            .collect();
+        assert_eq!(
+            variants,
+            vec![None, Some("headless")],
+            "both linux/x64 builds are returned, the default (no variant) first"
+        );
+        // The pre-#1912 accessor is unchanged: it still resolves to the DEFAULT build only, so a
+        // caller that never learned about variants keeps installing the default.
+        assert_eq!(c.artifact("linux", "x64").unwrap().variant, None);
+        // A platform with no build for it yields nothing (not a panic, not the wrong platform).
+        assert_eq!(c.artifacts_for("windows", "x64").count(), 0);
+    }
+
+    /// SIGNATURE COMPAT (the load-bearing #1912 invariant): a schema-2 manifest whose artifact
+    /// carries a `variant` still verifies over its RECEIVED bytes under the signing key — the
+    /// `variant` token travels inside the signed payload verbatim and an older reader ignoring the
+    /// key would compute the same signed bytes it did before.
+    #[test]
+    fn a_schema_2_manifest_carrying_a_variant_verifies_over_its_received_bytes() {
+        use ed25519_dalek::Verifier;
+
+        let key = targets_key();
+        let mut m = sample_manifest();
+        m.schema = 2;
+        m.components[0].artifacts.push(headless_variant());
+
+        let signed = SignedManifest::sign(m, &key);
+        let json = signed.to_json();
+        assert!(
+            json.contains("\"variant\":\"headless\""),
+            "the variant token is carried on the wire verbatim: {json}"
+        );
+
+        let parsed = SignedManifest::from_json(&json).expect("valid envelope");
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&parsed.signature)
+            .expect("signature is base64");
+        let signature =
+            ed25519_dalek::Signature::from_slice(&sig_bytes).expect("64-byte signature");
+        key.verifying_key()
+            .verify(parsed.signed_payload(), &signature)
+            .expect("a schema-2 manifest carrying a variant verifies over its received bytes");
+
+        assert_eq!(
+            parsed.manifest.components[0].artifacts[0].variant, None,
+            "the default artifact still carries no variant"
+        );
+        assert_eq!(
+            parsed.manifest.components[0].artifacts[1]
+                .variant
+                .as_deref(),
+            Some("headless"),
+        );
+    }
+
+    /// BACK-COMPAT: a pre-#1912 artifact JSON has no `variant` key at all — it must read as `None`,
+    /// and a single-variant manifest must re-serialize WITHOUT the key (so the feed's byte-exact
+    /// output is unperturbed and the signature over it is unchanged).
+    #[test]
+    fn an_artifact_without_a_variant_key_reads_as_none_and_reserializes_without_it() {
+        let m = sample_manifest();
+        let json = serde_json::to_string(&m).expect("serializable");
+        assert!(
+            !json.contains("variant"),
+            "skip_serializing_if keeps a single-variant manifest byte-identical: {json}"
+        );
+        let back: Manifest = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(
+            back.components[0].artifacts[0].variant, None,
+            "an absent variant key defaults to the default build"
+        );
     }
 }

@@ -119,6 +119,10 @@ pub struct ResolvedArtifact {
     pub os: String,
     /// Arch token (`x64` | `arm64`).
     pub arch: String,
+    /// The build VARIANT within this `(os, arch)` (dig_ecosystem#1912): `None` for the default asset,
+    /// `Some("headless")` for a declared alternative. Carried into the manifest artifact's
+    /// [`dig_updater_trust::Artifact::variant`].
+    pub variant: Option<String>,
     /// The public download URL of the matching release asset.
     pub url: String,
 }
@@ -154,11 +158,29 @@ pub fn select_artifacts(
             component.asset_kind,
         );
         if let Some(asset) = release.assets.iter().find(|a| a.name == expected) {
+            // The DEFAULT build for this platform (`variant: None`) — emitted FIRST, so the manifest
+            // lists the default before any alternative and the beacon's variant selection prefers it.
             artifacts.push(ResolvedArtifact {
                 os: (*os).to_string(),
                 arch: (*arch).to_string(),
+                variant: None,
                 url: asset.browser_download_url.clone(),
             });
+        }
+        // Each declared VARIANT (dig_ecosystem#1912) is an EXTRA asset named `{default}{suffix}` —
+        // e.g. `dig-app-3.5.0-linux-x64-headless`. A component that declares none adds nothing here,
+        // so its output is unchanged; a variant asset that is absent from the release is simply
+        // skipped (the platform may not ship it), never an error.
+        for spec in &component.variants {
+            let variant_name = format!("{expected}{}", spec.suffix);
+            if let Some(asset) = release.assets.iter().find(|a| a.name == variant_name) {
+                artifacts.push(ResolvedArtifact {
+                    os: (*os).to_string(),
+                    arch: (*arch).to_string(),
+                    variant: Some(spec.variant.clone()),
+                    url: asset.browser_download_url.clone(),
+                });
+            }
         }
     }
     if artifacts.is_empty() {
@@ -218,6 +240,7 @@ mod tests {
             repo: "DIG-Network/dig-node".into(),
             asset_prefix: "dig-node".into(),
             asset_kind: AssetKind::RawBinary,
+            variants: vec![],
         }
     }
 
@@ -236,6 +259,7 @@ mod tests {
             repo: format!("DIG-Network/{name}"),
             asset_prefix: name.into(),
             asset_kind: AssetKind::RawBinary,
+            variants: vec![],
         }
     }
 
@@ -348,6 +372,7 @@ mod tests {
             repo: "DIG-Network/digstore".into(),
             asset_prefix: "digstore".into(),
             asset_kind: AssetKind::RawBinary,
+            variants: vec![],
         };
         let arts = select_artifacts(&release, &cfg, "0.13.1").unwrap();
         assert_eq!(arts.len(), 1);
@@ -456,6 +481,82 @@ mod tests {
                 && !a.url.ends_with(".deb")),
             "a raw-binary component never selects a package"
         );
+    }
+
+    /// A dig-app-shaped component declaring a headless variant, plus a release carrying BOTH the
+    /// default and the `-headless` linux/x64 assets — the exact dig_ecosystem#1912 shape.
+    fn dig_app_with_headless() -> ComponentConfig {
+        ComponentConfig {
+            name: "dig-app".into(),
+            repo: "DIG-Network/dig-app".into(),
+            asset_prefix: "dig-app".into(),
+            asset_kind: AssetKind::RawBinary,
+            variants: vec![crate::config::VariantSpec {
+                suffix: "-headless".into(),
+                variant: "headless".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_declared_variant_emits_a_second_artifact_for_the_same_platform() {
+        // dig_ecosystem#1912: the feed must carry BOTH linux/x64 builds — the default (no variant)
+        // and the headless one — so the beacon can select the loadable one. The default is emitted
+        // first, and the platforms that ship only the default stay single-artifact.
+        let release = GithubRelease {
+            tag_name: "v3.5.0".into(),
+            assets: vec![
+                asset("dig-app-3.5.0-linux-x64"),
+                asset("dig-app-3.5.0-linux-x64-headless"),
+                asset("dig-app-3.5.0-macos-arm64"),
+                asset("dig-app-3.5.0-windows-x64.exe"),
+            ],
+        };
+        let arts = select_artifacts(&release, &dig_app_with_headless(), "3.5.0").unwrap();
+
+        let linux: Vec<_> = arts.iter().filter(|a| a.os == "linux").collect();
+        assert_eq!(linux.len(), 2, "both linux/x64 builds resolve: {arts:?}");
+        assert_eq!(linux[0].variant, None, "the default build comes first");
+        assert!(linux[0].url.ends_with("dig-app-3.5.0-linux-x64"));
+        assert_eq!(linux[1].variant.as_deref(), Some("headless"));
+        assert!(linux[1].url.ends_with("dig-app-3.5.0-linux-x64-headless"));
+
+        // The other platforms ship only the default — one artifact each, variant None.
+        for os in ["macos", "windows"] {
+            let for_os: Vec<_> = arts.iter().filter(|a| a.os == os).collect();
+            assert_eq!(for_os.len(), 1, "{os} ships only the default build");
+            assert_eq!(for_os[0].variant, None);
+        }
+    }
+
+    #[test]
+    fn a_component_with_no_declared_variants_emits_only_default_artifacts() {
+        // The control: a plain component's selection is untouched — every artifact is the default,
+        // even when the release happens to carry a `-headless`-suffixed sibling it did not declare.
+        let release = GithubRelease {
+            tag_name: "v0.29.0".into(),
+            assets: vec![
+                asset("dig-node-0.29.0-linux-x64"),
+                asset("dig-node-0.29.0-linux-x64-headless"),
+            ],
+        };
+        let arts = select_artifacts(&release, &component(), "0.29.0").unwrap();
+        assert_eq!(arts.len(), 1, "an undeclared suffix is never selected");
+        assert_eq!(arts[0].variant, None);
+        assert!(arts[0].url.ends_with("dig-node-0.29.0-linux-x64"));
+    }
+
+    #[test]
+    fn a_declared_variant_absent_from_the_release_is_skipped_not_an_error() {
+        // The headless asset simply is not there yet (a platform that has not built it): the default
+        // still resolves and selection succeeds, rather than failing the whole feed closed.
+        let release = GithubRelease {
+            tag_name: "v3.5.0".into(),
+            assets: vec![asset("dig-app-3.5.0-linux-x64")],
+        };
+        let arts = select_artifacts(&release, &dig_app_with_headless(), "3.5.0").unwrap();
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].variant, None);
     }
 
     #[test]

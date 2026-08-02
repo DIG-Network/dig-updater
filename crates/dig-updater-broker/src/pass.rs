@@ -152,6 +152,28 @@ pub struct PassReport {
     pub refused: Vec<String>,
 }
 
+/// The result of choosing a build variant to install ([`Installer::select_loadable_variant`],
+/// dig_ecosystem#1912).
+enum VariantSelection {
+    /// A variant was chosen and its verified bytes now sit in the broker-private copy. `indeterminate`
+    /// carries the reason no ELF loadability answer could be established, when the chosen variant was
+    /// [`Loadability::Indeterminate`] (the fail-open case), so it can be surfaced in the report.
+    Selected {
+        /// The chosen variant's manifest digest — the authority the post-install health gate re-hashes
+        /// a digest-evidenced component against (dig_ecosystem#1912: the SELECTED variant, not the
+        /// default).
+        expected_digest: String,
+        /// Present when the chosen variant's loadability could not be established.
+        indeterminate: Option<String>,
+    },
+    /// Every staged variant is unloadable on this host — the component is refused, carrying each
+    /// variant's reason.
+    AllUnloadable {
+        /// The per-variant refusal reasons.
+        refusals: Vec<String>,
+    },
+}
+
 /// The `action` a HELD component's report line carries — it had no Install/Update/Skip decision to
 /// report, because the planner stopped before deciding one ([`crate::plan::HeldComponent`]).
 const ACTION_HOLD: &str = "hold";
@@ -467,55 +489,141 @@ impl Installer<'_> {
     /// worker-reported path is refused unless it resolves inside the broker-owned staging dir, and
     /// the bytes that are hashed are the exact bytes copied into a file the worker cannot touch and
     /// then installed — closing the reverify→install TOCTOU (SPEC §8.3).
+    /// Choose the build VARIANT to install by loadability (dig_ecosystem#1912), leaving the chosen
+    /// variant's verified bytes at `private` on success. Candidates are tried in `pc.variants` order
+    /// — the DEFAULT first — and the rule is:
+    ///
+    /// - the FIRST variant that is [`Loadability::Loadable`] wins immediately (default-first ordering
+    ///   makes it the most-preferred loadable build, so nothing later can outrank it);
+    /// - failing any loadable variant, the FIRST [`Loadability::Indeterminate`] one is used — the
+    ///   fail-OPEN case that keeps a `.deb`/`.msi`/musl/non-ELF component updating exactly as before;
+    /// - only if EVERY variant is a refusal ([`Loadability::Unloadable`]/[`Loadability::WrongMachine`])
+    ///   is the component refused, carrying each variant's reason.
+    ///
+    /// Each candidate is staged into `private` and digest-verified against ITS OWN manifest digest
+    /// before it is inspected, so the hashed-is-installed invariant holds for whichever variant wins;
+    /// a rejected candidate's bytes are simply overwritten by the next (or cleaned up by the caller).
+    fn select_loadable_variant(
+        &self,
+        pc: &PlannedComponent,
+        private: &std::path::Path,
+        executable: bool,
+    ) -> Result<VariantSelection, BrokerError> {
+        let mut refusals: Vec<String> = Vec::new();
+        // The first Indeterminate variant we could fall back to (its index + reason).
+        let mut fallback: Option<(usize, String)> = None;
+        // Which variant's bytes currently sit at `private` (so a fallback re-stages only if needed).
+        let mut staged_idx: Option<usize> = None;
+
+        for (idx, candidate) in pc.variants.iter().enumerate() {
+            self.stage_variant(pc, candidate, private, executable)?;
+            staged_idx = Some(idx);
+            match (self.loadability)(private) {
+                Loadability::Loadable => {
+                    return Ok(VariantSelection::Selected {
+                        expected_digest: candidate.expected_digest.clone(),
+                        indeterminate: None,
+                    });
+                }
+                Loadability::Indeterminate { why } => {
+                    if fallback.is_none() {
+                        fallback = Some((idx, why));
+                    }
+                }
+                refused => {
+                    if let Some(reason) = refused.refusal() {
+                        refusals.push(reason);
+                    }
+                }
+            }
+        }
+
+        // No loadable variant. Fall back to the first Indeterminate one, re-staging it into `private`
+        // only if a later (refused) candidate has since overwritten its bytes there.
+        if let Some((idx, why)) = fallback {
+            let candidate = &pc.variants[idx];
+            if staged_idx != Some(idx) {
+                self.stage_variant(pc, candidate, private, executable)?;
+            }
+            return Ok(VariantSelection::Selected {
+                expected_digest: candidate.expected_digest.clone(),
+                indeterminate: Some(why),
+            });
+        }
+
+        Ok(VariantSelection::AllUnloadable { refusals })
+    }
+
+    /// Confine `candidate`'s worker-reported staged path to the staging dir, then copy + digest-verify
+    /// its bytes into the broker-private `private` file (SPEC §8.3) — the shared step every variant
+    /// goes through in [`Self::select_loadable_variant`].
+    fn stage_variant(
+        &self,
+        pc: &PlannedComponent,
+        candidate: &crate::plan::PlannedVariant,
+        private: &std::path::Path,
+        executable: bool,
+    ) -> Result<(), BrokerError> {
+        let staged = contained_staged_path(&candidate.staged_path, self.staging_dir, &pc.name)?;
+        stage_and_verify_private(
+            &staged,
+            private,
+            &candidate.expected_digest,
+            &pc.name,
+            executable,
+        )
+    }
+
     fn apply_component(
         &self,
         pc: &PlannedComponent,
         floor: u64,
         install_step: impl Fn(&std::path::Path, &RetryPolicy) -> InstallOutcome,
     ) -> Result<ComponentOutcome, BrokerError> {
-        // Refuse a staged path that escapes the broker-owned staging dir, BEFORE reading a byte.
-        let staged = contained_staged_path(&pc.staged_path, self.staging_dir, &pc.name)?;
-
-        // Copy the staged bytes into a broker-private file and verify THAT copy against the
-        // re-verified digest — a mismatch is a security event that aborts the whole pass (SPEC
-        // §8.3). From here the install reads only the private copy, so a later staging swap is inert.
+        // Select the build VARIANT this host can LOAD (dig_ecosystem#1870/#1912), staging each
+        // candidate into the broker-private copy and checking its loadability BEFORE anything on disk
+        // is touched — before the rollback snapshot, before any service stop, while the working binary
+        // at `dest` is still completely untouched. For a single-build component the loop reduces to the
+        // pre-#1912 behaviour: stage the one variant, refuse it only if it is unloadable.
         let private = private_target(pc, self.apply_dir);
         let executable = pc.method == InstallMethod::RawBinary;
-        stage_and_verify_private(&staged, &private, &pc.expected_digest, &pc.name, executable)?;
-
-        // dig_ecosystem#1870: verified bytes are not necessarily RUNNABLE bytes. Ask — of the exact
-        // private file `install_step` is about to move onto `dest` — whether this host can even load
-        // it, and refuse HERE if it cannot: before the rollback snapshot, before any service stop,
-        // while the working binary at `dest` is still completely untouched. Placement is the whole
-        // fix; a check after the install would only be able to undo damage it had already done.
-        let loadability = (self.loadability)(&private);
-        if let Some(refusal) = loadability.refusal() {
-            let _ = std::fs::remove_file(&private);
-            let detail = unloadable_detail(&refusal, &pc.dest);
-            eprintln!(
-                "dig-updater: warning: {LOG_CODE_REFUSED}: {} {detail}",
-                pc.name
-            );
-            return Ok(ComponentOutcome {
-                component: pc.name.clone(),
-                action: ACTION_REFUSE.to_string(),
-                result: ComponentResult::Refused,
-                detail,
-            });
-        }
-        // No answer is NOT a refusal (see [`crate::loadable`]): a `.deb`/`.msi` private copy, a
-        // musl host, a non-ELF platform. The install proceeds exactly as it did before this check
-        // existed, and the reason travels into the report so the silence is legible.
-        let indeterminate = match loadability {
-            Loadability::Indeterminate { why } => {
-                eprintln!(
-                    "dig-updater: warning: {} loadability unknown: {why}",
-                    pc.name
-                );
-                Some(why)
-            }
-            _ => None,
-        };
+        let (expected_digest, indeterminate) =
+            match self.select_loadable_variant(pc, &private, executable)? {
+                VariantSelection::Selected {
+                    expected_digest,
+                    indeterminate,
+                } => {
+                    if let Some(why) = &indeterminate {
+                        // No answer is NOT a refusal (see [`crate::loadable`]): a `.deb`/`.msi` private
+                        // copy, a musl host, a non-ELF platform. The install proceeds exactly as it did
+                        // before this check existed, and the reason travels into the report so the silence
+                        // is legible.
+                        eprintln!(
+                            "dig-updater: warning: {} loadability unknown: {why}",
+                            pc.name
+                        );
+                    }
+                    (expected_digest, indeterminate)
+                }
+                // EVERY staged variant is unloadable on this host — only now, when there is no build the
+                // host can run, is the component refused (dig_ecosystem#1912): a headless host whose
+                // default build is unloadable but whose headless build loads is NOT refused, it installs
+                // the headless build above.
+                VariantSelection::AllUnloadable { refusals } => {
+                    let _ = std::fs::remove_file(&private);
+                    let detail = unloadable_detail(&refusals.join("; "), &pc.dest);
+                    eprintln!(
+                        "dig-updater: warning: {LOG_CODE_REFUSED}: {} {detail}",
+                        pc.name
+                    );
+                    return Ok(ComponentOutcome {
+                        component: pc.name.clone(),
+                        action: ACTION_REFUSE.to_string(),
+                        result: ComponentResult::Refused,
+                        detail,
+                    });
+                }
+            };
 
         // Snapshot the WHOLE binary set (primary + every alias) so a failed health gate reverts the
         // ENTIRE set together (#666 F2). `install_from_private` refreshes the aliases to the new
@@ -555,7 +663,7 @@ impl Installer<'_> {
         // does NOT `?` the inner result before restarting, so a stopped service is never left down
         // even when the rollback itself errors out (#666 F1).
         let outcome = install_step(&private, &self.retry);
-        let install_result = self.finish_apply(pc, floor, snapshots, outcome);
+        let install_result = self.finish_apply(pc, floor, snapshots, outcome, &expected_digest);
         let mut outcome = restart_after(service.as_deref(), self.service_ctl, install_result)?;
         if let Some(why) = indeterminate {
             outcome
@@ -610,9 +718,10 @@ impl Installer<'_> {
         floor: u64,
         snapshots: Vec<BinarySnapshot>,
         outcome: InstallOutcome,
+        expected_digest: &str,
     ) -> Result<ComponentOutcome, BrokerError> {
         match outcome {
-            InstallOutcome::Installed => match self.check_binary_set(pc) {
+            InstallOutcome::Installed => match self.check_binary_set(pc, expected_digest) {
                 // `pc.summary` is the PLAN's pre-install prediction ("v0.14.0 -> v0.15.0") — once
                 // the install has actually happened, that prediction is stale. Report what the
                 // health gate just re-observed on disk instead (#582), so a later `status` read
@@ -699,13 +808,18 @@ impl Installer<'_> {
     /// gate exactly like a stale primary, so a component whose alias was left un-refreshed is
     /// rolled back rather than falsely reported Installed. Returns the PRIMARY's observed version
     /// (what a later `status` read states, #582).
-    fn check_binary_set(&self, pc: &PlannedComponent) -> Result<DetectedVersion, String> {
+    fn check_binary_set(
+        &self,
+        pc: &PlannedComponent,
+        expected_digest: &str,
+    ) -> Result<DetectedVersion, String> {
         if !pc.evidence.requires_execution() {
             // A component the planner refused to execute must not be executed AFTER installing it
             // either — the side effects a probe would trigger do not become acceptable once the bytes
             // are newer. The gate is the same measurement the plan was made from, re-taken against
-            // the same signed digest, so it still proves the installed bytes ARE the promised build.
-            return self.check_installed_digest(pc);
+            // the SELECTED variant's signed digest (dig_ecosystem#1912), so it still proves the
+            // installed bytes ARE the promised build — the headless one on a headless host.
+            return self.check_installed_digest(pc, expected_digest);
         }
         let primary = check_health(&pc.dest, &pc.version, self.health)?;
         for alias in &pc.aliases {
@@ -730,19 +844,22 @@ impl Installer<'_> {
     ///
     /// A component with content-digest evidence declares no aliases (enforced in
     /// [`crate::plan::hold_reason`]), so — unlike the probe path — there is no alias set to walk here.
-    fn check_installed_digest(&self, pc: &PlannedComponent) -> Result<DetectedVersion, String> {
+    fn check_installed_digest(
+        &self,
+        pc: &PlannedComponent,
+        expected_digest: &str,
+    ) -> Result<DetectedVersion, String> {
         match (self.digest)(&pc.dest) {
             None => Err(format!(
                 "nothing readable installed at {}",
                 pc.dest.display()
             )),
-            Some(found) if found.eq_ignore_ascii_case(&pc.expected_digest) => {
+            Some(found) if found.eq_ignore_ascii_case(expected_digest) => {
                 Ok(DetectedVersion::Present(pc.version.clone()))
             }
             Some(found) => Err(format!(
-                "post-install digest check failed: {} has sha256 {found}, expected {}",
+                "post-install digest check failed: {} has sha256 {found}, expected {expected_digest}",
                 pc.dest.display(),
-                pc.expected_digest
             )),
         }
     }

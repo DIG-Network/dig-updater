@@ -358,6 +358,85 @@ fn reported_digests_match_bytes() {
     }
 }
 
+/// dig_ecosystem#1912, end to end: a component that publishes BOTH a default and a `-headless`
+/// linux/x64 build produces a signed manifest carrying TWO linux/x64 artifacts — the default
+/// (`variant: None`) and the headless (`variant: "headless"`) — and BOTH digest-verify against the
+/// exact served bytes under the SAME trust chain the beacon runs.
+#[test]
+fn a_component_with_a_headless_variant_signs_both_linux_builds() {
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+
+    let mut releases = HashMap::new();
+    releases.insert(
+        ("DIG-Network/dig-app".to_string(), Channel::Stable),
+        r#"{"tag_name":"v3.5.0","assets":[
+            {"name":"dig-app-3.5.0-linux-x64","browser_download_url":"https://dl.test/dig-app/linux"},
+            {"name":"dig-app-3.5.0-linux-x64-headless","browser_download_url":"https://dl.test/dig-app/linux-headless"},
+            {"name":"dig-app-3.5.0-windows-x64.exe","browser_download_url":"https://dl.test/dig-app/windows"}
+        ]}"#
+        .to_string(),
+    );
+    let mut assets = HashMap::new();
+    // Distinct bytes per build, so a digest that verified the WRONG variant's bytes would fail.
+    assets.insert(
+        "https://dl.test/dig-app/linux".to_string(),
+        b"dig-app-gtk-linked-linux-binary".to_vec(),
+    );
+    assets.insert(
+        "https://dl.test/dig-app/linux-headless".to_string(),
+        b"dig-app-HEADLESS-no-gtk-linux-binary".to_vec(),
+    );
+    assets.insert(
+        "https://dl.test/dig-app/windows".to_string(),
+        b"dig-app-windows-binary".to_vec(),
+    );
+    let source = FakeSource { releases, assets };
+
+    let config = FeedConfig::from_json(
+        r#"{ "components": [
+            {
+                "name": "dig-app", "repo": "DIG-Network/dig-app", "asset_prefix": "dig-app",
+                "variants": [ { "suffix": "-headless", "variant": "headless" } ]
+            }
+        ] }"#,
+    )
+    .unwrap();
+
+    let feed = produce_feed(&config, &source, Channel::Stable, GENERATED, &signing_key)
+        .expect("feed produced");
+
+    // The whole trust chain still verifies — schema 2 + variant is additive.
+    let delegation = SignedDelegation::from_json(&feed.delegation_json).unwrap();
+    let manifest = SignedManifest::from_json(&feed.manifest_json).unwrap();
+    verify_update_chain(
+        &signing_key.verifying_key(),
+        &TrustState::initial(),
+        &delegation,
+        &manifest,
+        GENERATED + 60,
+    )
+    .expect("a schema-2 feed carrying a variant must verify");
+    assert_eq!(manifest.manifest.schema, 2, "the signer emits schema 2");
+
+    let dig_app = manifest.manifest.component("dig-app").unwrap();
+    let linux: Vec<_> = dig_app.artifacts_for("linux", "x64").collect();
+    assert_eq!(linux.len(), 2, "both linux/x64 builds are signed");
+    assert_eq!(linux[0].variant, None, "the default build is listed first");
+    assert_eq!(linux[1].variant.as_deref(), Some("headless"));
+
+    // BOTH artifacts digest-verify against the exact bytes the source served — and the two digests
+    // differ, so neither is silently pointing at the other build's bytes.
+    for artifact in &dig_app.artifacts {
+        let bytes = source.download(&artifact.url).unwrap();
+        verify_artifact_digest(artifact, &bytes)
+            .unwrap_or_else(|e| panic!("digest for {} must match: {e}", artifact.url));
+    }
+    assert_ne!(
+        linux[0].sha256, linux[1].sha256,
+        "the two builds have genuinely different bytes"
+    );
+}
+
 /// A component whose release has no matching platform assets fails the whole run closed.
 #[test]
 fn missing_component_assets_fail_closed() {
