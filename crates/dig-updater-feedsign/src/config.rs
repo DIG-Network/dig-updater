@@ -222,7 +222,10 @@ mod tests {
             ]
         }"#;
         let c = FeedConfig::from_json(json).unwrap();
-        assert_eq!(c.schema, 2, "the default schema is 2 since dig_ecosystem#1912");
+        assert_eq!(
+            c.schema, 2,
+            "the default schema is 2 since dig_ecosystem#1912"
+        );
         assert_eq!(c.root_version, 1);
         // Both channel floors default to 0 (nothing floored yet).
         assert_eq!(c.floor_for(Channel::Stable), 0);

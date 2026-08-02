@@ -541,7 +541,9 @@ mod tests {
             "the default artifact still carries no variant"
         );
         assert_eq!(
-            parsed.manifest.components[0].artifacts[1].variant.as_deref(),
+            parsed.manifest.components[0].artifacts[1]
+                .variant
+                .as_deref(),
             Some("headless"),
         );
     }

@@ -587,41 +587,43 @@ impl Installer<'_> {
         // pre-#1912 behaviour: stage the one variant, refuse it only if it is unloadable.
         let private = private_target(pc, self.apply_dir);
         let executable = pc.method == InstallMethod::RawBinary;
-        let (expected_digest, indeterminate) = match self
-            .select_loadable_variant(pc, &private, executable)?
-        {
-            VariantSelection::Selected {
-                expected_digest,
-                indeterminate,
-            } => {
-                if let Some(why) = &indeterminate {
-                    // No answer is NOT a refusal (see [`crate::loadable`]): a `.deb`/`.msi` private
-                    // copy, a musl host, a non-ELF platform. The install proceeds exactly as it did
-                    // before this check existed, and the reason travels into the report so the silence
-                    // is legible.
-                    eprintln!("dig-updater: warning: {} loadability unknown: {why}", pc.name);
+        let (expected_digest, indeterminate) =
+            match self.select_loadable_variant(pc, &private, executable)? {
+                VariantSelection::Selected {
+                    expected_digest,
+                    indeterminate,
+                } => {
+                    if let Some(why) = &indeterminate {
+                        // No answer is NOT a refusal (see [`crate::loadable`]): a `.deb`/`.msi` private
+                        // copy, a musl host, a non-ELF platform. The install proceeds exactly as it did
+                        // before this check existed, and the reason travels into the report so the silence
+                        // is legible.
+                        eprintln!(
+                            "dig-updater: warning: {} loadability unknown: {why}",
+                            pc.name
+                        );
+                    }
+                    (expected_digest, indeterminate)
                 }
-                (expected_digest, indeterminate)
-            }
-            // EVERY staged variant is unloadable on this host — only now, when there is no build the
-            // host can run, is the component refused (dig_ecosystem#1912): a headless host whose
-            // default build is unloadable but whose headless build loads is NOT refused, it installs
-            // the headless build above.
-            VariantSelection::AllUnloadable { refusals } => {
-                let _ = std::fs::remove_file(&private);
-                let detail = unloadable_detail(&refusals.join("; "), &pc.dest);
-                eprintln!(
-                    "dig-updater: warning: {LOG_CODE_REFUSED}: {} {detail}",
-                    pc.name
-                );
-                return Ok(ComponentOutcome {
-                    component: pc.name.clone(),
-                    action: ACTION_REFUSE.to_string(),
-                    result: ComponentResult::Refused,
-                    detail,
-                });
-            }
-        };
+                // EVERY staged variant is unloadable on this host — only now, when there is no build the
+                // host can run, is the component refused (dig_ecosystem#1912): a headless host whose
+                // default build is unloadable but whose headless build loads is NOT refused, it installs
+                // the headless build above.
+                VariantSelection::AllUnloadable { refusals } => {
+                    let _ = std::fs::remove_file(&private);
+                    let detail = unloadable_detail(&refusals.join("; "), &pc.dest);
+                    eprintln!(
+                        "dig-updater: warning: {LOG_CODE_REFUSED}: {} {detail}",
+                        pc.name
+                    );
+                    return Ok(ComponentOutcome {
+                        component: pc.name.clone(),
+                        action: ACTION_REFUSE.to_string(),
+                        result: ComponentResult::Refused,
+                        detail,
+                    });
+                }
+            };
 
         // Snapshot the WHOLE binary set (primary + every alias) so a failed health gate reverts the
         // ENTIRE set together (#666 F2). `install_from_private` refreshes the aliases to the new

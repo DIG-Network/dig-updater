@@ -686,7 +686,11 @@ fn digest_evidence_any(
         // A match on ANY variant's digest is "the current build is installed" (dig_ecosystem#1912):
         // a headless host runs bytes that hash to the headless variant, not the default, and that is
         // still current. All variants share the manifest version, so the answer is the same either way.
-        Some(found) if expected_digests.iter().any(|d| found.eq_ignore_ascii_case(d)) => {
+        Some(found)
+            if expected_digests
+                .iter()
+                .any(|d| found.eq_ignore_ascii_case(d)) =>
+        {
             DetectedVersion::Present(manifest_version.to_string())
         }
         Some(_) => DetectedVersion::Present(String::new()),
@@ -1284,7 +1288,12 @@ mod tests {
             &m,
             &[
                 staged("dig-app", "/staging/dig-app"),
-                staged_variant("dig-app", "headless", HEADLESS_DIGEST, "/staging/dig-app-headless"),
+                staged_variant(
+                    "dig-app",
+                    "headless",
+                    HEADLESS_DIGEST,
+                    "/staging/dig-app-headless",
+                ),
             ],
             &catalog_with_dig_app(),
             &platform(),
@@ -1299,7 +1308,10 @@ mod tests {
         assert_eq!(dig_app.variants.len(), 2, "both builds are planned");
         assert_eq!(dig_app.variants[0].variant, None, "the default is first");
         assert_eq!(dig_app.variants[0].expected_digest, DEFAULT_DIGEST);
-        assert_eq!(dig_app.variants[0].staged_path, PathBuf::from("/staging/dig-app"));
+        assert_eq!(
+            dig_app.variants[0].staged_path,
+            PathBuf::from("/staging/dig-app")
+        );
         assert_eq!(dig_app.variants[1].variant.as_deref(), Some("headless"));
         assert_eq!(dig_app.variants[1].expected_digest, HEADLESS_DIGEST);
         assert_eq!(
@@ -1321,7 +1333,12 @@ mod tests {
             &m,
             &[
                 staged("dig-app", "/staging/dig-app"),
-                staged_variant("dig-app", "headless", HEADLESS_DIGEST, "/staging/dig-app-headless"),
+                staged_variant(
+                    "dig-app",
+                    "headless",
+                    HEADLESS_DIGEST,
+                    "/staging/dig-app-headless",
+                ),
             ],
             &catalog_with_dig_app(),
             &platform(),

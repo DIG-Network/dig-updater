@@ -150,7 +150,7 @@ detached signature over the payload's **canonical signing bytes** (§5.4).
 // SignedManifest
 {
   "manifest": {
-    "schema":               1,           // u32 manifest schema version
+    "schema":               2,           // u32 manifest schema version (2 since the variant slot, §5.3)
     "root_version":         1,           // u32; MUST equal the in-force delegation's root_version
     "sequence":             42,          // u64, monotonic per-manifest counter (anti-rollback)
     "generated":            1730990000,  // u64 unix seconds when signed (anti-freeze high-water)
@@ -168,6 +168,7 @@ detached signature over the payload's **canonical signing bytes** (§5.4).
             "url":    "https://updates.dig.net/dig-node/0.26.0/linux-x64",
             "sha256": "<64-hex>",        // SHA-256 of the artifact bytes
             "size":   18874368           // u64 advisory byte size (digest is authority)
+            // "variant": "headless"     // OPTIONAL (schema 2+, §5.3); absent = the default build
           }
         ]
       }
@@ -187,9 +188,23 @@ detached signature over the payload's **canonical signing bytes** (§5.4).
 ### 5.3 Component / Artifact
 
 A `component` groups one release (`version`, `build`) and its per-OS/arch `artifacts`. An
-`artifact` is the smallest installable unit. The tuple (`os`, `arch`) MUST be unique within a
-component. `build` is the monotonic identity used for anti-downgrade comparisons; `version` is
-for display and MUST correspond to `build`.
+`artifact` is the smallest installable unit. `build` is the monotonic identity used for
+anti-downgrade comparisons; `version` is for display and MUST correspond to `build`.
+
+An artifact MAY carry an OPTIONAL `variant` string (schema 2+). It names a BUILD VARIANT within one
+`(os, arch)`: a component may publish more than one build for the same platform that differ in what
+the host must be able to LOAD (e.g. dig-app's default desktop/tray Linux build links GTK, while its
+`"headless"` Linux build does not). The DEFAULT build carries NO `variant` key (equivalently
+`variant == null`); every single-build component and every default build omits it. The identifying
+key is therefore the tuple (`os`, `arch`, `variant`), which MUST be unique within a component;
+(`os`, `arch`) alone MUST be unique among the DEFAULT (`variant`-absent) artifacts. All variants of
+one component share its `version` and `build`.
+
+`variant` is additive and backward-compatible (§5.1, §5.4): a schema-1 reader ignores an unknown
+`variant` key and selects the default artifact for its `(os, arch)`; a manifest whose artifacts all
+omit `variant` is byte-identical to a pre-variant manifest, so its signature is unchanged. A beacon
+that understands variants selects among the artifacts for its `(os, arch)` by host loadability
+(§9.8), preferring the default — see §9.8.
 
 ### 5.4 Signed bytes — the signer canonicalizes, the verifier checks the RECEIVED slice
 
@@ -575,7 +590,9 @@ the first failure:
 6. **Per artifact, before install:** stream the bytes from `artifact.url` into a staging file,
    hashing incrementally, and require the SHA-256 equals `artifact.sha256` (lowercase-hex
    compare). On mismatch → reject that artifact and MUST NOT install it (and remove the staged
-   bytes). This is **verify-then-install**, never install-then-verify. The download is bounded by
+   bytes). EVERY artifact for the host's `(os, arch)` is staged, including all build variants
+   (§5.3) — the beacon selects which variant to install at §9.9. This is **verify-then-install**,
+   never install-then-verify. The download is bounded by
    a hard size cap of `min(4 × artifact.size, 2 GiB)`: a stream exceeding the cap is rejected
    before the disk can be filled (a disk-fill DoS guard against a hostile CDN). Because it streams
    with a fixed buffer, the beacon's memory does not grow with artifact size.
@@ -918,11 +935,10 @@ exposure is closed by NOT EXECUTING, not by waiting for a version floor (dig_eco
 
 ### 9.8 Host loadability (normative)
 
-A verified artifact is not necessarily a RUNNABLE artifact. The manifest offers exactly ONE artifact per
-`(component, os, arch)` (§5.2), and that one build may require shared libraries a given host does not
-provide — a desktop-linked build on a headless server requires GTK sonames that are simply absent.
-Installing it there replaces a working binary with one that terminates inside the dynamic linker before
-`main`, while every signature and digest check passes.
+A verified artifact is not necessarily a RUNNABLE artifact. A build may require shared libraries a given
+host does not provide — a desktop-linked build on a headless server requires GTK sonames that are simply
+absent. Installing it there replaces a working binary with one that terminates inside the dynamic linker
+before `main`, while every signature and digest check passes.
 
 The broker MUST therefore establish, for each actionable component, whether THIS host can load the
 artifact, and MUST do so:
@@ -981,6 +997,29 @@ an operator to ignore the beacon's status and stall the channel. The requirement
 instead — the component's `refused` result line, the pass report's refusal list, and the
 `refused_components` mirror in `status.json` (§13.2). This check can only ever make the beacon install
 LESS than it otherwise would; it never relaxes a signature, digest or floor check.
+
+### 9.9 Build-variant selection (normative)
+
+When a component publishes more than one `variant` for the host's `(os, arch)` (§5.3), the manifest
+carries several artifacts for that platform and the beacon selects which one to install by the §9.8
+loadability of each. Every candidate is staged and digest-verified (§8.3) against ITS OWN digest before
+it is inspected; the hashed-is-installed invariant holds for whichever variant is chosen. The selection
+rule, evaluated over the artifacts for the host's `(os, arch)` in manifest order (the feed MUST list the
+DEFAULT, `variant`-absent, artifact FIRST):
+
+1. the first **loadable** variant is installed — default-first ordering makes it the most-preferred
+   loadable build;
+2. if no variant is loadable, the first **indeterminate** variant is installed (the §9.8 fail-open case,
+   preserving native-package/musl/non-ELF behaviour);
+3. only if EVERY variant is **unloadable** is the component REFUSED (§9.8), the refusal naming each
+   variant's cause.
+
+A component with a single artifact for the platform reduces to §9.8 exactly. The post-install health gate
+of a digest-evidenced component (§9.7) re-hashes the destination against the SELECTED variant's digest,
+and the enumeration that decides Install/Update/Skip treats the host as CURRENT when its bytes match ANY
+variant's digest — a host running the headless build is up to date, not perpetually re-installed. A
+headless host whose default build is unloadable but whose headless build loads therefore INSTALLS the
+headless build; it is NOT refused.
 
 ---
 
@@ -1067,6 +1106,14 @@ executable renamed `dig-node.msi`) and its OS installer rejects it (`msiexec` ex
   `{prefix}-{version}-{os}-{arch}.msi`; macOS `{prefix}-{version}-macos.pkg` (ONE universal package,
   no arch token — both macOS arches resolve to it); Linux `{prefix}_{version}_amd64.deb` (the Debian
   convention — underscores, `amd64`, no `linux` token, e.g. `dig-node_0.31.1_amd64.deb`).
+
+A component MAY also declare build **variants** (§5.3) in `feed-config.json` as
+`variants: [{ suffix, variant }]`. For each declared variant the signer additionally selects the
+asset named `{default-asset-name}{suffix}` (e.g. `dig-app-3.5.0-linux-x64-headless` for a `-headless`
+suffix) and emits an EXTRA manifest artifact carrying `variant`. The default artifact (no `variant`)
+is emitted FIRST, so the beacon's §9.9 selection prefers it. A declared variant absent from a release
+is simply skipped (not an error); a component that declares no variants is unchanged. The alpha config
+declares one variant: dig-app's `headless` Linux build.
 
 Both channels track the SAME component set with the SAME asset kinds — only the release each
 resolves differs. Sibling `.tar.gz`/companion assets are excluded by requiring an EXACT

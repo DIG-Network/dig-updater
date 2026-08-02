@@ -548,3 +548,21 @@ one and it still fails on the next:
   PRESENT, so a rollback re-records the REINSTATED build — a high-water mark would remember the build that
   was rolled away and skip the install that restores the host.
 
+
+## Build variants — the beacon selects the loadable build (#1912)
+
+- The signed manifest keys artifacts by `(os, arch, variant)`, where `variant` is an OPTIONAL string
+  (schema 2, additive). The DEFAULT build omits it (`None`); an alternative build a host may need
+  instead — dig-app's `headless` Linux build, which does not link GTK — carries a token. A pre-variant
+  manifest is byte-identical (`skip_serializing_if = "Option::is_none"`), so its signature is unchanged,
+  and verification is still over the RECEIVED bytes, so an old reader ignores the key.
+- The gap #1912 closed: #1870's loadability check correctly but PERMANENTLY refused dig-app on a
+  headless host, because the feed offered exactly one `(os, arch)` build and it linked GTK. The fix reuses
+  the SAME ELF check as a SELECTOR, not just a veto: the worker stages EVERY variant for the platform, and
+  the broker installs the first LOADABLE one (default-first), falling back to indeterminate, refusing only
+  if EVERY variant is unloadable.
+- Two subtle correctness points a naive "add a field" would miss: (1) the digest-evidence ENUMERATION for
+  dig-app must treat the host as current when its bytes match ANY variant's digest, or a headless host is
+  reinstalled every pass; (2) the post-install health gate must re-hash against the SELECTED variant's
+  digest, not the default's. Both are threaded through `PlannedComponent.variants` (default-first) + the
+  selected digest returned from `select_loadable_variant`.

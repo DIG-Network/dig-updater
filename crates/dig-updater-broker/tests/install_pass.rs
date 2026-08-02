@@ -2262,6 +2262,74 @@ fn a_gui_host_installs_the_default_tray_build_when_both_variants_load() {
     );
 }
 
+#[test]
+fn a_component_whose_every_variant_is_unloadable_is_refused() {
+    // The refusal is still correct when NO variant loads (dig_ecosystem#1912): a host that can load
+    // neither the default nor the headless build must be refused, its working binary left in place —
+    // exactly the #1870 guarantee, now over the whole variant set rather than a single artifact.
+    // Refuse BOTH dig-app builds (read the private copy to recognise them) while the digstore control
+    // still loads — so the refused list is exactly dig-app, not an artefact of refusing everything.
+    let no_dig_app_variant_loads = |p: &Path| match std::fs::read(p).unwrap_or_default().as_slice()
+    {
+        b if b == DEFAULT_DIG_APP_BYTES || b == HEADLESS_DIG_APP_BYTES => Loadability::Unloadable {
+            missing: vec!["libc.so.6".to_string()],
+        },
+        _ => Loadability::Loadable,
+    };
+    let (report, _home, dig_app_dest) = apply_two_variant_pass(&no_dig_app_variant_loads);
+
+    let dig_app = report
+        .components
+        .iter()
+        .find(|c| c.component == "dig-app")
+        .expect("dig-app is reported");
+    assert_eq!(dig_app.result, ComponentResult::Refused);
+    assert_eq!(report.refused, vec!["dig-app".to_string()]);
+    assert_eq!(
+        std::fs::read(&dig_app_dest).unwrap(),
+        OLD_DIG_APP_BYTES,
+        "with no loadable variant, the working build is left byte-untouched"
+    );
+}
+
+#[test]
+fn an_indeterminate_variant_is_installed_when_no_variant_is_loadable() {
+    // The fail-open fallback across variants: the default is unloadable but the headless one is
+    // INDETERMINATE (its loadability could not be established — a non-ELF/musl-shaped answer). Since
+    // not every variant is a refusal, the indeterminate one is installed rather than the component
+    // being refused — preserving the §9.8 fail-open behaviour at the variant level.
+    let default_unloadable_headless_indeterminate =
+        |p: &Path| match std::fs::read(p).unwrap_or_default().as_slice() {
+            b if b == DEFAULT_DIG_APP_BYTES => Loadability::Unloadable {
+                missing: vec!["libgtk-3.so.0".to_string()],
+            },
+            b if b == HEADLESS_DIG_APP_BYTES => Loadability::Indeterminate {
+                why: "not an ELF image".to_string(),
+            },
+            _ => Loadability::Loadable,
+        };
+    let (report, _home, dig_app_dest) =
+        apply_two_variant_pass(&default_unloadable_headless_indeterminate);
+
+    let dig_app = report
+        .components
+        .iter()
+        .find(|c| c.component == "dig-app")
+        .expect("dig-app is reported");
+    assert_eq!(
+        dig_app.result,
+        ComponentResult::Installed,
+        "an indeterminate variant is installed rather than refused: {}",
+        dig_app.detail
+    );
+    assert!(!report.has_refusals());
+    assert_eq!(
+        std::fs::read(&dig_app_dest).unwrap(),
+        HEADLESS_DIG_APP_BYTES,
+        "the indeterminate headless build is what landed"
+    );
+}
+
 // ============ dig_ecosystem#1858 — what this beacon installed is remembered per component ============
 
 #[test]

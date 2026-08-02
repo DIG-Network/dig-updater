@@ -1010,6 +1010,7 @@ mod tests {
                 build: 26,
                 os: "linux".into(),
                 arch: "x64".into(),
+                variant: None,
                 sha256: "ab".into(),
                 size: 10,
                 staged_path: "/tmp/staging/dig-node".into(),
