@@ -1256,6 +1256,92 @@ mod tests {
         assert_eq!(plan.components[0].installed_build, None);
     }
 
+    /// The digest of the DEFAULT dig-app build in these fixtures, and the digest of the HEADLESS one
+    /// — genuinely different, so a match on one is not a match on the other.
+    const DEFAULT_DIGEST: &str = "deadbeef";
+    const HEADLESS_DIGEST: &str = "feedface";
+
+    /// A dig-app manifest carrying BOTH linux/x64 builds — the default and the headless variant.
+    fn manifest_dig_app_two_variants() -> Manifest {
+        let mut m = manifest_one("dig-app", "3.5.0", 3_005_000, DEFAULT_DIGEST);
+        m.components[0].artifacts.push(Artifact {
+            os: "linux".into(),
+            arch: "x64".into(),
+            url: "https://x/headless".into(),
+            sha256: HEADLESS_DIGEST.into(),
+            size: 1,
+            variant: Some("headless".into()),
+        });
+        m
+    }
+
+    #[test]
+    fn a_multi_variant_component_plans_all_variants_default_first() {
+        // dig_ecosystem#1912: both linux/x64 builds must reach the applier as PlannedVariants, the
+        // default first (so selection prefers it), each carrying its OWN digest + staged path.
+        let m = manifest_dig_app_two_variants();
+        let plan = Plan::build(
+            &m,
+            &[
+                staged("dig-app", "/staging/dig-app"),
+                staged_variant("dig-app", "headless", HEADLESS_DIGEST, "/staging/dig-app-headless"),
+            ],
+            &catalog_with_dig_app(),
+            &platform(),
+            &|path| panic!("the planner executed {} for a version", path.display()),
+            // The host has NEITHER build installed, so the component is a fresh Install.
+            &digest_reader(None),
+            &nothing_recorded(),
+        )
+        .unwrap();
+
+        let dig_app = &plan.components[0];
+        assert_eq!(dig_app.variants.len(), 2, "both builds are planned");
+        assert_eq!(dig_app.variants[0].variant, None, "the default is first");
+        assert_eq!(dig_app.variants[0].expected_digest, DEFAULT_DIGEST);
+        assert_eq!(dig_app.variants[0].staged_path, PathBuf::from("/staging/dig-app"));
+        assert_eq!(dig_app.variants[1].variant.as_deref(), Some("headless"));
+        assert_eq!(dig_app.variants[1].expected_digest, HEADLESS_DIGEST);
+        assert_eq!(
+            dig_app.variants[1].staged_path,
+            PathBuf::from("/staging/dig-app-headless")
+        );
+        assert_eq!(dig_app.action, UpdateAction::Install);
+    }
+
+    #[test]
+    fn a_host_running_the_headless_build_is_current_not_reinstalled_every_pass() {
+        // The digest-evidence enumeration must recognise the host as CURRENT when its bytes hash to
+        // ANY variant's digest — here the HEADLESS one (dig_ecosystem#1912). Keying only on the
+        // default digest would report the headless host as an Update and reinstall it on every pass —
+        // the "success" that is really a churn loop. The reader returns the headless digest, which is
+        // NOT the default, so a default-only comparison would fail this.
+        let m = manifest_dig_app_two_variants();
+        let plan = Plan::build(
+            &m,
+            &[
+                staged("dig-app", "/staging/dig-app"),
+                staged_variant("dig-app", "headless", HEADLESS_DIGEST, "/staging/dig-app-headless"),
+            ],
+            &catalog_with_dig_app(),
+            &platform(),
+            &|path| panic!("the planner executed {} for a version", path.display()),
+            &digest_reader(Some(HEADLESS_DIGEST)),
+            &nothing_recorded(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.components[0].action,
+            UpdateAction::Skip,
+            "a host whose bytes hash to the headless variant is on the current build"
+        );
+        assert_eq!(
+            plan.components[0].installed_build,
+            Some(3_005_000),
+            "and the install is aged on the same scale"
+        );
+    }
+
     #[test]
     fn a_digest_evidenced_component_that_claims_aliases_is_held_fail_closed() {
         // Content-digest evidence says nothing about an ALIAS: an alias is not named in the manifest,

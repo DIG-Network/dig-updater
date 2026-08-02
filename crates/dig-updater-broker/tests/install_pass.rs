@@ -2003,6 +2003,265 @@ fn a_loadable_or_indeterminate_artifact_installs_exactly_as_before() {
     }
 }
 
+// =========== dig_ecosystem#1912 — the beacon installs the build VARIANT this host can LOAD ===========
+
+/// A dig-app manifest carrying BOTH linux/x64 builds — the default (GTK-linked) and the `headless`
+/// one — beside a digstore control, all for THIS host's platform so the worker really stages them.
+fn manifest_dig_app_two_variants(
+    base: &str,
+    digstore_bytes: &[u8],
+    default_bytes: &[u8],
+    headless_bytes: &[u8],
+) -> Manifest {
+    let p = Platform::current();
+    Manifest {
+        components: vec![
+            Component {
+                name: "digstore".into(),
+                version: "0.2.0".into(),
+                build: 2_000,
+                artifacts: vec![Artifact {
+                    os: p.os.clone(),
+                    arch: p.arch.clone(),
+                    url: format!("{base}/digstore"),
+                    sha256: hex(&Sha256::digest(digstore_bytes)),
+                    size: digstore_bytes.len() as u64,
+                    variant: None,
+                }],
+            },
+            Component {
+                name: "dig-app".into(),
+                version: "3.5.0".into(),
+                build: 3_005_000,
+                artifacts: vec![
+                    Artifact {
+                        os: p.os.clone(),
+                        arch: p.arch.clone(),
+                        url: format!("{base}/dig-app-default"),
+                        sha256: hex(&Sha256::digest(default_bytes)),
+                        size: default_bytes.len() as u64,
+                        variant: None,
+                    },
+                    Artifact {
+                        os: p.os,
+                        arch: p.arch,
+                        url: format!("{base}/dig-app-headless"),
+                        sha256: hex(&Sha256::digest(headless_bytes)),
+                        size: headless_bytes.len() as u64,
+                        variant: Some("headless".into()),
+                    },
+                ],
+            },
+        ],
+        ..manifest(base, "0.2.0", 2_000, 0, digstore_bytes)
+    }
+}
+
+/// The signed feed for a two-variant dig-app pass: the delegation + manifest, and the THREE artifact
+/// bodies (digstore, dig-app default, dig-app headless) at distinct routes.
+fn routes_two_variants(
+    manifest: &Manifest,
+    digstore_bytes: &[u8],
+    default_bytes: &[u8],
+    headless_bytes: &[u8],
+) -> HashMap<String, Vec<u8>> {
+    let delegation = SignedDelegation::sign(
+        Delegation {
+            root_version: 1,
+            targets_pubkey: b64(&test_targets().verifying_key().to_bytes()),
+            expires: FAR_FUTURE,
+        },
+        &test_root(),
+    );
+    let signed = SignedManifest::sign(manifest.clone(), &test_targets());
+    HashMap::from([
+        (
+            "/delegation.json".to_string(),
+            delegation.to_json().into_bytes(),
+        ),
+        ("/manifest.json".to_string(), signed.to_json().into_bytes()),
+        ("/digstore".to_string(), digstore_bytes.to_vec()),
+        ("/dig-app-default".to_string(), default_bytes.to_vec()),
+        ("/dig-app-headless".to_string(), headless_bytes.to_vec()),
+    ])
+}
+
+/// The bytes of each build. They are DISTINCT so a loadability check that reads the private copy can
+/// tell which variant it is looking at — exactly as the production ELF check reads the real bytes —
+/// and so the final on-disk assertion proves WHICH build landed.
+const DEFAULT_DIG_APP_BYTES: &[u8] = b"dig-app-3.5.0-GTK-linked-default-tray-build";
+const HEADLESS_DIG_APP_BYTES: &[u8] = b"dig-app-3.5.0-headless-no-gtk-server-build";
+const DIGSTORE_BYTES: &[u8] = b"the-new-digstore-0.2.0-binary";
+/// What dig-app is running BEFORE the pass — neither variant's bytes, so enumeration plans an Update.
+const OLD_DIG_APP_BYTES: &[u8] = b"the-old-dig-app-3.4.0-binary";
+
+/// Run a real two-variant dig-app pass with `loadability` INJECTED (it reads the private copy to
+/// decide, like production), and return the pass report plus dig-app's destination path so the caller
+/// can assert which build's bytes landed.
+fn apply_two_variant_pass(
+    loadability: &dyn Fn(&Path) -> Loadability,
+) -> (PassReport, tempfile::TempDir, std::path::PathBuf) {
+    let home = tempfile::tempdir().unwrap();
+    let digstore_dest = home.path().join("bin").join("digstore");
+    let dig_app_dest = home.path().join("bin").join("dig-app");
+
+    let srv = Server::bind();
+    let m = manifest_dig_app_two_variants(
+        &srv.base,
+        DIGSTORE_BYTES,
+        DEFAULT_DIG_APP_BYTES,
+        HEADLESS_DIG_APP_BYTES,
+    );
+    let guard = srv.serve(routes_two_variants(
+        &m,
+        DIGSTORE_BYTES,
+        DEFAULT_DIG_APP_BYTES,
+        HEADLESS_DIG_APP_BYTES,
+    ));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    // dig-app is really on disk with OLD bytes, so enumeration plans an Update (its hash matches
+    // neither variant) and the final byte assertion is against a file that genuinely changed.
+    std::fs::create_dir_all(dig_app_dest.parent().unwrap()).unwrap();
+    std::fs::write(&dig_app_dest, OLD_DIG_APP_BYTES).unwrap();
+
+    let store = TrustStateStore::for_channel(home.path(), Channel::Stable);
+    let loaded = store.load().expect("load state");
+    let lkg = LkgCache::at(home.path().join("lkg"));
+    let apply_dir = home.path().join("apply");
+    std::fs::create_dir_all(&apply_dir).unwrap();
+    let catalog = Catalog::new(vec![
+        ComponentTarget {
+            name: "digstore".into(),
+            method: InstallMethod::RawBinary,
+            dest: digstore_dest,
+            aliases: vec![],
+            service: None,
+            evidence: VersionEvidence::SafeToProbe,
+        },
+        ComponentTarget {
+            name: "dig-app".into(),
+            method: InstallMethod::RawBinary,
+            dest: dig_app_dest.clone(),
+            aliases: vec![],
+            service: None,
+            // dig-app's shipped class: never executed, its build established by hashing — which is
+            // why the health gate must re-hash against the SELECTED variant's digest (#1912).
+            evidence: VersionEvidence::ArtifactDigest,
+        },
+    ]);
+    // dig-app is never executed; digstore answers honestly (stale, then current after its install).
+    let detect = |p: &Path| {
+        assert!(!p.ends_with("dig-app"), "dig-app must never be executed");
+        DetectedVersion::Present("digstore 0.1.0".to_string())
+    };
+    let health = |p: &Path| {
+        assert!(!p.ends_with("dig-app"), "dig-app must never be executed");
+        DetectedVersion::Present("digstore 0.2.0".to_string())
+    };
+    let platform = Platform::current();
+    let installer = Installer {
+        store: &store,
+        loadability,
+        installed_builds: &records_beside(&store),
+        catalog: &catalog,
+        platform: &platform,
+        lkg: &lkg,
+        staging_dir: &home.path().join("staging"),
+        apply_dir: &apply_dir,
+        retry: RetryPolicy {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        },
+        now: NOW,
+        detect: &detect,
+        health: &health,
+        // The REAL digest reader: enumeration hashes the OLD bytes (→ Update) and the health gate
+        // re-hashes what actually landed against the selected variant's digest — so the pass can only
+        // go green because the promised variant's bytes really are at the destination.
+        digest: &dig_updater_broker::installed_digest_hex,
+        service_ctl: &|_, _| Ok(()),
+        suppress_state_advance: false,
+    };
+    let report = installer
+        .apply(&test_root().verifying_key(), &report, loaded)
+        .expect("the pass completes");
+    // Keep the server alive until the pass has fetched everything.
+    drop(guard);
+    (report, home, dig_app_dest)
+}
+
+/// A host that can load ONLY the headless build: it reads the private copy and refuses the default
+/// (GTK) bytes while accepting the headless bytes. Anything else (the digstore control) loads.
+fn only_headless_loads(p: &Path) -> Loadability {
+    match std::fs::read(p).unwrap_or_default().as_slice() {
+        b if b == DEFAULT_DIG_APP_BYTES => Loadability::Unloadable {
+            missing: vec!["libgtk-3.so.0".to_string()],
+        },
+        _ => Loadability::Loadable,
+    }
+}
+
+#[test]
+fn a_headless_host_installs_the_headless_variant_instead_of_refusing() {
+    // THE #1912 acceptance test: on a host that cannot load the default GTK build, the pass must NOT
+    // refuse dig-app (the pre-#1912 behaviour that left a headless host permanently stuck) — it must
+    // select and INSTALL the headless build, whose bytes the host CAN load. The loadability check
+    // reads the private copy, so it distinguishes the two variants exactly as the real ELF check does.
+    let (report, _home, dig_app_dest) = apply_two_variant_pass(&only_headless_loads);
+
+    let dig_app = report
+        .components
+        .iter()
+        .find(|c| c.component == "dig-app")
+        .expect("dig-app is reported");
+    assert_eq!(
+        dig_app.result,
+        ComponentResult::Installed,
+        "the headless build IS installed — not refused: {}",
+        dig_app.detail
+    );
+    assert!(
+        !report.has_refusals(),
+        "nothing is refused when a loadable variant exists: {:?}",
+        report.refused
+    );
+    // The DECISIVE witness: the bytes on disk are the HEADLESS build, not the default and not the old
+    // build. A selector that picked the default would have refused it; one that ignored variants would
+    // have installed the default.
+    assert_eq!(
+        std::fs::read(&dig_app_dest).unwrap(),
+        HEADLESS_DIG_APP_BYTES,
+        "the headless variant's bytes are what landed"
+    );
+}
+
+#[test]
+fn a_gui_host_installs_the_default_tray_build_when_both_variants_load() {
+    // The other direction: on a host that can load BOTH builds, the selector prefers the DEFAULT
+    // (desktop/tray) build — the default is listed first and preferred. This is what keeps an
+    // ordinary desktop from being handed the headless server build.
+    let both_load = |_: &Path| Loadability::Loadable;
+    let (report, _home, dig_app_dest) = apply_two_variant_pass(&both_load);
+
+    let dig_app = report
+        .components
+        .iter()
+        .find(|c| c.component == "dig-app")
+        .expect("dig-app is reported");
+    assert_eq!(
+        dig_app.result,
+        ComponentResult::Installed,
+        "{}",
+        dig_app.detail
+    );
+    assert_eq!(
+        std::fs::read(&dig_app_dest).unwrap(),
+        DEFAULT_DIG_APP_BYTES,
+        "with both loadable, the default tray build is preferred — never the headless one"
+    );
+}
+
 // ============ dig_ecosystem#1858 — what this beacon installed is remembered per component ============
 
 #[test]
