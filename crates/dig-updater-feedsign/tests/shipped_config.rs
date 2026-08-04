@@ -225,8 +225,12 @@ fn this_repos_build_produces_exactly_the_asset_names_its_declared_kind_expects()
         "the build workflow declares no platforms"
     );
 
-    let mut wanted =
-        dig_updater_feedsign::expected_asset_names(&me.asset_prefix, version, me.asset_kind);
+    let mut wanted = dig_updater_feedsign::expected_asset_names(
+        &me.asset_prefix,
+        version,
+        me.asset_kind,
+        &me.variants,
+    );
     wanted.sort();
 
     assert_eq!(

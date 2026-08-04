@@ -355,11 +355,27 @@ fn both_channels_build_from_the_one_reusable_build_workflow() {
         "the stable channel must build via the same shared `{BUILD}` — if either channel forks its \
          own build, the two asset sets drift apart unnoticed (dig_ecosystem#618)"
     );
-    assert!(
-        !nightly.contains("cargo build"),
-        "the nightly channel must not compile anything itself — a private build step is exactly how \
-         a channel's asset set drifts from the shared one"
-    );
+    // Stated over the CLASS, not one spelling: `cargo build` was the obvious way to fork a private
+    // build, but `cross build`, `cargo install --path`, a `make` shim or a native-packaging tool are
+    // the same defect. Any compile/package invocation here means a channel produces its own assets.
+    for compiler in [
+        "cargo build",
+        "cargo install",
+        "cargo zigbuild",
+        "cross build",
+        "make ",
+        "npm run build",
+        "dpkg-deb",
+        "pkgbuild",
+        "productbuild",
+        "candle",
+        "wix ",
+    ] {
+        assert!(
+            !nightly.contains(compiler),
+            "nightly-release.yml invokes `{compiler}` — a channel must not compile or package              anything itself; that is exactly how its asset set drifts from the shared build              (dig_ecosystem#618). Add the step to build-binaries.yml instead."
+        );
+    }
 }
 
 #[test]
