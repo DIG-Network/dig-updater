@@ -1117,7 +1117,13 @@ declares one variant: dig-app's `headless` Linux build.
 
 Both channels track the SAME component set with the SAME asset kinds — only the release each
 resolves differs. Sibling `.tar.gz`/companion assets are excluded by requiring an EXACT
-asset-name match. The alpha component set is **dig-node (native package), digstore, dig-updater,
+asset-name match. Resolving ZERO artifacts for a component MUST fail the signing run closed, and the
+failure MUST enumerate every asset FILE NAME that was searched for — each platform's default name
+for the component's declared `asset_kind`, plus each declared variant's `{default}{suffix}` name —
+so the diagnostic can never describe a shape the selector did not use, nor omit one it did. The
+nightly version-RECOVERY step searches only the default names (a variant suffix would corrupt the
+recovered version), and its failure reports only those. The
+alpha component set is **dig-node (native package), digstore, dig-updater,
 dig-dns, dig-app (raw binaries)** — dig-app is PUBLISHED in the feed but not yet tracked by the
 broker's catalog (§9.7), and a manifest entry for an untracked component is inert; each component's `asset_kind` comes from the committed `feed-config.json`
 (default kind `raw_binary`). The anti-rollback floor is **per channel** (`channels.stable`,

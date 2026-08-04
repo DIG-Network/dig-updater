@@ -179,3 +179,64 @@ fn every_shipped_component_is_fully_specified() {
         assert!(!c.asset_prefix.is_empty(), "{} has no asset prefix", c.name);
     }
 }
+
+/// The reusable cross-OS build every channel of THIS repo calls (`build-binaries.yml`).
+fn build_workflow() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/build-binaries.yml"
+    );
+    std::fs::read_to_string(path).expect("the shared build workflow is readable")
+}
+
+#[test]
+fn this_repos_build_produces_exactly_the_asset_names_its_declared_kind_expects() {
+    // dig_ecosystem#618: dig-node's nightly published raw binaries while the feed, per its
+    // `native_package` kind, looked for `.msi`/`.pkg`/`.deb` — so the feed job failed every night for
+    // three weeks. dig-updater is the REFERENCE nightlies implementation that repo copied, so the
+    // reference itself must hold the invariant the copy broke: the asset names this repo's build
+    // STAGES are exactly the names the feed LOOKS FOR for this repo's own component.
+    //
+    // The staged name is `{bin}-{version}-{matrix.out_name}`, so each `out_name` is the whole tail
+    // after the version — which is what makes the comparison below meaningful rather than incidental.
+    let wf = build_workflow();
+    assert!(
+        wf.contains(r#"cp "$SRC" "dist/${bin}-${VER}-${{ matrix.out_name }}""#),
+        "the build stages assets as `{{bin}}-{{version}}-{{out_name}}`; this guard's derivation \
+         assumes that shape, so a change to it must update the guard too"
+    );
+
+    let cfg = shipped_config();
+    let me = cfg
+        .components
+        .iter()
+        .find(|c| c.repo == "DIG-Network/dig-updater")
+        .expect("the feed tracks this repo's own component");
+
+    let version = "9.9.9";
+    let mut built: Vec<String> = wf
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("out_name: "))
+        .map(|out_name| format!("{}-{version}-{out_name}", me.asset_prefix))
+        .collect();
+    built.sort();
+    assert!(
+        !built.is_empty(),
+        "the build workflow declares no platforms"
+    );
+
+    let mut wanted = dig_updater_feedsign::expected_asset_names(
+        &me.asset_prefix,
+        version,
+        me.asset_kind,
+        &me.variants,
+    );
+    wanted.sort();
+
+    assert_eq!(
+        built, wanted,
+        "this repo's build output and its declared `asset_kind` ({:?}) have drifted: the feed would \
+         resolve zero artifacts for {}",
+        me.asset_kind, me.name
+    );
+}

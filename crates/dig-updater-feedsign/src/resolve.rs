@@ -11,7 +11,7 @@
 
 use serde::Deserialize;
 
-use crate::config::{AssetKind, ComponentConfig};
+use crate::config::{AssetKind, ComponentConfig, VariantSpec};
 use crate::error::FeedsignError;
 
 /// The `(os, arch)` platforms the beacon ships to, matching the manifest's `artifact.os`/
@@ -68,6 +68,65 @@ fn expected_asset_name(
 ) -> String {
     let (head, tail) = asset_name_parts(prefix, os, arch, kind);
     format!("{head}{version}{tail}")
+}
+
+/// Every DISTINCT asset file name a component of `kind` publishes at `version`, in [`PLATFORMS`]
+/// order — i.e. exactly the set [`select_artifacts`] matches against, and therefore the honest
+/// answer to "what did the feed look for?".
+///
+/// Derived from the matcher itself rather than described by hand, so a diagnostic can never claim a
+/// shape the selector does not use: for three weeks the `NoArtifacts` error named the RAW-BINARY
+/// shape for a `native_package` component, and triage concluded the assets were misnamed when they
+/// were simply absent (dig_ecosystem#618).
+///
+/// Each platform contributes its DEFAULT asset name followed by one name per declared `variant`
+/// (`{default}{suffix}`) — both families, in the order [`select_artifacts`] tries them, so a
+/// component that declares a variant never has that half of its search silently omitted.
+///
+/// Duplicates are collapsed: both macOS arches resolve to ONE universal `.pkg`, and listing it twice
+/// would read as two distinct missing assets.
+#[must_use]
+pub fn expected_asset_names(
+    prefix: &str,
+    version: &str,
+    kind: AssetKind,
+    variants: &[VariantSpec],
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::with_capacity(PLATFORMS.len() * (1 + variants.len()));
+    let mut push_unique = |name: String| {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    for (os, arch) in PLATFORMS {
+        let default = expected_asset_name(prefix, version, os, arch, kind);
+        push_unique(default.clone());
+        for spec in variants {
+            push_unique(format!("{default}{}", spec.suffix));
+        }
+    }
+    names
+}
+
+/// The `expected` field of a [`FeedsignError::NoArtifacts`]: the asset names that were searched for,
+/// joined for a one-line error. `version` is the resolved version, or the literal `<version>`
+/// placeholder on the nightly path where the version is what could not be recovered.
+///
+/// `variants` is the component's declared variant list at a site that searches variant names too,
+/// and empty at one that does not — the two sites genuinely differ (see
+/// [`resolve_version_from_assets`]), and a diagnostic must describe the search its OWN site ran.
+fn no_artifacts_expected(
+    component: &ComponentConfig,
+    version: &str,
+    variants: &[VariantSpec],
+) -> String {
+    expected_asset_names(
+        &component.asset_prefix,
+        version,
+        component.asset_kind,
+        variants,
+    )
+    .join(" | ")
 }
 
 /// A GitHub release, minimally deserialized: just its tag and assets.
@@ -186,7 +245,7 @@ pub fn select_artifacts(
     if artifacts.is_empty() {
         return Err(FeedsignError::NoArtifacts {
             component: component.name.clone(),
-            expected: format!("{}-{version}-<platform>", component.asset_prefix),
+            expected: no_artifacts_expected(component, version, &component.variants),
         });
     }
     Ok(artifacts)
@@ -226,7 +285,7 @@ pub fn resolve_version_from_assets(
     }
     Err(FeedsignError::NoArtifacts {
         component: component.name.clone(),
-        expected: format!("{}-<version>-<platform>", component.asset_prefix),
+        expected: no_artifacts_expected(component, "<version>", &[]),
     })
 }
 
@@ -633,6 +692,184 @@ mod tests {
             resolve_version_from_assets(&release, &component()),
             Err(FeedsignError::NoArtifacts { .. })
         ));
+    }
+
+    /// The dig-node NIGHTLY release exactly as it stood for the three weeks the feed job failed
+    /// (dig_ecosystem#618): the raw per-OS binaries were published, the native installer packages
+    /// were NOT. The component is configured `native_package`, so nothing matched — and the error
+    /// must say which PACKAGE names it looked for, not the raw-binary shape (which was present all
+    /// along, and whose mention sent triage down a "the assets are misnamed" dead end).
+    fn dig_node_nightly_missing_its_packages() -> GithubRelease {
+        GithubRelease {
+            tag_name: "nightly".into(),
+            assets: vec![
+                asset("dig-node-0.31.1-linux-x64"),
+                asset("dig-node-0.31.1-macos-arm64"),
+                asset("dig-node-0.31.1-windows-x64.exe"),
+            ],
+        }
+    }
+
+    #[test]
+    fn no_artifacts_names_the_native_package_shapes_it_actually_looked_for() {
+        let Err(FeedsignError::NoArtifacts { expected, .. }) = select_artifacts(
+            &dig_node_nightly_missing_its_packages(),
+            &native_package_component(),
+            "0.31.1",
+        ) else {
+            panic!("a native-package component with no packages must fail closed");
+        };
+        for name in [
+            "dig-node-0.31.1-windows-x64.msi",
+            "dig-node-0.31.1-macos.pkg",
+            "dig-node_0.31.1_amd64.deb",
+        ] {
+            assert!(
+                expected.contains(name),
+                "the error must name {name}, got: {expected}"
+            );
+        }
+        assert!(
+            !expected.contains("<platform>") && !expected.contains("dig-node-0.31.1-linux-x64"),
+            "the error must not describe the raw-binary shape it never looked for: {expected}"
+        );
+    }
+
+    #[test]
+    fn no_artifacts_for_a_raw_binary_component_names_the_binary_shapes() {
+        // The control: the same derivation must describe a RAW-BINARY component in its own terms,
+        // never a package name — so the message tracks the component's kind, not one hardcoded shape.
+        let release = GithubRelease {
+            tag_name: "v0.29.0".into(),
+            assets: vec![asset("some-unrelated-file.zip")],
+        };
+        let Err(FeedsignError::NoArtifacts { expected, .. }) =
+            select_artifacts(&release, &component(), "0.29.0")
+        else {
+            panic!("zero matching assets must fail closed");
+        };
+        assert!(
+            expected.contains("dig-node-0.29.0-linux-x64")
+                && expected.contains("dig-node-0.29.0-windows-x64.exe"),
+            "got: {expected}"
+        );
+        assert!(
+            !expected.contains(".msi") && !expected.contains(".deb") && !expected.contains(".pkg"),
+            "a raw-binary component must not be described with package names: {expected}"
+        );
+    }
+
+    #[test]
+    fn nightly_version_resolution_failure_names_the_shapes_for_the_components_kind() {
+        // The nightly path has no version to name yet, so it reports the same derived shapes with a
+        // `<version>` placeholder — still the component's OWN kind, still from the matcher.
+        let Err(FeedsignError::NoArtifacts { expected, .. }) = resolve_version_from_assets(
+            &GithubRelease {
+                tag_name: "nightly".into(),
+                assets: vec![asset("some-other-tool-1.0.0-linux-x64")],
+            },
+            &native_package_component(),
+        ) else {
+            panic!("no matching assets must fail closed");
+        };
+        assert!(
+            expected.contains("dig-node-<version>-windows-x64.msi")
+                && expected.contains("dig-node_<version>_amd64.deb")
+                && expected.contains("dig-node-<version>-macos.pkg"),
+            "got: {expected}"
+        );
+    }
+
+    #[test]
+    fn no_artifacts_also_names_a_declared_variants_asset_family() {
+        // select_artifacts searches TWO families per platform: the default name AND, per declared
+        // variant, `{default}{suffix}`. dig-app really declares `-headless` (feed-config.json), so a
+        // zero-artifact dig-app failure that named only the default family would under-describe its
+        // own search — the exact defect this whole change exists to remove.
+        //
+        // The fixture keeps a truthful control: the release carries a NEARLY-matching headless asset
+        // for the wrong version, so an implementation that echoed found-but-unmatched asset names
+        // rather than deriving the expected ones would not pass.
+        let release = GithubRelease {
+            tag_name: "v3.5.0".into(),
+            assets: vec![asset("dig-app-3.4.0-linux-x64-headless")],
+        };
+        let Err(FeedsignError::NoArtifacts { expected, .. }) =
+            select_artifacts(&release, &dig_app_with_headless(), "3.5.0")
+        else {
+            panic!("zero matching assets must fail closed");
+        };
+        assert!(
+            expected.contains("dig-app-3.5.0-linux-x64-headless"),
+            "the error must name the declared variant's asset too, got: {expected}"
+        );
+        assert!(
+            expected.contains("dig-app-3.5.0-linux-x64"),
+            "…without losing the default family, got: {expected}"
+        );
+    }
+
+    #[test]
+    fn the_default_asset_of_each_platform_is_named_before_its_variants() {
+        // Same order select_artifacts tries them, so the message reads as the search it describes.
+        let names = expected_asset_names(
+            "dig-app",
+            "3.5.0",
+            AssetKind::RawBinary,
+            &dig_app_with_headless().variants,
+        );
+        assert_eq!(
+            names,
+            vec![
+                "dig-app-3.5.0-linux-x64",
+                "dig-app-3.5.0-linux-x64-headless",
+                "dig-app-3.5.0-macos-arm64",
+                "dig-app-3.5.0-macos-arm64-headless",
+                "dig-app-3.5.0-macos-x64",
+                "dig-app-3.5.0-macos-x64-headless",
+                "dig-app-3.5.0-windows-x64.exe",
+                "dig-app-3.5.0-windows-x64.exe-headless",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_nightly_version_search_reports_only_the_default_family_it_searches() {
+        // Deliberate asymmetry, not an oversight: resolve_version_from_assets strips only the
+        // DEFAULT `{head}…{tail}` (a variant suffix would corrupt the recovered version), so its
+        // diagnostic must not claim to have looked for variant names.
+        let Err(FeedsignError::NoArtifacts { expected, .. }) = resolve_version_from_assets(
+            &GithubRelease {
+                tag_name: "nightly".into(),
+                assets: vec![asset("some-other-tool-1.0.0-linux-x64")],
+            },
+            &dig_app_with_headless(),
+        ) else {
+            panic!("no matching assets must fail closed");
+        };
+        assert!(
+            expected.contains("dig-app-<version>-linux-x64"),
+            "got: {expected}"
+        );
+        assert!(
+            !expected.contains("-headless"),
+            "this site never searches variant names, so it must not claim to: {expected}"
+        );
+    }
+
+    #[test]
+    fn expected_asset_names_are_deduplicated_in_platform_order() {
+        // Both macOS arches resolve to ONE universal `.pkg`, so the message lists it once — a
+        // duplicate would read as two distinct missing assets.
+        let names = expected_asset_names("dig-node", "0.31.1", AssetKind::NativePackage, &[]);
+        assert_eq!(
+            names,
+            vec![
+                "dig-node_0.31.1_amd64.deb",
+                "dig-node-0.31.1-macos.pkg",
+                "dig-node-0.31.1-windows-x64.msi",
+            ]
+        );
     }
 
     #[test]

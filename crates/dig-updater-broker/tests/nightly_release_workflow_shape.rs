@@ -330,6 +330,54 @@ fn schedule_cuts_only_nightlies_stable_is_manual_dispatch_only() {
     );
 }
 
+/// The STABLE release pipeline (`release.yml`), which the nightly channel must share a build with.
+fn stable_release() -> String {
+    workflow("release.yml")
+}
+
+#[test]
+fn both_channels_build_from_the_one_reusable_build_workflow() {
+    // dig_ecosystem#618: the signed feed selects each component's assets by its declared
+    // `asset_kind`, so a channel whose build produces a DIFFERENT asset set than the other silently
+    // publishes a release the feed cannot resolve — dig-node's nightly shipped only raw binaries
+    // while its `native_package` kind wanted `.msi`/`.pkg`/`.deb`, and the feed job failed nightly
+    // for three weeks. The reference shape that prevents it: ONE reusable build workflow defines the
+    // asset set, and BOTH channels call it — the nightly never grows a build of its own.
+    const BUILD: &str = "uses: ./.github/workflows/build-binaries.yml";
+    let nightly = nightly_release();
+    assert!(
+        nightly.contains(BUILD),
+        "the nightly channel must build via the shared `{BUILD}`, so its assets are the same set \
+         the stable release publishes (and the feed's declared asset kinds resolve on both channels)"
+    );
+    assert!(
+        stable_release().contains(BUILD),
+        "the stable channel must build via the same shared `{BUILD}` — if either channel forks its \
+         own build, the two asset sets drift apart unnoticed (dig_ecosystem#618)"
+    );
+    // Stated over the CLASS, not one spelling: `cargo build` was the obvious way to fork a private
+    // build, but `cross build`, `cargo install --path`, a `make` shim or a native-packaging tool are
+    // the same defect. Any compile/package invocation here means a channel produces its own assets.
+    for compiler in [
+        "cargo build",
+        "cargo install",
+        "cargo zigbuild",
+        "cross build",
+        "make ",
+        "npm run build",
+        "dpkg-deb",
+        "pkgbuild",
+        "productbuild",
+        "candle",
+        "wix ",
+    ] {
+        assert!(
+            !nightly.contains(compiler),
+            "nightly-release.yml invokes `{compiler}` — a channel must not compile or package              anything itself; that is exactly how its asset set drifts from the shared build              (dig_ecosystem#618). Add the step to build-binaries.yml instead."
+        );
+    }
+}
+
 #[test]
 fn both_channels_no_op_without_release_token() {
     let wf = nightly_release();
