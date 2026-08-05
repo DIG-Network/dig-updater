@@ -1104,8 +1104,9 @@ executable renamed `dig-node.msi`) and its OS installer rejects it (`msiexec` ex
   with `.exe` on Windows (e.g. `digstore-0.13.1-windows-x64.exe`, `dig-node-0.31.1-linux-x64`);
 - **native package** (dig-node) — the platform installer's native asset name: Windows
   `{prefix}-{version}-{os}-{arch}.msi`; macOS `{prefix}-{version}-macos.pkg` (ONE universal package,
-  no arch token — both macOS arches resolve to it); Linux `{prefix}_{version}_amd64.deb` (the Debian
-  convention — underscores, `amd64`, no `linux` token, e.g. `dig-node_0.31.1_amd64.deb`).
+  no arch token — both macOS arches resolve to it); Linux `{prefix}_{version}_{deb_arch}.deb` (the
+  Debian convention — underscores, the ARCH token not the OS token, no `linux` token: `amd64` for x64
+  and `arm64` for arm64, e.g. `dig-node_0.31.1_amd64.deb` / `dig-node_0.31.1_arm64.deb`).
 
 A component MAY also declare build **variants** (§5.3) in `feed-config.json` as
 `variants: [{ suffix, variant }]`. For each declared variant the signer additionally selects the
@@ -1728,8 +1729,9 @@ fires the stable build; the nightly job builds and publishes directly.
 The cross-OS binary build lives once in `.github/workflows/build-binaries.yml` (`on: workflow_call`,
 inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel call it, so the two
 paths can never diverge on HOW a binary is produced. It builds both beacon binaries — `dig-updater`
-and its sibling `dig-updater-worker` (§8.3) — for `windows-x64`, `linux-x64`, `macos-arm64`, and
-`macos-x64`, stamping the caller's `version` into each artifact filename.
+and its sibling `dig-updater-worker` (§8.3) — for `windows-x64`, `linux-x64`, `linux-arm64` (cross-compiled
+with the aarch64 GNU linker), `macos-arm64`, and `macos-x64`, stamping the caller's `version` into each
+artifact filename.
 
 ### 14.5 RELEASE_TOKEN posture (both channels)
 
