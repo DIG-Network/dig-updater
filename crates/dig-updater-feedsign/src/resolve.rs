@@ -19,6 +19,7 @@ use crate::error::FeedsignError;
 /// on the component's [`AssetKind`] — see [`expected_asset_name`].
 const PLATFORMS: &[(&str, &str)] = &[
     ("linux", "x64"),
+    ("linux", "arm64"),
     ("macos", "arm64"),
     ("macos", "x64"),
     ("windows", "x64"),
@@ -36,8 +37,9 @@ const PLATFORMS: &[(&str, &str)] = &[
 ///   - Windows `.msi`: `{prefix}-{version}-{os}-{arch}.msi` (`dig-node-0.31.1-windows-x64.msi`);
 ///   - macOS `.pkg`: `{prefix}-{version}-macos.pkg` — ONE universal package, no arch token, so both
 ///     `macos/arm64` and `macos/x64` resolve to it;
-///   - Linux `.deb`: `{prefix}_{version}_amd64.deb` — the Debian convention (underscores, `amd64`,
-///     no `linux` token), e.g. `dig-node_0.31.1_amd64.deb`.
+///   - Linux `.deb`: `{prefix}_{version}_{deb_arch}.deb` — the Debian convention (underscores, the
+///     ARCH token not the OS token, no `linux` token), e.g. `dig-node_0.31.1_amd64.deb` for x64 and
+///     `dig-node_0.31.1_arm64.deb` for arm64.
 ///
 /// Factoring the name into a `head` before the version and a `tail` after it lets BOTH directions
 /// reuse one source of truth: [`expected_asset_name`] builds the name (stable, whose version comes
@@ -52,7 +54,11 @@ fn asset_name_parts(prefix: &str, os: &str, arch: &str, kind: AssetKind) -> (Str
             (format!("{prefix}-"), format!("-{os}-{arch}.msi"))
         }
         (AssetKind::NativePackage, "macos") => (format!("{prefix}-"), "-macos.pkg".to_string()),
-        (AssetKind::NativePackage, "linux") => (format!("{prefix}_"), "_amd64.deb".to_string()),
+        (AssetKind::NativePackage, "linux") => {
+            // Debian names the arch, not the OS: `amd64` for x64, `arm64` for arm64.
+            let deb_arch = if arch == "arm64" { "arm64" } else { "amd64" };
+            (format!("{prefix}_"), format!("_{deb_arch}.deb"))
+        }
         (_, "windows") => (format!("{prefix}-"), format!("-{os}-{arch}.exe")),
         _ => (format!("{prefix}-"), format!("-{os}-{arch}")),
     }
@@ -380,6 +386,136 @@ mod tests {
                 AssetKind::NativePackage
             ),
             "dig-node_0.31.1_amd64.deb"
+        );
+    }
+
+    #[test]
+    fn expected_asset_name_encodes_linux_arm64() {
+        // RawBinary keeps the `-{os}-{arch}` shape, so linux/arm64 tokens as `-linux-arm64`.
+        assert_eq!(
+            expected_asset_name("digstore", "0.13.1", "linux", "arm64", AssetKind::RawBinary),
+            "digstore-0.13.1-linux-arm64"
+        );
+        // NativePackage Linux is arch-tokened: arm64 → `_arm64.deb` (the Debian convention).
+        assert_eq!(
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "linux",
+                "arm64",
+                AssetKind::NativePackage
+            ),
+            "dig-node_0.31.1_arm64.deb"
+        );
+    }
+
+    #[test]
+    fn native_package_linux_x64_deb_is_byte_identical() {
+        // Regression guard: the arch-aware branch must not disturb the x64 `.deb` byte-shape.
+        assert_eq!(
+            expected_asset_name(
+                "dig-node",
+                "0.31.1",
+                "linux",
+                "x64",
+                AssetKind::NativePackage
+            ),
+            "dig-node_0.31.1_amd64.deb"
+        );
+    }
+
+    #[test]
+    fn native_package_linux_arm64_selects_the_arm64_deb() {
+        // A dig-node-shaped release carrying the arm64 `.deb` resolves it for linux/arm64.
+        let release = GithubRelease {
+            tag_name: "v0.31.1".into(),
+            assets: vec![
+                asset("dig-node_0.31.1_amd64.deb"),
+                asset("dig-node_0.31.1_arm64.deb"),
+                asset("dig-node-0.31.1-macos.pkg"),
+                asset("dig-node-0.31.1-windows-x64.msi"),
+            ],
+        };
+        let arts = select_artifacts(&release, &native_package_component(), "0.31.1").unwrap();
+        let arm = arts
+            .iter()
+            .find(|a| a.os == "linux" && a.arch == "arm64")
+            .expect("a linux/arm64 artifact");
+        assert!(
+            arm.url.ends_with("dig-node_0.31.1_arm64.deb"),
+            "must select the arm64 .deb, got {}",
+            arm.url
+        );
+    }
+
+    #[test]
+    fn raw_binary_linux_arm64_selects_the_linux_arm64_asset() {
+        // A digstore release carrying `-linux-arm64` resolves it for linux/arm64.
+        let release = GithubRelease {
+            tag_name: "v0.13.1".into(),
+            assets: vec![
+                asset("digstore-0.13.1-linux-x64"),
+                asset("digstore-0.13.1-linux-arm64"),
+                asset("digstore-0.13.1-macos-arm64"),
+                asset("digstore-0.13.1-windows-x64.exe"),
+            ],
+        };
+        let arts = select_artifacts(&release, &component_named("digstore"), "0.13.1").unwrap();
+        let arm = arts
+            .iter()
+            .find(|a| a.os == "linux" && a.arch == "arm64")
+            .expect("a linux/arm64 artifact");
+        assert!(
+            arm.url.ends_with("digstore-0.13.1-linux-arm64"),
+            "must select the linux-arm64 binary, got {}",
+            arm.url
+        );
+    }
+
+    #[test]
+    fn a_component_without_arm64_still_resolves_its_other_platforms() {
+        // Graceful degrade: a component publishing x64/macos/windows but NO arm64 asset still
+        // resolves its other platforms and publishes — the same tolerated case as any absent
+        // platform, now that linux/arm64 is one more sometimes-absent slot.
+        let release = GithubRelease {
+            tag_name: "v0.29.0".into(),
+            assets: vec![
+                asset("dig-node-0.29.0-linux-x64"),
+                asset("dig-node-0.29.0-macos-arm64"),
+                asset("dig-node-0.29.0-macos-x64"),
+                asset("dig-node-0.29.0-windows-x64.exe"),
+            ],
+        };
+        let arts = select_artifacts(&release, &component(), "0.29.0").unwrap();
+        assert_eq!(arts.len(), 4, "the four present platforms resolve");
+        assert!(
+            !arts.iter().any(|a| a.arch == "arm64" && a.os == "linux"),
+            "no linux/arm64 artifact when its asset is absent"
+        );
+    }
+
+    #[test]
+    fn nightly_version_recovers_across_the_new_arm64_slot() {
+        // With only the x64 `_amd64.deb` present, the arm64 `_arm64.deb` tail simply does not match
+        // and version recovery still succeeds off the x64 asset.
+        let x64_only = GithubRelease {
+            tag_name: "nightly".into(),
+            assets: vec![asset("dig-node_0.32.0-nightly.20260714.deadbee_amd64.deb")],
+        };
+        assert_eq!(
+            resolve_version_from_assets(&x64_only, &native_package_component())
+                .expect("recovers from the x64 deb"),
+            "0.32.0-nightly.20260714.deadbee"
+        );
+        // And an arm64-only nightly asset recovers the version off the `_arm64.deb` tail.
+        let arm64_only = GithubRelease {
+            tag_name: "nightly".into(),
+            assets: vec![asset("dig-node_0.32.0-nightly.20260714.deadbee_arm64.deb")],
+        };
+        assert_eq!(
+            resolve_version_from_assets(&arm64_only, &native_package_component())
+                .expect("recovers from the arm64 deb"),
+            "0.32.0-nightly.20260714.deadbee"
         );
     }
 
@@ -823,6 +959,8 @@ mod tests {
             vec![
                 "dig-app-3.5.0-linux-x64",
                 "dig-app-3.5.0-linux-x64-headless",
+                "dig-app-3.5.0-linux-arm64",
+                "dig-app-3.5.0-linux-arm64-headless",
                 "dig-app-3.5.0-macos-arm64",
                 "dig-app-3.5.0-macos-arm64-headless",
                 "dig-app-3.5.0-macos-x64",
@@ -866,6 +1004,7 @@ mod tests {
             names,
             vec![
                 "dig-node_0.31.1_amd64.deb",
+                "dig-node_0.31.1_arm64.deb",
                 "dig-node-0.31.1-macos.pkg",
                 "dig-node-0.31.1-windows-x64.msi",
             ]
