@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.29.0] - 2026-08-06
+
+### Features
+- **release:** Cut stable from release/X.Y branches (nightly stays main-HEAD) (#33)- **feed:** Cover dig-app and bound the version probe with a deadline- **broker:** Track dig-app in the catalog, HELD until it can prove its version (#41)- **broker:** Content-digest version evidence for dig-app + stop corrupting the Windows task store (#44)- **broker:** Refuse an update this host cannot load, and never install backwards (#46)- **updater:** Bound the fetch + worker IPC so a stalled transport can't wedge updates (#48)- **manifest:** Additive build-variant selection so headless Linux hosts can update (#49)
+
+### Bug Fixes
+- **broker:** Guard per-channel lkg subdirs + fail-closed force-guard on gh error (#24)- **beacon:** Relocate staging to a traversable sibling and exit non-zero on a faulted pass- **ci:** Make cutting a release branch idempotent, so the first cut works (#42)- **feedsign:** Name the asset shapes it truly searched for when a component has none (#50)- **feedsign:** Emit linux/arm64 artifacts in the signed manifest (#2126)
+
+### Build
+- **deps:** Bump sha2 from 0.10.9 to 0.11.0 (#30)- **deps:** Bump the cargo-minor-patch group with 2 updates (#34)- **deps:** Bump libc from 0.2.186 to 0.2.188 in the cargo-minor-patch group (#36)- **deps:** Bump libc from 0.2.188 to 0.2.189 in the cargo-minor-patch group (#37)- **deps:** Bump base64 from 0.22.1 to 0.23.0 (#38)
+
+### CI
+- **dependabot:** Add Cargo Dependabot + auto-merge pipeline (#26)- **dependabot:** Schedule updates at 20:00 UTC, before the nightly release (#32)
+
+### Chores
+- **broker:** Consume dig-release-resolver from crates.io by version (#25)
+
 ## [0.14.0] - 2026-07-16
 
 ### Features
