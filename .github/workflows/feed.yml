@@ -351,3 +351,103 @@ jobs:
             cat feed-summary.txt 2>/dev/null || echo 'feed was not signed'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # THE ALARM (dig_ecosystem#2290).
+  #
+  # The cadence note at the top of this file reasons that a 6-hour cron against a 12-hour expiry
+  # leaves 6 hours of slack, "so a single skipped/failed run never lets clients see an expired
+  # feed". That is true and it is not enough: the slack tolerates ONE failure, and nothing was
+  # counting. Four consecutive stable-leg failures ran straight through it, the live manifest
+  # expired, and auto-update was down for every product for ~15 hours. It was found by a human
+  # noticing stale version numbers.
+  #
+  # A red workflow run is not an alert. Nobody is watching this repo's Actions tab at 02:21 UTC.
+  # So a failing feed now files a real, deduplicated P0 issue and keeps commenting on it every
+  # cycle it stays broken — and, just as importantly, CLOSES it when the feed recovers, so the
+  # signal keeps meaning something rather than decaying into a stale ticket everyone scrolls past.
+  #
+  # It reports the LIVE manifest's freshness rather than only the run failure, because that is the
+  # thing that actually harms users: a beacon rejects an expired manifest outright, which is worse
+  # than serving slightly old versions. Knowing how long is left is what distinguishes "fix it
+  # this cycle" from "users are already broken".
+  alert:
+    name: Alert on a failing feed
+    needs: sign-verify-publish
+    # `always()` — a failed matrix leg must not skip this by way of the implicit `success()`,
+    # which is the exact way an alarm ends up silent in the outage it was built for.
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      FEED_RESULT: ${{ needs.sign-verify-publish.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # A fixed marker in the title is the dedupe key. A label would be tidier but silently
+      # no-ops if the label does not exist on the repo, which would lose the alarm.
+      ALERT_TITLE: "P0: the signed update feed is failing"
+    steps:
+      - name: File, update, or resolve the feed alarm
+        run: |
+          set -euo pipefail
+
+          # Freshness of what clients are ACTUALLY being served right now, per channel.
+          freshness() {
+            local channel="$1" now expires
+            now="$(date +%s)"
+            expires="$(curl -fsS --max-time 20 "https://updates.dig.net/v1/${channel}/manifest.json" \
+                        | jq -r '.manifest.expires // empty' 2>/dev/null || true)"
+            if [ -z "$expires" ]; then
+              echo "- \`${channel}\`: could not read the live manifest."
+              return
+            fi
+            if [ "$expires" -le "$now" ]; then
+              echo "- \`${channel}\`: **EXPIRED $(( (now - expires) / 3600 ))h ago** — beacons are rejecting it."
+            else
+              echo "- \`${channel}\`: valid for another $(( (expires - now) / 3600 ))h."
+            fi
+          }
+
+          existing="$(gh issue list --repo "$REPO" --state open --search "in:title \"$ALERT_TITLE\"" \
+                        --json number --jq '.[0].number // empty')"
+
+          if [ "$FEED_RESULT" = "success" ]; then
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" \
+                --body "Recovered — the feed signed and published cleanly in [this run]($RUN_URL). Closing."
+              gh issue close "$existing" --repo "$REPO"
+              echo "Feed recovered; closed alarm #$existing."
+            else
+              echo "Feed healthy; no alarm open."
+            fi
+            exit 0
+          fi
+
+          body="$(
+            echo "The signed update feed run **failed** (\`$FEED_RESULT\`)."
+            echo
+            echo "Auto-update is degrading for every product on the affected channel, and it will"
+            echo "BREAK outright once the live manifest passes its expiry — a beacon rejects an"
+            echo "expired manifest rather than serving stale versions."
+            echo
+            echo "Live feed freshness right now:"
+            freshness stable
+            freshness nightly
+            echo
+            echo "Failing run: $RUN_URL"
+          )"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            echo "::error::the signed update feed is STILL failing — see issue #$existing. $RUN_URL"
+          else
+            # `gh issue create` prints the new issue's URL on stdout.
+            new="$(gh issue create --repo "$REPO" --title "$ALERT_TITLE" --body "$body")"
+            echo "::error::the signed update feed is failing — filed $new. $RUN_URL"
+          fi
+
+          # Redden this job too. The issue is what gets a human's attention; the red run is what
+          # stops an automated caller from reading the workflow as healthy.
+          exit 1
