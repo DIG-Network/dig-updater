@@ -22,9 +22,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -186,9 +186,9 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-broker"
-version = "0.29.1"
+version = "0.29.2"
 dependencies = [
- "base64 0.23.0",
+ "base64 0.23.1",
  "dig-release-resolver",
  "dig-updater-trust",
  "dig-updater-worker",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-cli"
-version = "0.29.1"
+version = "0.29.2"
 dependencies = [
  "dig-updater-broker",
  "dig-updater-trust",
@@ -217,9 +217,9 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-feedsign"
-version = "0.29.1"
+version = "0.29.2"
 dependencies = [
- "base64 0.23.0",
+ "base64 0.23.1",
  "dig-updater-trust",
  "ed25519-dalek",
  "hex",
@@ -234,9 +234,9 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-trust"
-version = "0.29.1"
+version = "0.29.2"
 dependencies = [
- "base64 0.23.0",
+ "base64 0.23.1",
  "ed25519-dalek",
  "hex",
  "serde",
@@ -247,9 +247,9 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-worker"
-version = "0.29.1"
+version = "0.29.2"
 dependencies = [
- "base64 0.23.0",
+ "base64 0.23.1",
  "dig-updater-trust",
  "ed25519-dalek",
  "hex",
