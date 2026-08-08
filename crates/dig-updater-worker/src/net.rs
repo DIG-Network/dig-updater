@@ -24,11 +24,11 @@ const CHUNK_BYTES: usize = 64 * 1024;
 
 /// Per-read stall guard: the longest a single socket read may block.
 ///
-/// Set on every agent as a secondary bound. Note `ureq`'s overall `.timeout()` takes PRECEDENCE
-/// over `.timeout_read()` for body reads, so where an overall budget is also set (both agents
-/// below) the overall deadline is the effective wall-clock bound; this value still governs the
-/// phases the overall deadline does not (and documents intent). Thirty seconds is far longer than
-/// any healthy server's inter-packet gap.
+/// Set on every agent as a secondary bound. `ureq`'s global timeout and this per-phase receive
+/// bound are both enforced, and whichever expires first ends the transfer — so where an overall
+/// budget is also set (both agents below) the overall deadline is the effective wall-clock bound,
+/// while this value still governs a body that trickles without ever exceeding the global budget.
+/// Thirty seconds is far longer than any healthy server's inter-packet gap.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Overall wall-clock deadline for a small feed document (delegation/manifest JSON).
@@ -53,10 +53,11 @@ const ARTIFACT_OVERALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// no fetch can ever block indefinitely. The budgets are parameters purely so tests can drive the
 /// stall paths with tiny values; production uses the constants above.
 fn build_agent(read: Duration, overall: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_read(read)
-        .timeout(overall)
-        .build()
+    let config = ureq::Agent::config_builder()
+        .timeout_recv_body(Some(read))
+        .timeout_global(Some(overall))
+        .build();
+    ureq::Agent::new_with_config(config)
 }
 
 /// The production agent for a small feed document.
@@ -92,14 +93,17 @@ pub fn fetch_text(url: &str) -> Result<String, WorkerError> {
 /// test under a tiny budget. A stalled or frozen transport surfaces as [`WorkerError::Fetch`], so
 /// the pass fails closed and retries next wake rather than blocking forever.
 fn fetch_text_with(agent: &ureq::Agent, url: &str) -> Result<String, WorkerError> {
-    let response = agent.get(url).call().map_err(|e| WorkerError::Fetch {
+    let mut response = agent.get(url).call().map_err(|e| WorkerError::Fetch {
         url: url.to_string(),
         detail: e.to_string(),
     })?;
-    response.into_string().map_err(|e| WorkerError::Fetch {
-        url: url.to_string(),
-        detail: e.to_string(),
-    })
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| WorkerError::Fetch {
+            url: url.to_string(),
+            detail: e.to_string(),
+        })
 }
 
 /// Stream the artifact at `url` into `dest`, hashing as it arrives, refusing to accept more than
@@ -143,7 +147,10 @@ fn download_and_verify_with(
         url: url.to_string(),
         detail: e.to_string(),
     })?;
-    let mut reader = response.into_reader();
+    // The reader is deliberately UNLIMITED: the size bound this path relies on is the explicit
+    // `cap` enforced in the read loop below, which rejects an overflowing chunk before it is
+    // written. Delegating the cap to the transport would change which error the caller sees.
+    let mut reader = response.into_body().into_reader();
     let mut file = File::create(dest).map_err(|e| WorkerError::Io(e.to_string()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK_BYTES];
@@ -211,10 +218,10 @@ mod tests {
 
     use std::net::TcpListener;
 
-    /// A tiny overall budget so the stall tests finish fast. `ureq`'s overall `.timeout()` takes
-    /// precedence over `.timeout_read()` for body reads, so this is the value that actually bounds a
-    /// frozen transfer — exactly the wall-clock guarantee production relies on, just scaled down (the
-    /// same "inject a tiny budget" idiom `probe.rs`/`loadable.rs` use).
+    /// A tiny overall budget so the stall tests finish fast. It is far shorter than `READ_TIMEOUT`,
+    /// so it is the bound that actually fires on a frozen transfer — exactly the wall-clock
+    /// guarantee production relies on, just scaled down (the same "inject a tiny budget" idiom
+    /// `probe.rs`/`loadable.rs` use).
     const TEST_OVERALL_TIMEOUT: Duration = Duration::from_secs(1);
 
     /// Bind a loopback listener and serve exactly one connection off a background thread using
