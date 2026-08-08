@@ -61,12 +61,15 @@ impl GithubSource {
     }
 
     /// Apply the headers GitHub expects (a `User-Agent` is mandatory) plus optional auth.
-    fn prepare(&self, request: ureq::Request) -> ureq::Request {
+    fn prepare(
+        &self,
+        request: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
         let request = request
-            .set("User-Agent", "dig-updater-feedsign")
-            .set("Accept", "application/vnd.github+json");
+            .header("User-Agent", "dig-updater-feedsign")
+            .header("Accept", "application/vnd.github+json");
         match &self.token {
-            Some(token) => request.set("Authorization", &format!("Bearer {token}")),
+            Some(token) => request.header("Authorization", &format!("Bearer {token}")),
             None => request,
         }
     }
@@ -80,14 +83,16 @@ impl ReleaseSource for GithubSource {
             repo,
             channel.release_path()
         );
-        let body = self
-            .prepare(ureq::get(&url))
-            .call()
-            .map_err(|e| FeedsignError::Fetch {
-                url: url.clone(),
-                detail: e.to_string(),
-            })?
-            .into_string()
+        let mut response =
+            self.prepare(ureq::get(&url))
+                .call()
+                .map_err(|e| FeedsignError::Fetch {
+                    url: url.clone(),
+                    detail: e.to_string(),
+                })?;
+        let body = response
+            .body_mut()
+            .read_to_string()
             .map_err(|e| FeedsignError::Fetch {
                 url: url.clone(),
                 detail: e.to_string(),
@@ -105,6 +110,7 @@ impl ReleaseSource for GithubSource {
             })?;
         let mut bytes = Vec::new();
         response
+            .into_body()
             .into_reader()
             .read_to_end(&mut bytes)
             .map_err(|e| FeedsignError::Fetch {
