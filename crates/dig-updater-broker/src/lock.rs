@@ -205,7 +205,7 @@ mod imp {
             // freed exactly once, here, only after `CreateMutexW` has already returned (the
             // descriptor is no longer referenced by anything at this point).
             unsafe {
-                let _ = LocalFree(HLOCAL(self.descriptor as *mut _));
+                let _ = LocalFree(Some(HLOCAL(self.descriptor as *mut _)));
             }
         }
     }

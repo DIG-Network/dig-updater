@@ -357,9 +357,9 @@ mod imp {
     ) -> io::Result<()> {
         if let Ok(token) = restricted_token() {
             let asuser = CreateProcessAsUserW(
-                token,
+                Some(token),
                 PCWSTR(app.as_ptr()),
-                PWSTR(cmdline.as_mut_ptr()),
+                Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,
                 true,
@@ -376,7 +376,7 @@ mod imp {
         }
         CreateProcessW(
             PCWSTR(app.as_ptr()),
-            PWSTR(cmdline.as_mut_ptr()),
+            Some(PWSTR(cmdline.as_mut_ptr())),
             None,
             None,
             true,

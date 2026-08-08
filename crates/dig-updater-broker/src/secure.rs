@@ -233,7 +233,7 @@ fn windows_owner_is_privileged(path: &Path) -> Option<bool> {
     // SAFETY: `security_descriptor` is exactly the allocation `GetNamedSecurityInfoW` returned,
     // freed once (LocalAlloc semantics, per the API contract).
     unsafe {
-        let _ = LocalFree(HLOCAL(security_descriptor.0));
+        let _ = LocalFree(Some(HLOCAL(security_descriptor.0)));
     }
     Some(privileged)
 }
