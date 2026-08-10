@@ -240,6 +240,49 @@ fn ensure_decision(presence: SchedulePresence) -> EnsureAction {
     }
 }
 
+/// Classify a `schtasks /Query` outcome into a [`ScheduleStatus`] (#546, #2323).
+///
+/// Exit 0 (the task printed) is [`SchedulePresence::Registered`]. A non-zero exit happens for three
+/// very different reasons the pre-#546 code conflated into a single "not installed":
+/// - **access-denied** — "ERROR: Access is denied." (`0x80070005`), e.g. an unprivileged
+///   `schedule status` against the SYSTEM task, or its ACL-hardened definition file → [`Unknown`];
+/// - **not-visible when unprivileged** — an unelevated query for a task inside the `\DIG\` folder
+///   fails with "ERROR: The system cannot find the path specified." because the folder itself is not
+///   visible to a non-elevated user. From `schtasks` stderr alone, unprivileged, this is
+///   INDISTINGUISHABLE from a genuinely absent task, so it must NOT resolve to [`Absent`] → [`Unknown`];
+/// - **provably absent** — "ERROR: The system cannot find the file specified." (`0x80070002`) or
+///   "The specified task name ... does not exist" (`0x8004131F`), seen from an ELEVATED query that
+///   CAN read the `\DIG\` folder → [`Absent`].
+///
+/// The elevation gate is the #2323 fix: only an ELEVATED query can honestly report [`Absent`]
+/// (the caller could actually see the folder and the task was not there), which is exactly what the
+/// self-heal ([`ensure`]) and idempotent [`uninstall`] rely on — both run elevated, so their
+/// behaviour is unchanged. An UNPRIVILEGED failure that is not a recognized access-denied signal is
+/// [`Unknown`], never [`Absent`], because the unprivileged query cannot tell the two apart.
+///
+/// Pure string logic with an injected `is_elevated` bool, so it is unit-testable on every target.
+///
+/// [`Unknown`]: SchedulePresence::Unknown
+/// [`Absent`]: SchedulePresence::Absent
+/// [`Registered`]: SchedulePresence::Registered
+#[cfg_attr(not(windows), allow(dead_code))]
+fn classify_query(success: bool, stderr: &str, is_elevated: bool) -> ScheduleStatus {
+    use content::WINDOWS_TASK_PATH;
+
+    if success {
+        return ScheduleStatus::registered(format!("registered at {WINDOWS_TASK_PATH}"));
+    }
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("access is denied") || lower.contains("0x80070005") {
+        return ScheduleStatus::unknown(format!(
+            "cannot determine whether {WINDOWS_TASK_PATH} is registered (access denied); \
+             re-run elevated to read it"
+        ));
+    }
+    // TODO(#2323): the unprivileged not-visible case falls through to Absent here — the bug.
+    ScheduleStatus::absent(format!("no task registered at {WINDOWS_TASK_PATH}"))
+}
+
 // ---------------------------------------- Windows ----------------------------------------------
 
 #[cfg(windows)]
@@ -347,37 +390,11 @@ mod imp {
             .hide_console()
             .output()
             .map_err(|e| BrokerError::Io(format!("could not run schtasks: {e}")))?;
-        Ok(classify_query(
+        Ok(super::classify_query(
             output.status.success(),
             &String::from_utf8_lossy(&output.stderr),
+            crate::elevation::is_elevated(),
         ))
-    }
-
-    /// Classify a `schtasks /Query` outcome into a [`ScheduleStatus`] (#546).
-    ///
-    /// Exit 0 (the task printed) is [`SchedulePresence::Registered`]. A non-zero exit happens for two
-    /// very different reasons the pre-#546 code conflated into a single "not installed":
-    /// - **absent** — "ERROR: The system cannot find the file specified." (`0x80070002`) or "The
-    ///   specified task name ... does not exist" (`0x8004131F`);
-    /// - **access-denied** — "ERROR: Access is denied." (`0x80070005`), e.g. an unprivileged
-    ///   `schedule status` against the SYSTEM task, or its ACL-hardened definition file.
-    ///
-    /// Only a recognized access-denied signal yields [`SchedulePresence::Unknown`]; every other
-    /// failure stays [`SchedulePresence::Absent`], preserving the pre-#546 default so the self-heal
-    /// still fires (and status still reads NOT REGISTERED) for the common, possibly-localized
-    /// not-found message — while fixing the one dangerous conflation (a locked task looking absent).
-    fn classify_query(success: bool, stderr: &str) -> ScheduleStatus {
-        if success {
-            return ScheduleStatus::registered(format!("registered at {WINDOWS_TASK_PATH}"));
-        }
-        let lower = stderr.to_ascii_lowercase();
-        if lower.contains("access is denied") || lower.contains("0x80070005") {
-            return ScheduleStatus::unknown(format!(
-                "cannot determine whether {WINDOWS_TASK_PATH} is registered (access denied); \
-                 re-run elevated to read it"
-            ));
-        }
-        ScheduleStatus::absent(format!("no task registered at {WINDOWS_TASK_PATH}"))
     }
 
     /// Encode `text` as UTF-16LE bytes with a leading byte-order mark — the exact form
@@ -392,56 +409,7 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{classify_query, utf16le_with_bom};
-        use crate::scheduler::SchedulePresence;
-
-        #[test]
-        fn classify_query_reports_a_successful_query_as_registered() {
-            assert_eq!(
-                classify_query(true, "").presence,
-                SchedulePresence::Registered
-            );
-        }
-
-        #[test]
-        fn classify_query_reports_a_not_found_failure_as_absent() {
-            // The two shapes schtasks prints for a genuinely missing task.
-            let file_not_found = "ERROR: The system cannot find the file specified.";
-            let no_such_task = "ERROR: The specified task name \"\\DIG\\dig-updater\" \
-                                does not exist in the system.";
-            assert_eq!(
-                classify_query(false, file_not_found).presence,
-                SchedulePresence::Absent
-            );
-            assert_eq!(
-                classify_query(false, no_such_task).presence,
-                SchedulePresence::Absent
-            );
-        }
-
-        #[test]
-        fn classify_query_reports_access_denied_as_unknown_not_absent() {
-            // The #546 fix: a locked-but-present task must NOT masquerade as absent — recognized
-            // by the English message and/or the 0x80070005 code.
-            assert_eq!(
-                classify_query(false, "ERROR: Access is denied.").presence,
-                SchedulePresence::Unknown
-            );
-            assert_eq!(
-                classify_query(false, "some prefix 0x80070005 suffix").presence,
-                SchedulePresence::Unknown
-            );
-        }
-
-        #[test]
-        fn classify_query_defaults_an_unrecognized_failure_to_absent() {
-            // Preserves the pre-#546 default so the self-heal still fires for an unfamiliar
-            // (e.g. localized) not-found message; only recognized access-denied becomes Unknown.
-            assert_eq!(
-                classify_query(false, "ERROR: something unexpected happened").presence,
-                SchedulePresence::Absent
-            );
-        }
+        use super::utf16le_with_bom;
 
         #[test]
         fn utf16le_with_bom_starts_with_the_little_endian_bom() {
@@ -823,6 +791,77 @@ mod tests {
 
         assert!(err.to_string().contains("ownership"), "{err}");
         assert_eq!(ledger.calls(), vec![LedgerCall::Record]);
+    }
+
+    #[test]
+    fn classify_query_reports_a_successful_query_as_registered() {
+        // Elevation is irrelevant on success: the task printed, so it is registered either way.
+        assert_eq!(
+            classify_query(true, "", false).presence,
+            SchedulePresence::Registered
+        );
+        assert_eq!(
+            classify_query(true, "", true).presence,
+            SchedulePresence::Registered
+        );
+    }
+
+    #[test]
+    fn classify_query_reports_access_denied_as_unknown_not_absent() {
+        // The #546 fix: a locked-but-present task must NOT masquerade as absent — recognized by the
+        // English message and/or the 0x80070005 code, regardless of elevation.
+        for is_elevated in [false, true] {
+            assert_eq!(
+                classify_query(false, "ERROR: Access is denied.", is_elevated).presence,
+                SchedulePresence::Unknown
+            );
+            assert_eq!(
+                classify_query(false, "some prefix 0x80070005 suffix", is_elevated).presence,
+                SchedulePresence::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn classify_query_unprivileged_path_not_found_is_unknown_not_absent() {
+        // The #2323 fix: run UNPRIVILEGED, an unelevated `schtasks /Query /TN \DIG\dig-updater`
+        // fails with "the system cannot find the path specified" because the `\DIG\` folder is not
+        // visible to a non-elevated user — which is INDISTINGUISHABLE from a genuinely absent task.
+        // The probe must NOT resolve to Absent, or `schedule status` states the opposite of the
+        // truth on a machine where the task IS registered.
+        let path_not_found = "ERROR: The system cannot find the path specified.";
+        assert_eq!(
+            classify_query(false, path_not_found, /* is_elevated = */ false).presence,
+            SchedulePresence::Unknown,
+        );
+        // Any other unprivileged failure is equally undeterminable → Unknown, never Absent.
+        assert_eq!(
+            classify_query(false, "ERROR: something unexpected happened", false).presence,
+            SchedulePresence::Unknown,
+        );
+    }
+
+    #[test]
+    fn classify_query_elevated_not_found_is_absent_preserving_self_heal() {
+        // ELEVATED, the query CAN read the `\DIG\` folder, so a not-found is PROVABLY absent — the
+        // one state the self-heal ([`ensure`]) re-registers from and idempotent uninstall relies on.
+        let file_not_found = "ERROR: The system cannot find the file specified.";
+        let no_such_task = "ERROR: The specified task name \"\\DIG\\dig-updater\" \
+                            does not exist in the system.";
+        assert_eq!(
+            classify_query(false, file_not_found, /* is_elevated = */ true).presence,
+            SchedulePresence::Absent
+        );
+        assert_eq!(
+            classify_query(false, no_such_task, true).presence,
+            SchedulePresence::Absent
+        );
+        // An unrecognized (e.g. localized) failure, seen ELEVATED, still defaults to Absent so the
+        // self-heal fires for an unfamiliar not-found message.
+        assert_eq!(
+            classify_query(false, "ERROR: something unexpected happened", true).presence,
+            SchedulePresence::Absent
+        );
     }
 
     #[test]
