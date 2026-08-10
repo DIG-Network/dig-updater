@@ -1144,19 +1144,23 @@ committed, reviewable declaration that the component genuinely does not ship tho
 defaults to empty. The alpha config exempts `linux/arm64` for every component (no DIG release ships
 that platform yet); each exemption is removed as its repo begins publishing the platform.
 
-**Exemption legitimacy (normative, dig_ecosystem#2555).** An `exempt_platforms` entry is legitimate
-ONLY while the component's latest STABLE and rolling NIGHTLY release each publishes NO feed-resolvable
-DEFAULT asset for that `(os, arch)` — i.e. only while its absence is real. An exemption for a platform
-the release actually ships is OVER-BROAD: it masks the completeness gate for that platform, so a later
-regression that drops the platform would publish a green feed silently missing it. A drift check MUST
-detect this and fail closed: for every declared exemption, the check asserts — over both channels'
-live releases, reusing the SAME asset-name derivation the selector matches on — that the platform is
-NOT resolvable, and REDs naming the component, channel, and resolvable platform otherwise. The check is
-the OPPOSITE direction from the completeness gate (which REDs on a missing, unexempted platform) and
-MUST NOT widen the gate's expected set — a genuinely-missing platform still REDs the gate unchanged. It
-needs no signing secret, so it runs as a PR gate on `feed-config.json` and on a daily schedule
-(`feedsign --audit-exemptions`), deliberately OFF the feed-signing cron path so a transient GitHub
-outage can never red the live feed.
+**Exemption legitimacy (normative, dig_ecosystem#2555).** `exempt_platforms` is per-component and
+applies to EVERY channel the feed signs. An exemption is therefore legitimate while the platform is
+UNRESOLVABLE — publishes no feed-resolvable DEFAULT asset — in AT LEAST ONE signed channel (stable or
+nightly): that channel's completeness gate still relies on the exemption, so removing it would fail
+that channel closed. An exemption is OVER-BROAD and DROPPABLE only when the platform is feed-resolvable
+in EVERY signed channel — only then does no channel still need it. A drift check MUST enforce this: for
+every declared exemption it determines, over both channels' live releases and reusing the SAME
+asset-name derivation the selector matches on, the set of channels in which the platform resolves, and
+FAILS CLOSED (naming the component + platform) only when that set is ALL signed channels. A platform
+resolvable in a strict SUBSET of channels is reported as an informational, NON-failing note (the
+exemption is retained — dropping it would red the completeness gate on the channels that lack the
+platform); per-channel exemptions would be required to drop it. The check is the OPPOSITE direction
+from the completeness gate (which REDs on a missing, unexempted platform) and MUST NOT widen the gate's
+expected set — a genuinely-missing platform still REDs the gate unchanged. It needs no signing secret,
+so it runs as a PR gate on `feed-config.json` and on a daily schedule (`feedsign
+--audit-exemptions`), deliberately OFF the feed-signing cron path so a transient GitHub outage can
+never red the live feed.
 
 The alpha component set is **dig-node (native package), digstore, dig-updater,
 dig-dns, dig-app (raw binaries)** — dig-app is PUBLISHED in the feed but not yet tracked by the

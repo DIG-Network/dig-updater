@@ -132,6 +132,16 @@ change diary.
   channels and REDs on an OVER-BROAD exemption (platform IS resolvable), the opposite direction from
   the #2343 completeness gate (which REDs on a MISSING, unexempted platform). It is deliberately a
   PR/daily gate OFF the signing cron, so a GitHub blip can never red the live feed.
+- **An exemption applies to EVERY channel, so it is droppable only when over-broad in ALL of them
+  (#2555, caught live).** `exempt_platforms` is per-component and not per-channel; both the stable and
+  nightly feeds honour the same list. The first audit cut naively failed per-channel and would have
+  told us to drop dig-node's linux/arm64 exemption because STABLE now ships an arm64 `.deb` — but the
+  NIGHTLY dig-node release does NOT, so dropping it would have red the #2343 completeness gate on
+  nightly and broken the live nightly feed. Correct rule: an exemption is legitimate while the platform
+  is unresolvable in AT LEAST ONE signed channel; it is over-broad/droppable only when resolvable in
+  EVERY signed channel. A strict-subset over-broad (stable-yes/nightly-no) is an informational RETAINED
+  note, exit 0. Live ground truth 2026-08-10: dig-updater arm64 resolves in both → dropped; dig-node
+  arm64 stable-only → retained; digstore/dig-dns/dig-app arm64 in neither → retained.
 
 ## Primary publish + transparency (#535 / #533)
 

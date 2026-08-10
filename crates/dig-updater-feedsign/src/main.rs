@@ -12,9 +12,11 @@
 //!   red at the signing step. Reads `--config`/`--channel`/`GITHUB_TOKEN` only.
 //! - **`audit-exemptions`** (subcommand, or `--audit-exemptions`) — check every declared
 //!   `exempt_platforms` against BOTH channels' live releases WITHOUT any signing key
-//!   (dig_ecosystem#2555), exiting non-zero on any OVER-BROAD exemption (the platform is actually
-//!   resolvable, so the exemption masks the #2343 completeness gate). Reads `--config`/`GITHUB_TOKEN`
-//!   only; the channel is not selectable — it always sweeps both. A PR/scheduled drift guard.
+//!   (dig_ecosystem#2555), exiting non-zero only on an exemption whose platform is resolvable in
+//!   EVERY signed channel (droppable — it masks the #2343 gate everywhere). A platform resolvable in
+//!   only a subset of channels is a NON-failing informational note (the exemption stays load-bearing
+//!   for the channels that lack it). Reads `--config`/`GITHUB_TOKEN` only; always sweeps both
+//!   channels. A PR/scheduled drift guard.
 //! - **default (sign)** — the full assemble + sign pass below (requires `BEACON_SIGNING_KEY`).
 //!
 //! Inputs (CLI flag falls back to environment):

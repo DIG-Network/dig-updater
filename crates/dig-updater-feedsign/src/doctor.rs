@@ -13,7 +13,7 @@
 //! (respecting `exempt_platforms`, dig_ecosystem#2343).
 
 use crate::channel::Channel;
-use crate::config::{FeedConfig, PlatformKey};
+use crate::config::{ComponentConfig, FeedConfig, PlatformKey};
 use crate::resolve::{overbroad_exemptions, ResolvedArtifact};
 use crate::source::ReleaseSource;
 use crate::{resolve_all, resolve_release_and_version, ComponentResolution};
@@ -83,55 +83,72 @@ impl DoctorReport {
     }
 }
 
-/// One component's over-broad exemptions on ONE channel: the `exempt_platforms` entries whose asset
-/// the channel's release actually publishes, so the exemption masks the #2343 completeness gate for
-/// them (dig_ecosystem#2555). Empty when every declared exemption is still accurate.
+/// One `(component, platform)` exemption's cross-channel status: the channels whose release actually
+/// publishes a feed-resolvable default asset for the exempt platform (dig_ecosystem#2555).
+///
+/// `exempt_platforms` is per-component and applies to EVERY channel the feed signs, so an exemption
+/// is safe to DROP only when the platform is resolvable in ALL of them: if it resolves in a strict
+/// SUBSET (e.g. dig-node's linux/arm64 in stable but not nightly), the exemption is still
+/// LOAD-BEARING for the channel(s) that lack it — dropping it would RED the #2343 completeness gate
+/// on those channels and break their live feed. So this records the set and lets
+/// [`ComponentExemptions::is_droppable`] decide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentExemptions {
     /// The component id from the config.
     pub name: String,
-    /// The channel this finding is for.
-    pub channel: Channel,
-    /// The declared-exempt platforms that ARE resolvable on this channel — the over-broad ones.
-    pub overbroad: Vec<PlatformKey>,
+    /// The exempt platform this finding is about.
+    pub platform: PlatformKey,
+    /// The channels in which this platform is actually resolvable (the exemption is over-broad
+    /// THERE), in [`ALL_CHANNELS`] order. Non-empty for every recorded finding.
+    pub overbroad_channels: Vec<Channel>,
 }
 
-/// A secret-free audit of every component's `exempt_platforms` against BOTH channels' live releases,
-/// flagging each exemption that has become OVER-BROAD — the platform is now resolvable, so the
-/// exemption should be dropped lest it hide a future regression (dig_ecosystem#2555).
+impl ComponentExemptions {
+    /// `true` when the exemption is safe to DROP: the platform is resolvable in EVERY signed channel,
+    /// so no channel still relies on the exemption to satisfy the #2343 gate. A strict-subset
+    /// over-broad (resolvable in some channels, not others) is NOT droppable — the exemption remains
+    /// load-bearing for the channels that lack the platform.
+    #[must_use]
+    pub fn is_droppable(&self) -> bool {
+        ALL_CHANNELS
+            .iter()
+            .all(|channel| self.overbroad_channels.contains(channel))
+    }
+}
+
+/// A secret-free audit of every component's `exempt_platforms` against BOTH channels' live releases
+/// (dig_ecosystem#2555). An exemption is a FAILING finding — safe to drop — only when its platform is
+/// resolvable in EVERY signed channel; a platform resolvable in only a strict subset of channels is
+/// reported as an informational, NON-failing note (the exemption is still load-bearing elsewhere).
 ///
 /// It is the OPPOSITE direction from the #2343 completeness gate: that gate REDs on a MISSING,
-/// unexempted platform; this REDs on an EXEMPT, resolvable one. It never widens the gate's expected
-/// set — a genuinely-missing platform still REDs [`crate::select_artifacts`] unchanged.
+/// unexempted platform; this REDs on an EXEMPT platform that is resolvable in all channels. It never
+/// widens the gate's expected set — a genuinely-missing platform still REDs [`crate::select_artifacts`]
+/// unchanged.
 #[derive(Debug)]
 pub struct ExemptionAudit {
     findings: Vec<ComponentExemptions>,
 }
 
 impl ExemptionAudit {
-    /// Audit every component on both channels. A component whose release cannot be fetched or whose
-    /// version cannot be parsed on a channel yields NO over-broad finding there — judging an
-    /// exemption over-broad requires a resolvable release, and a genuine resolution failure is the
-    /// [`DoctorReport`]/completeness gate's concern, not this drift check's.
+    /// Audit every component's exemptions across both channels, aggregating per `(component,
+    /// platform)`.
+    ///
+    /// A channel whose release cannot be fetched or whose version cannot be parsed counts as "does
+    /// not resolve there" — so the exemption is CONSERVATIVELY retained for that channel (a genuine
+    /// resolution failure is the [`DoctorReport`]/completeness gate's concern, and never a reason to
+    /// recommend dropping an exemption the failing channel may still need).
     #[must_use]
     pub fn run(config: &FeedConfig, source: &dyn ReleaseSource) -> Self {
         let mut findings = Vec::new();
-        for channel in ALL_CHANNELS {
-            for component in &config.components {
-                if component.exempt_platforms.is_empty() {
-                    continue;
-                }
-                let Ok((release, version)) =
-                    resolve_release_and_version(source, component, channel)
-                else {
-                    continue;
-                };
-                let overbroad = overbroad_exemptions(&release, component, &version);
-                if !overbroad.is_empty() {
+        for component in &config.components {
+            for platform in &component.exempt_platforms {
+                let overbroad_channels = channels_resolving(source, component, platform);
+                if !overbroad_channels.is_empty() {
                     findings.push(ComponentExemptions {
                         name: component.name.clone(),
-                        channel,
-                        overbroad,
+                        platform: platform.clone(),
+                        overbroad_channels,
                     });
                 }
             }
@@ -139,22 +156,24 @@ impl ExemptionAudit {
         Self { findings }
     }
 
-    /// `true` when no exemption is over-broad on either channel — every declared exemption still
-    /// names a platform the component genuinely does not publish.
+    /// `true` when NO exemption is over-broad in EVERY signed channel — i.e. no exemption is safe to
+    /// drop. A partial/single-channel over-broad keeps the audit clean (its exemption stays
+    /// load-bearing), so the CLI exit code is 0 for it.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.findings.is_empty()
+        !self.findings.iter().any(ComponentExemptions::is_droppable)
     }
 
-    /// The over-broad findings, one per `(component, channel)` that has any.
+    /// Every recorded finding — both the DROPPABLE (all-channel) ones and the informational
+    /// partial-channel notes.
     #[must_use]
     pub fn findings(&self) -> &[ComponentExemptions] {
         &self.findings
     }
 
-    /// A legible, secret-free report + a one-line verdict, suitable for a CI log. It reads no secret
-    /// and names, per over-broad finding, the component, channel, and the resolvable platforms whose
-    /// exemption should be dropped.
+    /// A legible, secret-free report + a one-line verdict. It names each DROP finding (over-broad in
+    /// every channel → drop the exemption) and each RETAINED note (over-broad in only some channels →
+    /// exemption still load-bearing), then states whether any exemption is droppable.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::from("feed exemption audit (dig_ecosystem#2555)\n");
@@ -163,28 +182,64 @@ impl ExemptionAudit {
             return out;
         }
         for finding in &self.findings {
+            out.push_str(&render_finding(finding));
+        }
+        let droppable = self.findings.iter().filter(|f| f.is_droppable()).count();
+        if droppable == 0 {
+            out.push_str(
+                "no over-broad exemption is resolvable in every channel — none is droppable.\n",
+            );
+        } else {
             out.push_str(&format!(
-                "  OVER-BROAD {} [{}] — resolvable, drop the exemption for: {}\n",
-                finding.name,
-                finding.channel.as_str(),
-                render_platform_keys(&finding.overbroad),
+                "{droppable} exemption(s) resolvable in every signed channel — drop them; a resolvable platform masks the #2343 gate.\n",
             ));
         }
-        out.push_str(&format!(
-            "{} over-broad exemption(s) — a resolvable platform is masking the #2343 gate.\n",
-            self.findings.len()
-        ));
         out
     }
 }
 
-/// `os/arch` platform keys, comma-joined, for the audit report.
-fn render_platform_keys(platforms: &[PlatformKey]) -> String {
-    platforms
+/// The channels (in [`ALL_CHANNELS`] order) whose release resolves `platform` for `component` — the
+/// channels where the exemption is over-broad. A channel that cannot resolve at all is omitted, so
+/// the exemption is treated as still needed there.
+fn channels_resolving(
+    source: &dyn ReleaseSource,
+    component: &ComponentConfig,
+    platform: &PlatformKey,
+) -> Vec<Channel> {
+    ALL_CHANNELS
         .iter()
-        .map(|p| format!("{}/{}", p.os, p.arch))
+        .copied()
+        .filter(|&channel| {
+            let Ok((release, version)) = resolve_release_and_version(source, component, channel)
+            else {
+                return false;
+            };
+            overbroad_exemptions(&release, component, &version).contains(platform)
+        })
+        .collect()
+}
+
+/// One finding's report line: `DROP` when resolvable in every channel (safe to drop), else `RETAINED`
+/// with the channels it resolves in (still load-bearing for the others).
+fn render_finding(finding: &ComponentExemptions) -> String {
+    let platform = format!("{}/{}", finding.platform.os, finding.platform.arch);
+    let channels = finding
+        .overbroad_channels
+        .iter()
+        .map(|c| c.as_str())
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    if finding.is_droppable() {
+        format!(
+            "  DROP     {} [{platform}] — resolvable in every signed channel ({channels}); drop the exemption\n",
+            finding.name,
+        )
+    } else {
+        format!(
+            "  RETAINED {} [{platform}] — resolvable in {channels} but not every channel; exemption still load-bearing (per-channel exemptions would be needed to drop it)\n",
+            finding.name,
+        )
+    }
 }
 
 /// The `os/arch` platforms a component resolved, comma-joined, annotating any non-default variant.

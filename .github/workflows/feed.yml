@@ -132,7 +132,13 @@ jobs:
     # on:push) from an unreviewed branch must never sign with the real pinned key + publish to the
     # bases every shipped beacon trusts — that would bypass the §2.4 PR-review gate. The cron + the
     # production dispatch both run on main, so this guard costs nothing legitimate.
-    if: github.ref == 'refs/heads/main'
+    #
+    # The trailing schedule guard scopes signing to the 6-hourly heartbeat cron ONLY: the daily
+    # exemption-audit cron (`17 4 * * *`, dig_ecosystem#2555) must NOT fire an extra signing run.
+    # workflow_dispatch + push still pass (their `github.event.schedule` is empty).
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name != 'schedule' || github.event.schedule == '0 */6 * * *')
     # BEACON_SIGNING_KEY MUST be a main-scoped GitHub Environment secret (env `feed-signing`, #540)
     # with a main-only deployment branch policy — NEVER a plain repo secret. Referencing the environment
     # here readies that binding (an as-yet-uncreated environment is inert; @mt-dev adds the protected secret to it).
@@ -450,8 +456,13 @@ jobs:
     name: Alert on a failing feed
     needs: sign-verify-publish
     # `always()` — a failed matrix leg must not skip this by way of the implicit `success()`,
-    # which is the exact way an alarm ends up silent in the outage it was built for.
-    if: always() && github.ref == 'refs/heads/main'
+    # which is the exact way an alarm ends up silent in the outage it was built for. The schedule
+    # guard scopes it to the 6-hourly signing heartbeat: on the daily audit cron (`17 4 * * *`)
+    # sign-verify-publish is skipped, so its `result` would be "skipped" and this alarm would file a
+    # FALSE feed-failure issue — exclude that cron here (workflow_dispatch + push still pass).
+    if: >-
+      always() && github.ref == 'refs/heads/main'
+      && (github.event_name != 'schedule' || github.event.schedule == '0 */6 * * *')
     runs-on: ubuntu-latest
     permissions:
       contents: read
