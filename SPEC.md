@@ -490,7 +490,13 @@ e.g. access-denied — Windows `0x80070005` — when an unprivileged caller insp
 A status query MUST NOT report *undeterminable* as *absent*: the self-heal MUST re-register ONLY a
 *provably absent* artifact (never an *undeterminable* one, or it could clobber a present-but-
 unreadable task), and `schedule status` MUST NOT tell a user "NOT REGISTERED" when it merely could
-not read the task. Removing the artifact (`schedule uninstall`) removes the artifact and nothing else:
+not read the task. In particular, an UNPRIVILEGED query MUST NOT resolve to *provably absent* from
+`schtasks` stderr alone (#2323): an unelevated `schtasks /Query /TN \DIG\dig-updater` fails with
+"the system cannot find the path specified" because the `\DIG\` task folder is not visible to a
+non-elevated user, which is INDISTINGUISHABLE from a genuinely missing task — so any non-access-denied
+failure seen WITHOUT elevation is *undeterminable*, and only an ELEVATED query (which can read the
+folder) may report *provably absent*. The unprivileged `status` mirror surfaces this as
+`schedule_registered: "unknown"` (§13.2). Removing the artifact (`schedule uninstall`) removes the artifact and nothing else:
 on Windows it MUST NOT delete the containing `\DIG` folder, which belongs to Task Scheduler (above).
 
 **A deliberate removal records its intent FIRST (MANDATORY).** `schedule uninstall` MUST write the
@@ -1443,6 +1449,12 @@ Administrator/root.
                                            // sentinel is present (a deliberate `schedule
                                            // uninstall`), so the self-heal leaves it removed.
                                            // Defaults to false when absent (a pre-#584 mirror)
+  "schedule_registered": "unknown",       // ADDITIVE (§8.4): THREE-valued OS-scheduler registration
+                                           // — "registered" | "not_registered" | "unknown". An
+                                           // UNPRIVILEGED query cannot always distinguish an absent
+                                           // task from one it may not read, so "unknown" is reported
+                                           // rather than a false "not_registered" (#2323). Defaults
+                                           // to "unknown" when absent (a pre-#2323 mirror)
   "trust_state": {                        // an INFORMATIONAL mirror of the persisted trust marks
     "root_version": 1, "sequence": 42, "generated": 1730990000, "rollback_floor_build": 20
   }

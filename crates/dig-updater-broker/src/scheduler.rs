@@ -279,7 +279,13 @@ fn classify_query(success: bool, stderr: &str, is_elevated: bool) -> ScheduleSta
              re-run elevated to read it"
         ));
     }
-    // TODO(#2323): the unprivileged not-visible case falls through to Absent here — the bug.
+    if !is_elevated {
+        return ScheduleStatus::unknown(format!(
+            "cannot determine whether {WINDOWS_TASK_PATH} is registered without elevation — the \
+             unprivileged query cannot distinguish an absent task from one it may not read; \
+             re-run elevated, or: schtasks /Query /TN {WINDOWS_TASK_PATH}"
+        ));
+    }
     ScheduleStatus::absent(format!("no task registered at {WINDOWS_TASK_PATH}"))
 }
 
