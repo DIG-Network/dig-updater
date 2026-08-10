@@ -56,11 +56,11 @@ use dig_updater_trust::{Artifact, Component, SignedDelegation, SignedManifest};
 
 pub use assemble::{assemble_delegation, assemble_manifest};
 pub use channel::Channel;
-pub use config::{AssetKind, ChannelFloors, ComponentConfig, FeedConfig};
+pub use config::{AssetKind, ChannelFloors, ComponentConfig, FeedConfig, PlatformKey};
 pub use error::FeedsignError;
 pub use resolve::{
-    expected_asset_names, resolve_version_from_assets, select_artifacts, GithubRelease,
-    ResolvedArtifact,
+    expected_asset_name, expected_asset_names, resolve_version_from_assets, select_artifacts,
+    GithubRelease, ResolvedArtifact,
 };
 pub use sign::{assert_pinned_root, is_pinned_root, signing_key_from_secret};
 pub use source::{GithubSource, ReleaseSource};

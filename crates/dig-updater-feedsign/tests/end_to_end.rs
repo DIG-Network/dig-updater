@@ -121,11 +121,16 @@ fn fake_source() -> FakeSource {
 }
 
 fn config() -> FeedConfig {
+    // These fixtures ship only linux/x64 (+ windows/x64 for dig-node) to keep the signing e2e small;
+    // the platforms they omit are exempted so the #2343 completeness gate is not the thing under
+    // test here (the gate has its own tests in resolve.rs and shipped_config.rs).
     FeedConfig::from_json(
         r#"{
             "components": [
-                { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node" },
-                { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore" }
+                { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node",
+                  "exempt_platforms": [ {"os":"linux","arch":"arm64"}, {"os":"macos","arch":"arm64"}, {"os":"macos","arch":"x64"} ] },
+                { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore",
+                  "exempt_platforms": [ {"os":"linux","arch":"arm64"}, {"os":"macos","arch":"arm64"}, {"os":"macos","arch":"x64"}, {"os":"windows","arch":"x64"} ] }
             ]
         }"#,
     )
@@ -396,7 +401,8 @@ fn a_component_with_a_headless_variant_signs_both_linux_builds() {
         r#"{ "components": [
             {
                 "name": "dig-app", "repo": "DIG-Network/dig-app", "asset_prefix": "dig-app",
-                "variants": [ { "suffix": "-headless", "variant": "headless" } ]
+                "variants": [ { "suffix": "-headless", "variant": "headless" } ],
+                "exempt_platforms": [ {"os":"linux","arch":"arm64"}, {"os":"macos","arch":"arm64"}, {"os":"macos","arch":"x64"} ]
             }
         ] }"#,
     )
