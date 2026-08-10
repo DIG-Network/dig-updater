@@ -149,7 +149,10 @@ fn a_complete_release_resolves_green_with_its_version() {
         r#"{"components":[{"name":"digstore","repo":"DIG-Network/digstore","asset_prefix":"digstore"}]}"#,
     )
     .unwrap();
-    let src = source(vec![("DIG-Network/digstore", release("v1.2.3", DIGSTORE_ALL))]);
+    let src = source(vec![(
+        "DIG-Network/digstore",
+        release("v1.2.3", DIGSTORE_ALL),
+    )]);
 
     let report = DoctorReport::run(&config, &src, Channel::Stable);
 
@@ -182,7 +185,10 @@ fn a_mixed_config_reports_all_components_and_fails_on_any() {
     ];
     let src = source(vec![
         ("DIG-Network/digstore", release("v1.2.3", DIGSTORE_ALL)),
-        ("DIG-Network/dig-node", release("v0.31.1", dig_node_raw_only)),
+        (
+            "DIG-Network/dig-node",
+            release("v0.31.1", dig_node_raw_only),
+        ),
     ]);
 
     let report = DoctorReport::run(&config, &src, Channel::Stable);

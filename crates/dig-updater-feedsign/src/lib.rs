@@ -41,6 +41,7 @@
 mod assemble;
 mod channel;
 mod config;
+mod doctor;
 mod error;
 mod resolve;
 mod sign;
@@ -57,6 +58,7 @@ use dig_updater_trust::{Artifact, Component, SignedDelegation, SignedManifest};
 pub use assemble::{assemble_delegation, assemble_manifest};
 pub use channel::Channel;
 pub use config::{AssetKind, ChannelFloors, ComponentConfig, FeedConfig, PlatformKey};
+pub use doctor::DoctorReport;
 pub use error::FeedsignError;
 pub use resolve::{
     expected_asset_name, expected_asset_names, resolve_version_from_assets, select_artifacts,
@@ -115,6 +117,77 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// One component successfully resolved for a channel: the version it resolved to, its channel
+/// `build` number (SPEC §10.1), and its per-platform artifacts (before their bytes are fetched).
+#[derive(Debug, Clone)]
+pub struct ResolvedComponent {
+    /// The resolved version string (from the release tag for stable, from the asset names for
+    /// nightly).
+    pub version: String,
+    /// The channel-scaled monotonic build number (packed semver for stable, `YYYYMMDD` for nightly).
+    pub build: u64,
+    /// The per-platform artifacts selected for this component ([`select_artifacts`]).
+    pub artifacts: Vec<ResolvedArtifact>,
+}
+
+/// One component's channel-resolution outcome: its name plus either the [`ResolvedComponent`] or the
+/// [`FeedsignError`] that stopped it (a fetch failure, an unparseable version, or missing/incomplete
+/// declared assets). Capturing the error per component — rather than failing on the first — lets
+/// [`DoctorReport`] report the WHOLE feed's health at once; [`produce_feed`] instead fails closed on
+/// the first error it encounters.
+#[derive(Debug)]
+pub struct ComponentResolution {
+    /// The component id from the config.
+    pub name: String,
+    /// The resolved build, or why resolution failed.
+    pub outcome: Result<ResolvedComponent, FeedsignError>,
+}
+
+/// Resolve EVERY configured component for `channel`, recording each outcome independently.
+///
+/// This is the per-component resolution loop shared by [`produce_feed`] (which fails closed on the
+/// first error) and [`DoctorReport`] (which reports every outcome). For each component it fetches the
+/// channel's release, resolves the version + `build`, and selects the per-platform artifacts — the
+/// SAME sequence signing performs, minus the download + sign, so a doctor pass can never disagree
+/// with what signing would find. No component's failure stops another's resolution.
+#[must_use]
+pub fn resolve_all(
+    config: &FeedConfig,
+    source: &dyn ReleaseSource,
+    channel: Channel,
+) -> Vec<ComponentResolution> {
+    config
+        .components
+        .iter()
+        .map(|component| ComponentResolution {
+            name: component.name.clone(),
+            outcome: resolve_component(source, component, channel),
+        })
+        .collect()
+}
+
+/// Resolve one component for `channel`: fetch its release, recover its version + `build`, and select
+/// its per-platform artifacts.
+///
+/// # Errors
+///
+/// [`FeedsignError`] if the release cannot be fetched, the version cannot be parsed, or the declared
+/// assets are missing/incomplete for a non-exempt platform.
+fn resolve_component(
+    source: &dyn ReleaseSource,
+    component: &ComponentConfig,
+    channel: Channel,
+) -> Result<ResolvedComponent, FeedsignError> {
+    let release = source.release(&component.repo, channel)?;
+    let (version, build) = resolve_version(&release, component, channel)?;
+    let artifacts = select_artifacts(&release, component, &version)?;
+    Ok(ResolvedComponent {
+        version,
+        build,
+        artifacts,
+    })
+}
+
 /// Assemble and sign one `channel`'s feed for one run (SPEC §10.1).
 ///
 /// The `signing_key` is used for BOTH the root delegation signature and the targets manifest
@@ -139,10 +212,16 @@ pub fn produce_feed(
     let mut components = Vec::with_capacity(config.components.len());
     let mut digests = Vec::new();
 
-    for component in &config.components {
-        let release = source.release(&component.repo, channel)?;
-        let (version_str, build) = resolve_version(&release, component, channel)?;
-        let resolved = select_artifacts(&release, component, &version_str)?;
+    // Resolve every component up front through the SAME loop `doctor` uses, then fail closed on the
+    // first error in config order — behaviour-identical to resolving-and-downloading per component,
+    // since resolution has no side effects and the first error is deterministic.
+    for resolution in resolve_all(config, source, channel) {
+        let name = resolution.name;
+        let ResolvedComponent {
+            version: version_str,
+            build,
+            artifacts: resolved,
+        } = resolution.outcome?;
 
         let mut artifacts = Vec::with_capacity(resolved.len());
         for artifact in resolved {
@@ -150,7 +229,7 @@ pub fn produce_feed(
             let sha256 = hex::encode(Sha256::digest(&bytes));
             let size = bytes.len() as u64;
             digests.push(ArtifactDigest {
-                component: component.name.clone(),
+                component: name.clone(),
                 version: version_str.clone(),
                 os: artifact.os.clone(),
                 arch: artifact.arch.clone(),
@@ -169,7 +248,7 @@ pub fn produce_feed(
         }
 
         components.push(Component {
-            name: component.name.clone(),
+            name,
             version: version_str,
             build,
             artifacts,

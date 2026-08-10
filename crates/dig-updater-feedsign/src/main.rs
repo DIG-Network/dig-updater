@@ -3,6 +3,15 @@
 //! The `dig-updater-feedsign` CI binary: assemble + sign the beacon feed, write it out, print a
 //! secret-free summary.
 //!
+//! ## Two modes
+//!
+//! - **`doctor`** (subcommand, or `--doctor`) — validate `feed-config.json` against each component's
+//!   LIVE releases for a channel WITHOUT any signing key (dig_ecosystem#2115), printing a
+//!   per-component report and exiting non-zero if any component's release lacks the asset kind it
+//!   declares. Run in CI BEFORE signing so a broken declaration fails as a named report, not a silent
+//!   red at the signing step. Reads `--config`/`--channel`/`GITHUB_TOKEN` only.
+//! - **default (sign)** — the full assemble + sign pass below (requires `BEACON_SIGNING_KEY`).
+//!
 //! Inputs (CLI flag falls back to environment):
 //!
 //! | purpose            | flag           | env                     | default            |
@@ -34,12 +43,27 @@
 use std::process::ExitCode;
 
 use dig_updater_feedsign::{
-    assert_pinned_root, produce_feed, signing_key_from_secret, Channel, FeedConfig, FeedsignError,
-    GithubSource,
+    assert_pinned_root, produce_feed, signing_key_from_secret, Channel, DoctorReport, FeedConfig,
+    FeedsignError, GithubSource,
 };
 
 fn main() -> ExitCode {
-    match run() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `doctor` (dig_ecosystem#2115) validates feed-config against live releases WITHOUT the signing
+    // key, so it must dispatch BEFORE the signing pass (which requires BEACON_SIGNING_KEY). It exits
+    // FAILURE if any component cannot resolve its declared assets.
+    if is_doctor(&args) {
+        return match run_doctor(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("dig-updater-feedsign doctor: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    match run(&args) {
         Ok(summary) => {
             println!("{summary}");
             ExitCode::SUCCESS
@@ -51,18 +75,49 @@ fn main() -> ExitCode {
     }
 }
 
-/// The whole signing pass; returns the secret-free summary on success.
-fn run() -> Result<String, FeedsignError> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// Whether this invocation selects doctor mode: the `doctor` subcommand as the first argument, or a
+/// `--doctor` flag anywhere.
+fn is_doctor(args: &[String]) -> bool {
+    args.first().is_some_and(|a| a == "doctor") || args.iter().any(|a| a == "--doctor")
+}
 
-    let config_path = input(&args, "--config", "FEEDSIGN_CONFIG")
+/// The doctor pass: resolve every component of `--config`/`FEEDSIGN_CONFIG` for `--channel` against
+/// live GitHub releases (needing NO signing key), print the per-component report, and return
+/// [`ExitCode::FAILURE`] if any component fails resolution.
+fn run_doctor(args: &[String]) -> Result<ExitCode, FeedsignError> {
+    let config_path = input(args, "--config", "FEEDSIGN_CONFIG")
         .unwrap_or_else(|| "feed-config.json".to_string());
-    let out_dir = input(&args, "--out", "FEEDSIGN_OUT").unwrap_or_else(|| "feed-out".to_string());
-    let channel = match input(&args, "--channel", "FEEDSIGN_CHANNEL") {
+    let channel = match input(args, "--channel", "FEEDSIGN_CHANNEL") {
         Some(token) => Channel::from_token(&token)?,
         None => Channel::Stable,
     };
-    let generated = input(&args, "--generated", "FEEDSIGN_GENERATED")
+
+    let config_text = std::fs::read_to_string(&config_path)
+        .map_err(|e| FeedsignError::Config(format!("{config_path}: {e}")))?;
+    let config = FeedConfig::from_json(&config_text)?;
+
+    let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+    let source = GithubSource::github(token);
+
+    let report = DoctorReport::run(&config, &source, channel);
+    print!("{}", report.render());
+    Ok(if report.is_healthy() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// The whole signing pass; returns the secret-free summary on success.
+fn run(args: &[String]) -> Result<String, FeedsignError> {
+    let config_path = input(args, "--config", "FEEDSIGN_CONFIG")
+        .unwrap_or_else(|| "feed-config.json".to_string());
+    let out_dir = input(args, "--out", "FEEDSIGN_OUT").unwrap_or_else(|| "feed-out".to_string());
+    let channel = match input(args, "--channel", "FEEDSIGN_CHANNEL") {
+        Some(token) => Channel::from_token(&token)?,
+        None => Channel::Stable,
+    };
+    let generated = input(args, "--generated", "FEEDSIGN_GENERATED")
         .ok_or_else(|| {
             FeedsignError::MissingInput(
                 "--generated / FEEDSIGN_GENERATED (unix seconds)".to_string(),
@@ -94,7 +149,7 @@ fn run() -> Result<String, FeedsignError> {
 
     // Optionally emit the transparency-log triple for a public log (Rekor, #533). Derived from the
     // signed feed, so it can only reflect exactly what was published.
-    if let Some(dir) = input(&args, "--transparency-out", "FEEDSIGN_TRANSPARENCY_OUT") {
+    if let Some(dir) = input(args, "--transparency-out", "FEEDSIGN_TRANSPARENCY_OUT") {
         feed.transparency()?.write_to(std::path::Path::new(&dir))?;
     }
 
