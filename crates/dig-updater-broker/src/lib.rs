@@ -615,6 +615,7 @@ impl Broker {
             next_wake: self.estimate_next_wake(now),
             trust_state,
             schedule_opted_out: optout::is_opted_out(&paths::default_state_dir()),
+            schedule_registered: Self::schedule_registration(),
         };
         self.write_status_best_effort(&StatusSnapshot::from_dry_check(report, &ctx));
     }
@@ -632,6 +633,7 @@ impl Broker {
             next_wake: self.estimate_next_wake(now),
             trust_state,
             schedule_opted_out: optout::is_opted_out(&paths::default_state_dir()),
+            schedule_registered: Self::schedule_registration(),
         };
         self.write_status_best_effort(&StatusSnapshot::from_pass(report, &ctx));
     }
@@ -650,7 +652,17 @@ impl Broker {
         // — a dry check relocates the latter to a user-writable dir (#582), where a user could plant
         // a marker to spoof `schedule_opted_out` in the world-readable status mirror (#584 finding 2).
         snapshot.schedule_opted_out = optout::is_opted_out(&paths::default_state_dir());
+        snapshot.schedule_registered = Self::schedule_registration();
         self.write_status_best_effort(&snapshot);
+    }
+
+    /// The three-valued OS-scheduler registration state for the status mirror (#2323): the presence
+    /// [`scheduler::status`] reports, mapped to [`status::ScheduleRegistration`]. Best-effort — a
+    /// failure to even query the scheduler is reported as `Unknown`, never a false "not registered".
+    fn schedule_registration() -> status::ScheduleRegistration {
+        scheduler::status()
+            .map(|status| status.presence.into())
+            .unwrap_or(status::ScheduleRegistration::Unknown)
     }
 
     /// Persist `snapshot` to the world-readable status mirror. Best-effort: failing to write it

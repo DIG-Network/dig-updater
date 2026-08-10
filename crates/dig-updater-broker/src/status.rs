@@ -28,6 +28,36 @@ use dig_updater_worker::WorkerReport;
 /// The current on-disk schema of [`StatusSnapshot`] (SPEC §13.2).
 pub const STATUS_SCHEMA: u32 = 1;
 
+/// Whether the daily schedule artifact is registered with the OS, as reported in the status mirror
+/// (#2323). A THREE-valued answer, because `dig-updater status` runs UNPRIVILEGED and an unprivileged
+/// query genuinely cannot always tell an absent task from one it may not read (see
+/// [`crate::scheduler::SchedulePresence`]): reporting a plain boolean would force "can't tell" to
+/// masquerade as "not registered", which stated the opposite of the truth on a machine where the
+/// task IS registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleRegistration {
+    /// The daily schedule artifact is registered with the OS scheduler.
+    Registered,
+    /// The artifact is PROVABLY absent (a query that could actually see it reported "no such task").
+    NotRegistered,
+    /// The artifact's presence could not be determined (e.g. an unprivileged query that cannot
+    /// distinguish absent from unreadable, #2323) — NOT the same as [`Self::NotRegistered`].
+    #[default]
+    Unknown,
+}
+
+impl From<crate::scheduler::SchedulePresence> for ScheduleRegistration {
+    fn from(presence: crate::scheduler::SchedulePresence) -> Self {
+        use crate::scheduler::SchedulePresence;
+        match presence {
+            SchedulePresence::Registered => Self::Registered,
+            SchedulePresence::Absent => Self::NotRegistered,
+            SchedulePresence::Unknown => Self::Unknown,
+        }
+    }
+}
+
 const STATUS_FILE: &str = "status.json";
 
 /// One component's most-recently-observed decision: either a dry check's staged-artifact preview
@@ -63,6 +93,10 @@ pub struct StatusContext<'a> {
     /// Whether the operator has DELIBERATELY opted out of the daily schedule (#584): an Admin-owned
     /// opt-out sentinel is present, so the self-heal / re-arm driver will NOT re-register it.
     pub schedule_opted_out: bool,
+    /// Whether the daily schedule artifact is registered with the OS scheduler (#2323) — a
+    /// three-valued answer honest about the unprivileged "can't tell" case (see
+    /// [`ScheduleRegistration`]). Derived from [`crate::scheduler::status`]'s presence.
+    pub schedule_registered: ScheduleRegistration,
 }
 
 /// The beacon's unprivileged, world-readable status (SPEC §13.2).
@@ -105,6 +139,14 @@ pub struct StatusSnapshot {
     /// beacon still deserializes — an older mirror simply reports "not opted out".
     #[serde(default)]
     pub schedule_opted_out: bool,
+    /// Whether the daily schedule artifact is registered with the OS scheduler (#2323), as a
+    /// three-valued answer ([`ScheduleRegistration`]): `registered`, `not_registered`, or `unknown`
+    /// when an unprivileged query cannot tell absent from unreadable.
+    ///
+    /// ADDITIVE (SPEC §5.1 / §13.2): defaults to [`ScheduleRegistration::Unknown`] so a `status.json`
+    /// written by a pre-#2323 beacon still deserializes — an older mirror simply reports "unknown".
+    #[serde(default)]
+    pub schedule_registered: ScheduleRegistration,
     /// The components whose artifact this host cannot LOAD, and which the last pass therefore REFUSED
     /// to install (dig_ecosystem#1870 — [`crate::loadable`]). Empty on a host that can load everything
     /// the feed offers it.
@@ -144,6 +186,7 @@ impl StatusSnapshot {
             next_wake: None,
             trust_state: TrustState::initial(),
             schedule_opted_out: false,
+            schedule_registered: ScheduleRegistration::Unknown,
             refused_components: Vec::new(),
         }
     }
@@ -243,6 +286,7 @@ impl StatusSnapshot {
             next_wake: ctx.next_wake,
             trust_state: ctx.trust_state,
             schedule_opted_out: ctx.schedule_opted_out,
+            schedule_registered: ctx.schedule_registered,
             refused_components: Vec::new(),
         }
     }
@@ -311,6 +355,7 @@ impl<'a> StatusContext<'a> {
             next_wake: None,
             trust_state: TrustState::initial(),
             schedule_opted_out: false,
+            schedule_registered: ScheduleRegistration::Unknown,
         }
     }
 }
@@ -437,6 +482,7 @@ mod tests {
             next_wake: None,
             trust_state: TrustState::initial(),
             schedule_opted_out: false,
+            schedule_registered: ScheduleRegistration::Unknown,
         };
         let snapshot = PassReport::already_running();
         let status = StatusSnapshot::from_pass(&snapshot, &ctx);
@@ -521,6 +567,52 @@ mod tests {
             json["components"][1]["result"], "installed",
             "the OTHER component still installed — a refusal is per-component, not a stalled pass"
         );
+    }
+
+    #[test]
+    fn schedule_registered_serializes_distinctly_across_all_three_states() {
+        // #2323: the status mirror must expose a THREE-valued registration answer so an unprivileged
+        // "can't tell" is not forced to masquerade as "not registered". Each state serializes to its
+        // own snake_case token, and every state must be distinguishable from the others.
+        let token = |reg: ScheduleRegistration| {
+            let mut snapshot = StatusSnapshot::never_checked();
+            snapshot.schedule_registered = reg;
+            serde_json::to_value(&snapshot).expect("serialize")["schedule_registered"]
+                .as_str()
+                .expect("schedule_registered is a string token")
+                .to_string()
+        };
+        assert_eq!(token(ScheduleRegistration::Registered), "registered");
+        assert_eq!(token(ScheduleRegistration::NotRegistered), "not_registered");
+        assert_eq!(token(ScheduleRegistration::Unknown), "unknown");
+        // A round-trip preserves each state (the field is a real contract, not write-only).
+        for reg in [
+            ScheduleRegistration::Registered,
+            ScheduleRegistration::NotRegistered,
+            ScheduleRegistration::Unknown,
+        ] {
+            let mut snapshot = StatusSnapshot::never_checked();
+            snapshot.schedule_registered = reg;
+            let bytes = serde_json::to_vec(&snapshot).expect("serialize");
+            let parsed: StatusSnapshot = serde_json::from_slice(&bytes).expect("deserialize");
+            assert_eq!(parsed.schedule_registered, reg);
+        }
+    }
+
+    #[test]
+    fn a_pre_2323_status_json_still_deserializes_as_unknown_registration() {
+        // The additive-field contract (SPEC §5.1 / §13.2): a mirror written before #2323 has no
+        // `schedule_registered` key, and must load as `Unknown` (the honest default) rather than
+        // failing to parse or inventing a false "registered"/"not_registered".
+        let mut older = serde_json::to_value(StatusSnapshot::never_checked()).expect("serialize");
+        older
+            .as_object_mut()
+            .expect("object")
+            .remove("schedule_registered")
+            .expect("the fixture must actually drop the new field");
+        let parsed: StatusSnapshot =
+            serde_json::from_value(older).expect("a pre-#2323 mirror loads");
+        assert_eq!(parsed.schedule_registered, ScheduleRegistration::Unknown);
     }
 
     #[test]
