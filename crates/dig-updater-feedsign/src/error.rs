@@ -35,6 +35,23 @@ pub enum FeedsignError {
         expected: String,
     },
 
+    /// A component resolved SOME but not all of its default platforms, and at least one missing
+    /// `(os, arch)` pair was not declared exempt (dig_ecosystem#2343). Fails the feed closed so a
+    /// partial release never publishes a GREEN feed that silently drops the missing-platform hosts —
+    /// the generalization of the #2290 zero-asset outage, worse because nothing else goes red. The
+    /// message names each undeclared-missing pair, derived from the same platform set the selector
+    /// matched against.
+    #[error(
+        "component {component}: incomplete platform coverage — missing {missing} \
+         with no exemption declared (dig_ecosystem#2343)"
+    )]
+    IncompleteArtifacts {
+        /// The component name from the config.
+        component: String,
+        /// The `os/arch` pairs that were missing and not exempted, comma-joined.
+        missing: String,
+    },
+
     /// A network/transport error talking to GitHub (release metadata or an asset download).
     #[error("fetch {url}: {detail}")]
     Fetch {

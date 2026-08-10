@@ -117,6 +117,29 @@ pub struct ComponentConfig {
     /// carries `variant: None`.
     #[serde(default)]
     pub variants: Vec<VariantSpec>,
+    /// The `(os, arch)` platforms this component is EXPLICITLY ALLOWED to miss (dig_ecosystem#2343).
+    ///
+    /// [`crate::resolve::select_artifacts`] fails the feed closed when a component resolves fewer than
+    /// the full [platform set](crate::resolve::expected_asset_names) of DEFAULT artifacts — a partial
+    /// release would otherwise publish a GREEN feed that silently drops every missing-platform host
+    /// (the generalization of the #2290 zero-asset outage, worse because nothing goes red). A platform
+    /// listed here is a deliberate, reviewable exemption: the component genuinely does not ship it yet,
+    /// so its absence is expected rather than a regression. Every other missing platform is an error.
+    ///
+    /// `#[serde(default)]` so an entry that ships every platform needs no `exempt_platforms` at all.
+    #[serde(default)]
+    pub exempt_platforms: Vec<PlatformKey>,
+}
+
+/// One `(os, arch)` platform a component is allowed to miss ([`ComponentConfig::exempt_platforms`]).
+/// The `os`/`arch` tokens use the same vocabulary as the manifest artifacts and
+/// [`crate::resolve`]'s platform set (e.g. `{ "os": "linux", "arch": "arm64" }`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PlatformKey {
+    /// OS token (`windows` | `linux` | `macos`).
+    pub os: String,
+    /// Arch token (`x64` | `arm64`).
+    pub arch: String,
 }
 
 /// One declared non-default build VARIANT of a component (dig_ecosystem#1912): the asset-name

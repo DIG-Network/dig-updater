@@ -1123,8 +1123,22 @@ failure MUST enumerate every asset FILE NAME that was searched for — each plat
 for the component's declared `asset_kind`, plus each declared variant's `{default}{suffix}` name —
 so the diagnostic can never describe a shape the selector did not use, nor omit one it did. The
 nightly version-RECOVERY step searches only the default names (a variant suffix would corrupt the
-recovered version), and its failure reports only those. The
-alpha component set is **dig-node (native package), digstore, dig-updater,
+recovered version), and its failure reports only those.
+
+**Platform completeness (normative).** Resolving SOME but not all platforms MUST ALSO fail the
+signing run closed, unless every missing `(os, arch)` pair is declared in the component's
+`exempt_platforms`. A component MUST resolve a DEFAULT artifact (the `variant: None` build) for every
+platform in the beacon's platform set (`linux/x64`, `linux/arm64`, `macos/arm64`, `macos/x64`,
+`windows/x64`) except those it declares exempt; a variant build never counts toward coverage. Absent
+this gate a partial release publishes a well-formed, freshly-signed feed that simply omits the
+missing-platform components — so those hosts silently stop updating with nothing going red (the
+generalization of the zero-asset outage). The failure MUST name each undeclared-missing pair, derived
+from the same platform set the selector matched against. `exempt_platforms` is a per-component,
+committed, reviewable declaration that the component genuinely does not ship those platforms yet; it
+defaults to empty. The alpha config exempts `linux/arm64` for every component (no DIG release ships
+that platform yet); each exemption is removed as its repo begins publishing the platform.
+
+The alpha component set is **dig-node (native package), digstore, dig-updater,
 dig-dns, dig-app (raw binaries)** — dig-app is PUBLISHED in the feed but not yet tracked by the
 broker's catalog (§9.7), and a manifest entry for an untracked component is inert; each component's `asset_kind` comes from the committed `feed-config.json`
 (default kind `raw_binary`). The anti-rollback floor is **per channel** (`channels.stable`,

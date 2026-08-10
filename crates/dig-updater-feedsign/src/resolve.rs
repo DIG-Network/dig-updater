@@ -65,7 +65,8 @@ fn asset_name_parts(prefix: &str, os: &str, arch: &str, kind: AssetKind) -> (Str
 }
 
 /// The exact release-asset file name a component of `kind` publishes for `(os, arch)` at `version`.
-fn expected_asset_name(
+#[must_use]
+pub fn expected_asset_name(
     prefix: &str,
     version: &str,
     os: &str,
@@ -249,12 +250,62 @@ pub fn select_artifacts(
         }
     }
     if artifacts.is_empty() {
+        // The all-missing case (a misconfigured prefix or a release with no binaries): reported as
+        // NoArtifacts with the full searched-for shape, unchanged from before dig_ecosystem#2343.
         return Err(FeedsignError::NoArtifacts {
             component: component.name.clone(),
             expected: no_artifacts_expected(component, version, &component.variants),
         });
     }
+
+    // Completeness gate (dig_ecosystem#2343): a release that resolves SOME but not all default
+    // platforms would otherwise publish a GREEN feed that silently drops every missing-platform
+    // host — the generalization of the #2290 zero-asset outage, worse because nothing goes red. A
+    // platform a component genuinely does not ship yet must be declared in `exempt_platforms`; any
+    // OTHER missing platform fails the feed closed, named from the SAME PLATFORMS set the selector
+    // matched against (never a second hardcoded vocabulary, cf. dig_ecosystem#618).
+    if let Some(missing) = missing_default_platforms(&artifacts, component) {
+        return Err(FeedsignError::IncompleteArtifacts {
+            component: component.name.clone(),
+            missing,
+        });
+    }
     Ok(artifacts)
+}
+
+/// The `(os, arch)` platforms in [`PLATFORMS`] that `component` resolved NO default artifact for and
+/// did NOT declare exempt, formatted as `os/arch` and comma-joined — or `None` when coverage is
+/// complete (every platform either resolved or exempted).
+///
+/// Coverage is judged over the DEFAULT artifacts only (`variant: None`): a variant is an optional
+/// extra build (a platform may ship the default without it), so it is never what makes a platform
+/// "covered". The set is derived from the resolved artifacts and the [`PLATFORMS`] loop the selector
+/// itself walks, so the diagnostic can only ever name platforms the selector actually looked for.
+fn missing_default_platforms(
+    artifacts: &[ResolvedArtifact],
+    component: &ComponentConfig,
+) -> Option<String> {
+    let is_exempt = |os: &str, arch: &str| {
+        component
+            .exempt_platforms
+            .iter()
+            .any(|p| p.os == os && p.arch == arch)
+    };
+    let covered = |os: &str, arch: &str| {
+        artifacts
+            .iter()
+            .any(|a| a.variant.is_none() && a.os == os && a.arch == arch)
+    };
+    let missing: Vec<String> = PLATFORMS
+        .iter()
+        .filter(|(os, arch)| !covered(os, arch) && !is_exempt(os, arch))
+        .map(|(os, arch)| format!("{os}/{arch}"))
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing.join(", "))
+    }
 }
 
 /// Recover the version string shared by a `component`'s assets in a rolling `nightly` release.
@@ -306,6 +357,15 @@ mod tests {
             asset_prefix: "dig-node".into(),
             asset_kind: AssetKind::RawBinary,
             variants: vec![],
+            exempt_platforms: vec![],
+        }
+    }
+
+    /// A [`PlatformKey`] for `(os, arch)`, for building test exemption lists.
+    fn exempt(os: &str, arch: &str) -> crate::config::PlatformKey {
+        crate::config::PlatformKey {
+            os: os.into(),
+            arch: arch.into(),
         }
     }
 
@@ -325,6 +385,7 @@ mod tests {
             asset_prefix: name.into(),
             asset_kind: AssetKind::RawBinary,
             variants: vec![],
+            exempt_platforms: vec![],
         }
     }
 
@@ -450,13 +511,15 @@ mod tests {
 
     #[test]
     fn raw_binary_linux_arm64_selects_the_linux_arm64_asset() {
-        // A digstore release carrying `-linux-arm64` resolves it for linux/arm64.
+        // A COMPLETE digstore release (all five platforms) carrying `-linux-arm64` resolves it for
+        // linux/arm64. macos/x64 is present too so the #2343 completeness gate is satisfied.
         let release = GithubRelease {
             tag_name: "v0.13.1".into(),
             assets: vec![
                 asset("digstore-0.13.1-linux-x64"),
                 asset("digstore-0.13.1-linux-arm64"),
                 asset("digstore-0.13.1-macos-arm64"),
+                asset("digstore-0.13.1-macos-x64"),
                 asset("digstore-0.13.1-windows-x64.exe"),
             ],
         };
@@ -473,10 +536,11 @@ mod tests {
     }
 
     #[test]
-    fn a_component_without_arm64_still_resolves_its_other_platforms() {
-        // Graceful degrade: a component publishing x64/macos/windows but NO arm64 asset still
-        // resolves its other platforms and publishes — the same tolerated case as any absent
-        // platform, now that linux/arm64 is one more sometimes-absent slot.
+    fn a_component_that_exempts_arm64_resolves_its_other_platforms() {
+        // Graceful degrade, now EXPLICIT (#2343): a component publishing x64/macos/windows but no
+        // linux/arm64 asset still resolves + publishes — but only because it DECLARES linux/arm64
+        // exempt. Without that declaration the missing platform fails the feed closed (see
+        // `a_partial_release_without_exemption_is_an_error`).
         let release = GithubRelease {
             tag_name: "v0.29.0".into(),
             assets: vec![
@@ -486,7 +550,11 @@ mod tests {
                 asset("dig-node-0.29.0-windows-x64.exe"),
             ],
         };
-        let arts = select_artifacts(&release, &component(), "0.29.0").unwrap();
+        let cfg = ComponentConfig {
+            exempt_platforms: vec![exempt("linux", "arm64")],
+            ..component()
+        };
+        let arts = select_artifacts(&release, &cfg, "0.29.0").unwrap();
         assert_eq!(arts.len(), 4, "the four present platforms resolve");
         assert!(
             !arts.iter().any(|a| a.arch == "arm64" && a.os == "linux"),
@@ -529,18 +597,19 @@ mod tests {
     }
 
     #[test]
-    fn selects_all_four_platforms() {
+    fn selects_all_five_platforms() {
         let release = GithubRelease {
             tag_name: "v0.29.0".into(),
             assets: vec![
                 asset("dig-node-0.29.0-linux-x64"),
+                asset("dig-node-0.29.0-linux-arm64"),
                 asset("dig-node-0.29.0-macos-arm64"),
                 asset("dig-node-0.29.0-macos-x64"),
                 asset("dig-node-0.29.0-windows-x64.exe"),
             ],
         };
         let arts = select_artifacts(&release, &component(), "0.29.0").unwrap();
-        assert_eq!(arts.len(), 4);
+        assert_eq!(arts.len(), 5);
         assert_eq!(arts[0].os, "linux");
         assert_eq!(arts[0].arch, "x64");
         assert_eq!(
@@ -568,6 +637,14 @@ mod tests {
             asset_prefix: "digstore".into(),
             asset_kind: AssetKind::RawBinary,
             variants: vec![],
+            // This fixture ships only linux/x64 to isolate the sibling-exclusion behaviour; the
+            // other platforms are exempted so the completeness gate (#2343) does not mask the point.
+            exempt_platforms: vec![
+                exempt("linux", "arm64"),
+                exempt("macos", "arm64"),
+                exempt("macos", "x64"),
+                exempt("windows", "x64"),
+            ],
         };
         let arts = select_artifacts(&release, &cfg, "0.13.1").unwrap();
         assert_eq!(arts.len(), 1);
@@ -582,16 +659,21 @@ mod tests {
     /// PACKAGES — because the broker installs dig-node via `msiexec`/`installer`/`dpkg`, so signing
     /// the raw PE and staging it as `dig-node.msi` makes `msiexec` reject it (exit 1620).
     fn dig_node_full_release() -> GithubRelease {
+        // A COMPLETE release: every platform is present in both the raw-binary and native-package
+        // shapes (including the linux/arm64 `-linux-arm64` binary and `_arm64.deb`), so both a
+        // raw-binary and a native-package view of it satisfy the #2343 completeness gate.
         GithubRelease {
             tag_name: "v0.31.1".into(),
             assets: vec![
                 asset("dig-node-0.31.1-linux-x64"),
+                asset("dig-node-0.31.1-linux-arm64"),
                 asset("dig-node-0.31.1-macos-arm64"),
                 asset("dig-node-0.31.1-macos-x64"),
                 asset("dig-node-0.31.1-macos.pkg"),
                 asset("dig-node-0.31.1-windows-x64.exe"),
                 asset("dig-node-0.31.1-windows-x64.msi"),
                 asset("dig-node_0.31.1_amd64.deb"),
+                asset("dig-node_0.31.1_arm64.deb"),
             ],
         }
     }
@@ -690,6 +772,15 @@ mod tests {
                 suffix: "-headless".into(),
                 variant: "headless".into(),
             }],
+            // These tests exercise VARIANT selection, not platform completeness, on releases that
+            // ship only a subset of platforms — so every platform but linux/x64 is exempted, keeping
+            // the completeness gate (#2343) out of the way of the behaviour under test.
+            exempt_platforms: vec![
+                exempt("linux", "arm64"),
+                exempt("macos", "arm64"),
+                exempt("macos", "x64"),
+                exempt("windows", "x64"),
+            ],
         }
     }
 
@@ -735,7 +826,18 @@ mod tests {
                 asset("dig-node-0.29.0-linux-x64-headless"),
             ],
         };
-        let arts = select_artifacts(&release, &component(), "0.29.0").unwrap();
+        // This fixture ships only linux/x64 to isolate the undeclared-suffix behaviour; the other
+        // platforms are exempted so the completeness gate (#2343) does not obscure the point.
+        let cfg = ComponentConfig {
+            exempt_platforms: vec![
+                exempt("linux", "arm64"),
+                exempt("macos", "arm64"),
+                exempt("macos", "x64"),
+                exempt("windows", "x64"),
+            ],
+            ..component()
+        };
+        let arts = select_artifacts(&release, &cfg, "0.29.0").unwrap();
         assert_eq!(arts.len(), 1, "an undeclared suffix is never selected");
         assert_eq!(arts[0].variant, None);
         assert!(arts[0].url.ends_with("dig-node-0.29.0-linux-x64"));
@@ -755,7 +857,9 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_a_missing_platform() {
+    fn tolerates_missing_platforms_only_when_they_are_exempted() {
+        // #2343: a release that ships just linux/x64 + windows/x64 resolves ONLY because the three
+        // absent platforms are declared exempt. This is the graceful-degrade path made explicit.
         let release = GithubRelease {
             tag_name: "v0.29.0".into(),
             assets: vec![
@@ -763,8 +867,85 @@ mod tests {
                 asset("dig-node-0.29.0-windows-x64.exe"),
             ],
         };
-        let arts = select_artifacts(&release, &component(), "0.29.0").unwrap();
+        let cfg = ComponentConfig {
+            exempt_platforms: vec![
+                exempt("linux", "arm64"),
+                exempt("macos", "arm64"),
+                exempt("macos", "x64"),
+            ],
+            ..component()
+        };
+        let arts = select_artifacts(&release, &cfg, "0.29.0").unwrap();
         assert_eq!(arts.len(), 2);
+    }
+
+    #[test]
+    fn a_partial_release_without_exemption_is_an_error() {
+        // The RED anchor for #2343: a release missing exactly ONE platform (macos/x64) with NO
+        // exemption must fail the feed closed — before the completeness gate this returned Ok with a
+        // silently-incomplete four-platform set, publishing a GREEN feed that dropped macos/x64 hosts.
+        let release = GithubRelease {
+            tag_name: "v0.29.0".into(),
+            assets: vec![
+                asset("dig-node-0.29.0-linux-x64"),
+                asset("dig-node-0.29.0-linux-arm64"),
+                asset("dig-node-0.29.0-macos-arm64"),
+                asset("dig-node-0.29.0-windows-x64.exe"),
+            ],
+        };
+        let Err(FeedsignError::IncompleteArtifacts { component, missing }) =
+            select_artifacts(&release, &component(), "0.29.0")
+        else {
+            panic!("a partial release with no exemption must fail closed");
+        };
+        assert_eq!(component, "dig-node");
+        assert_eq!(
+            missing, "macos/x64",
+            "the error must name exactly the missing pair, got: {missing}"
+        );
+    }
+
+    #[test]
+    fn a_release_missing_two_platforms_names_both_when_unexempted() {
+        // Three of the five platforms resolve; the gate is not implicit — the two absent platforms,
+        // undeclared, both fail the feed closed and are both named.
+        let release = GithubRelease {
+            tag_name: "v0.29.0".into(),
+            assets: vec![
+                asset("dig-node-0.29.0-linux-x64"),
+                asset("dig-node-0.29.0-macos-arm64"),
+                asset("dig-node-0.29.0-windows-x64.exe"),
+            ],
+        };
+        let Err(FeedsignError::IncompleteArtifacts { missing, .. }) =
+            select_artifacts(&release, &component(), "0.29.0")
+        else {
+            panic!("three-of-five with no exemption must fail closed");
+        };
+        assert!(
+            missing.contains("linux/arm64") && missing.contains("macos/x64"),
+            "both missing pairs must be named, got: {missing}"
+        );
+    }
+
+    #[test]
+    fn a_partial_release_with_every_missing_platform_exempted_succeeds() {
+        // The same three-of-five release resolves cleanly once BOTH absent platforms are declared
+        // exempt — proving the exemption, not luck, is what makes a partial release publishable.
+        let release = GithubRelease {
+            tag_name: "v0.29.0".into(),
+            assets: vec![
+                asset("dig-node-0.29.0-linux-x64"),
+                asset("dig-node-0.29.0-macos-arm64"),
+                asset("dig-node-0.29.0-windows-x64.exe"),
+            ],
+        };
+        let cfg = ComponentConfig {
+            exempt_platforms: vec![exempt("linux", "arm64"), exempt("macos", "x64")],
+            ..component()
+        };
+        let arts = select_artifacts(&release, &cfg, "0.29.0").expect("all gaps exempted → green");
+        assert_eq!(arts.len(), 3, "the three shipped platforms resolve");
     }
 
     #[test]
@@ -794,8 +975,17 @@ mod tests {
             .expect("recovers the nightly version");
         assert_eq!(version, "0.9.0-nightly.20260714.abc1234");
 
-        // …and that recovered version drives an exact selection, same as stable.
-        let arts = select_artifacts(&release, &component_named("dig-updater"), &version).unwrap();
+        // …and that recovered version drives an exact selection, same as stable. This nightly ships
+        // only linux/x64 + windows/x64, so the other three platforms are exempted (#2343).
+        let cfg = ComponentConfig {
+            exempt_platforms: vec![
+                exempt("linux", "arm64"),
+                exempt("macos", "arm64"),
+                exempt("macos", "x64"),
+            ],
+            ..component_named("dig-updater")
+        };
+        let arts = select_artifacts(&release, &cfg, &version).unwrap();
         assert_eq!(arts.len(), 2);
     }
 

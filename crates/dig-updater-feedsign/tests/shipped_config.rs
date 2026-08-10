@@ -7,7 +7,10 @@
 //! feed down for every component at once. That is worth a test that runs offline, on every PR,
 //! against pinned real-release asset names.
 
-use dig_updater_feedsign::{select_artifacts, AssetKind, FeedConfig, GithubRelease};
+use dig_updater_feedsign::{
+    expected_asset_name, expected_asset_names, select_artifacts, AssetKind, ComponentConfig,
+    FeedConfig, FeedsignError, GithubRelease,
+};
 
 /// The config the Feed workflow signs with (`--config feed-config.json`, from the repo root).
 fn shipped_config() -> FeedConfig {
@@ -238,5 +241,116 @@ fn this_repos_build_produces_exactly_the_asset_names_its_declared_kind_expects()
         "this repo's build output and its declared `asset_kind` ({:?}) have drifted: the feed would \
          resolve zero artifacts for {}",
         me.asset_kind, me.name
+    );
+}
+
+/// Build a release for `component` at `version` that ships EVERY default (and declared-variant) asset
+/// the component looks for EXCEPT the platforms it declares exempt — i.e. the release shape the feed
+/// actually faces today, given the recorded gaps. Every name comes from the same matcher the selector
+/// uses ([`expected_asset_names`]/[`expected_asset_name`]), so the fixture can never diverge from the
+/// vocabulary the completeness gate judges against.
+fn release_shipping_all_but_exemptions(
+    component: &ComponentConfig,
+    version: &str,
+) -> GithubRelease {
+    let mut names = expected_asset_names(
+        &component.asset_prefix,
+        version,
+        component.asset_kind,
+        &component.variants,
+    );
+    for pk in &component.exempt_platforms {
+        // The exempted platform's default name — and any `{default}{suffix}` variant built on it —
+        // are the assets that platform would contribute; drop them to simulate its real absence.
+        let default = expected_asset_name(
+            &component.asset_prefix,
+            version,
+            &pk.os,
+            &pk.arch,
+            component.asset_kind,
+        );
+        names.retain(|n| !n.starts_with(&default));
+    }
+    let assets: Vec<String> = names
+        .iter()
+        .map(|name| {
+            format!(r#"{{"name":"{name}","browser_download_url":"https://example.test/{name}"}}"#)
+        })
+        .collect();
+    let json = format!(
+        r#"{{"tag_name":"v{version}","assets":[{}]}}"#,
+        assets.join(",")
+    );
+    GithubRelease::from_json("https://api/x", &json).expect("the synthesised release parses")
+}
+
+/// The core dig_ecosystem#2343 guarantee at the production layer: given a release that ships exactly
+/// what each component ships TODAY (everything but its recorded `exempt_platforms`), the shipped feed
+/// resolves green for EVERY component — so neither the stable nor the nightly signing run fails
+/// closed on the current, known linux/arm64 gap. Selection is channel-agnostic, so a green
+/// `select_artifacts` here is a green feed on BOTH channels (§10.1).
+#[test]
+fn the_shipped_config_resolves_green_for_every_component_given_todays_recorded_gaps() {
+    for c in &shipped_config().components {
+        let release = release_shipping_all_but_exemptions(c, "9.9.9");
+        select_artifacts(&release, c, "9.9.9").unwrap_or_else(|e| {
+            panic!(
+                "{} must resolve green with its recorded exemptions in place, but failed: {e}",
+                c.name
+            )
+        });
+    }
+}
+
+/// The exemptions are load-bearing, not decorative: if a component drops a platform it did NOT
+/// declare exempt, the completeness gate fails the feed closed and names that platform — the exact
+/// silent-drop this change exists to prevent. Proven against dig-node by withholding windows/x64
+/// (which it is NOT exempt from) on top of today's release shape.
+#[test]
+fn an_unexempted_gap_fails_the_shipped_feed_closed_and_is_named() {
+    let cfg = shipped_config();
+    let dig_node = cfg
+        .components
+        .iter()
+        .find(|c| c.name == "dig-node")
+        .expect("dig-node is a tracked component");
+    assert!(
+        !dig_node
+            .exempt_platforms
+            .iter()
+            .any(|p| p.os == "windows" && p.arch == "x64"),
+        "this test assumes windows/x64 is NOT exempt for dig-node"
+    );
+
+    let full = release_shipping_all_but_exemptions(dig_node, "9.9.9");
+    let windows_default = expected_asset_name(
+        &dig_node.asset_prefix,
+        "9.9.9",
+        "windows",
+        "x64",
+        dig_node.asset_kind,
+    );
+    let assets: Vec<String> = full
+        .assets
+        .iter()
+        .filter(|a| !a.name.starts_with(&windows_default))
+        .map(|a| {
+            format!(
+                r#"{{"name":"{}","browser_download_url":"{}"}}"#,
+                a.name, a.browser_download_url
+            )
+        })
+        .collect();
+    let json = format!(r#"{{"tag_name":"v9.9.9","assets":[{}]}}"#, assets.join(","));
+    let release = GithubRelease::from_json("https://api/x", &json).expect("parses");
+
+    let Err(FeedsignError::IncompleteArtifacts { missing, .. }) =
+        select_artifacts(&release, dig_node, "9.9.9")
+    else {
+        panic!("an unexempted missing platform must fail the feed closed");
+    };
+    assert!(
+        missing.contains("windows/x64"),
+        "the error must name the unexempted gap, got: {missing}"
     );
 }
