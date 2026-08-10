@@ -121,8 +121,54 @@ pub enum EnsureAction {
 /// [`BrokerError::Io`] if the caller lacks the privilege to register a SYSTEM/root-run schedule,
 /// if the underlying OS scheduler call fails, or if the opt-out sentinel could not be cleared.
 pub fn install(exe: &Path, state_dir: &Path) -> Result<(), BrokerError> {
-    imp::install(exe)?;
+    install_with(
+        exe,
+        state_dir,
+        crate::secure::path_is_privileged_owned,
+        imp::install,
+    )
+}
+
+/// [`install`] factored over its two OS boundaries — the privilege check on `exe`'s directory and the
+/// actual OS registration — so the refusal guard is unit-testable without a privileged runner or a
+/// real scheduler write.
+///
+/// The guard runs FIRST: the schedule is registered only from a privileged-owned install root, so a
+/// later writer of that directory cannot swap the binary this SYSTEM/root daily task runs.
+fn install_with(
+    exe: &Path,
+    state_dir: &Path,
+    is_privileged: impl Fn(&Path) -> bool,
+    register: impl FnOnce(&Path) -> Result<(), BrokerError>,
+) -> Result<(), BrokerError> {
+    refuse_unprivileged_exe_dir(exe, is_privileged)?;
+    register(exe)?;
     crate::optout::clear_opted_out(state_dir)
+}
+
+/// Refuse to register a SYSTEM/root daily schedule for a binary whose containing directory is NOT
+/// privileged-owned (dig_ecosystem#2334, the §565 "privileged artifact whose path is user-controlled"
+/// class).
+///
+/// The daily task runs `exe` as SYSTEM/root forever with no further prompt. If the directory holding
+/// `exe` is user-writable (a portable / user-directory install), one UAC/sudo approval becomes a
+/// PERMANENT elevated foothold: whoever can later write that directory replaces the binary, and the
+/// task runs the replacement elevated. So registration is allowed ONLY from a privileged-owned install
+/// root — the ownership of the DIRECTORY, checked via the injected `is_privileged` (production:
+/// [`crate::secure::path_is_privileged_owned`]).
+///
+/// `is_privileged` is injected so the decision is deterministically testable without depending on the
+/// test runner's uid or filesystem ownership.
+///
+/// # Errors
+///
+/// [`BrokerError::Io`] if `exe` has no parent directory, or if that directory is not privileged-owned.
+fn refuse_unprivileged_exe_dir(
+    exe: &Path,
+    is_privileged: impl Fn(&Path) -> bool,
+) -> Result<(), BrokerError> {
+    let _ = (exe, is_privileged); // RED: guard not yet wired — proves the tests below are load-bearing
+    Ok(())
 }
 
 /// Remove the daily scheduler artifact and RECORD a deliberate opt-out. Idempotent: removing an
@@ -219,12 +265,36 @@ pub fn status() -> Result<ScheduleStatus, BrokerError> {
 /// privileged act, §8.4). The caller (`Broker::run_once_with_feed`) treats such a failure as
 /// best-effort and non-fatal.
 pub fn ensure(exe: &Path, state_dir: &Path) -> Result<EnsureAction, BrokerError> {
+    ensure_with(
+        exe,
+        state_dir,
+        || Ok(imp::status()?.presence),
+        crate::secure::path_is_privileged_owned,
+        imp::install,
+    )
+}
+
+/// [`ensure`] factored over its OS boundaries — the presence probe, the privilege check, and the OS
+/// registration — so the self-heal DECISION and its re-register guard are unit-testable without an
+/// elevated runner or a real scheduler.
+///
+/// The re-register branch is guarded exactly like [`install`]: a self-heal that would re-register from
+/// a non-privileged-owned directory REFUSES and surfaces the error rather than silently proceeding — a
+/// self-heal that cannot safely re-register must report, not manufacture the very foothold #2334 fixes.
+fn ensure_with(
+    exe: &Path,
+    state_dir: &Path,
+    presence: impl FnOnce() -> Result<SchedulePresence, BrokerError>,
+    is_privileged: impl Fn(&Path) -> bool,
+    register: impl FnOnce(&Path) -> Result<(), BrokerError>,
+) -> Result<EnsureAction, BrokerError> {
     if crate::optout::is_opted_out(state_dir) {
         return Ok(EnsureAction::SuppressedByOptOut);
     }
-    let action = ensure_decision(imp::status()?.presence);
+    let action = ensure_decision(presence()?);
     if action == EnsureAction::Reregistered {
-        imp::install(exe)?;
+        refuse_unprivileged_exe_dir(exe, is_privileged)?;
+        register(exe)?;
     }
     Ok(action)
 }
@@ -685,6 +755,7 @@ mod imp {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
 
     /// What a test observed the ledger being asked to do, in order.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -903,6 +974,202 @@ mod tests {
         assert_eq!(
             ensure(&exe, state_dir.path()).expect("ensure honors the opt-out without an OS probe"),
             EnsureAction::SuppressedByOptOut
+        );
+    }
+
+    // ---------------- #2334: refuse to register from a non-privileged-owned dir -----------------
+
+    /// A canonical exe path with a parent directory, for the guard tests.
+    fn exe_with_parent() -> PathBuf {
+        PathBuf::from("/opt/dig/bin/dig-updater")
+    }
+
+    #[test]
+    fn refuse_unprivileged_exe_dir_rejects_a_user_writable_dir_and_names_it() {
+        // #2334: the daily task runs `exe` as SYSTEM/root forever. If its directory is user-writable,
+        // one elevation approval becomes a permanent foothold. The guard must REFUSE and name the
+        // exact directory so the operator can see which install root was rejected.
+        let exe = exe_with_parent();
+        let err = refuse_unprivileged_exe_dir(&exe, |_dir| false)
+            .expect_err("a non-privileged-owned exe directory must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/opt/dig/bin"),
+            "the refusal must name the offending directory, got: {msg}"
+        );
+        assert!(
+            msg.contains("foothold"),
+            "the refusal must explain WHY (the elevated-foothold risk), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuse_unprivileged_exe_dir_checks_the_directory_not_the_binary() {
+        // The property being guarded is DIRECTORY ownership — a later writer of the dir swaps the
+        // binary. The predicate must be handed the parent dir, never the exe itself (a fix that
+        // checked the binary's own path would satisfy an outcome-only test but miss the real threat).
+        let exe = exe_with_parent();
+        let seen = RefCell::new(Vec::new());
+        let _ = refuse_unprivileged_exe_dir(&exe, |dir| {
+            seen.borrow_mut().push(dir.to_path_buf());
+            true
+        });
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[PathBuf::from("/opt/dig/bin")],
+            "the guard must check the exe's PARENT directory, not the exe path"
+        );
+    }
+
+    #[test]
+    fn refuse_unprivileged_exe_dir_allows_a_privileged_owned_dir() {
+        refuse_unprivileged_exe_dir(&exe_with_parent(), |_dir| true)
+            .expect("a privileged-owned install root must be allowed");
+    }
+
+    #[test]
+    fn refuse_unprivileged_exe_dir_errors_legibly_when_exe_has_no_parent() {
+        // A root path has no parent directory to verify — refuse legibly rather than panic/unwrap.
+        let err = refuse_unprivileged_exe_dir(Path::new("/"), |_dir| true)
+            .expect_err("a parentless exe path cannot be verified and must be refused");
+        assert!(
+            err.to_string().contains("parent"),
+            "the refusal must explain the missing parent directory, got: {err}"
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_non_privileged_owned_exe_dir_before_registering() {
+        // Path 1 (the CLI wrapper): `install` must run the guard BEFORE `imp::install`, so a
+        // non-privileged-owned install root never reaches the OS registration at all.
+        let state = tempfile::tempdir().expect("state dir");
+        let registered = RefCell::new(false);
+        let err = install_with(
+            &exe_with_parent(),
+            state.path(),
+            |_dir| false,
+            |_exe| {
+                *registered.borrow_mut() = true;
+                Ok(())
+            },
+        )
+        .expect_err("install must refuse a non-privileged-owned exe dir");
+        assert!(err.to_string().contains("foothold"), "{err}");
+        assert!(
+            !*registered.borrow(),
+            "the OS registration must NOT run when the guard refuses"
+        );
+    }
+
+    #[test]
+    fn install_proceeds_to_register_from_a_privileged_owned_dir() {
+        let state = tempfile::tempdir().expect("state dir");
+        let registered = RefCell::new(false);
+        install_with(
+            &exe_with_parent(),
+            state.path(),
+            |_dir| true,
+            |_exe| {
+                *registered.borrow_mut() = true;
+                Ok(())
+            },
+        )
+        .expect("a privileged-owned root registers normally");
+        assert!(
+            *registered.borrow(),
+            "registration proceeds on the happy path"
+        );
+    }
+
+    #[test]
+    fn ensure_reregister_refuses_a_non_privileged_owned_exe_dir() {
+        // Path 2 (the self-heal): the `Reregistered` branch calls `imp::install` DIRECTLY, so it must
+        // carry its own guard or it is a bypass of path 1. A provably-absent schedule whose exe dir is
+        // not privileged-owned must REFUSE (surface the error), never silently re-register.
+        let state = tempfile::tempdir().expect("state dir");
+        let registered = RefCell::new(false);
+        let err = ensure_with(
+            &exe_with_parent(),
+            state.path(),
+            || Ok(SchedulePresence::Absent),
+            |_dir| false,
+            |_exe| {
+                *registered.borrow_mut() = true;
+                Ok(())
+            },
+        )
+        .expect_err("the self-heal must refuse to re-register from a non-privileged-owned dir");
+        assert!(err.to_string().contains("foothold"), "{err}");
+        assert!(
+            !*registered.borrow(),
+            "the self-heal must NOT re-register when the guard refuses"
+        );
+    }
+
+    #[test]
+    fn ensure_reregister_proceeds_from_a_privileged_owned_dir() {
+        let state = tempfile::tempdir().expect("state dir");
+        let registered = RefCell::new(false);
+        let action = ensure_with(
+            &exe_with_parent(),
+            state.path(),
+            || Ok(SchedulePresence::Absent),
+            |_dir| true,
+            |_exe| {
+                *registered.borrow_mut() = true;
+                Ok(())
+            },
+        )
+        .expect("a privileged-owned root re-registers normally");
+        assert_eq!(action, EnsureAction::Reregistered);
+        assert!(
+            *registered.borrow(),
+            "the self-heal re-registers on the happy path"
+        );
+    }
+
+    #[test]
+    fn ensure_does_not_invoke_the_guard_when_already_registered() {
+        // The guard gates ONLY the re-register branch: an already-registered schedule is left
+        // untouched and never consults the privilege check (a guard on the non-acting branch would be
+        // a spurious refusal of a healthy machine).
+        let state = tempfile::tempdir().expect("state dir");
+        let guard_consulted = RefCell::new(false);
+        let action = ensure_with(
+            &exe_with_parent(),
+            state.path(),
+            || Ok(SchedulePresence::Registered),
+            |_dir| {
+                *guard_consulted.borrow_mut() = true;
+                false
+            },
+            |_exe| panic!("a registered schedule must not re-register"),
+        )
+        .expect("an already-registered schedule is left untouched");
+        assert_eq!(action, EnsureAction::AlreadyRegistered);
+        assert!(
+            !*guard_consulted.borrow(),
+            "the guard must not run when nothing is being registered"
+        );
+    }
+
+    #[test]
+    fn refuse_unprivileged_exe_dir_with_the_real_check_agrees_with_the_production_predicate() {
+        // Integration-flavored: wired to the REAL `path_is_privileged_owned`, the guard's verdict on a
+        // real directory must MATCH what the production predicate says about that directory — proving
+        // the guard consults the parent dir through the production check, deterministically under ANY
+        // runner uid (root CI sees the tempdir as privileged-owned; an unprivileged runner does not).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = dir.path().join("dig-updater");
+        std::fs::write(&exe, b"binary").expect("write a fake exe");
+
+        let dir_is_privileged = crate::secure::path_is_privileged_owned(dir.path());
+        let guard = refuse_unprivileged_exe_dir(&exe, crate::secure::path_is_privileged_owned);
+        assert_eq!(
+            guard.is_ok(),
+            dir_is_privileged,
+            "the guard must allow iff the production predicate deems the exe's directory \
+             privileged-owned"
         );
     }
 
