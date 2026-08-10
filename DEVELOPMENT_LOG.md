@@ -121,6 +121,18 @@ change diary.
   release always sorts higher for the anti-downgrade floor. Per component; the manifest-level
   `rollback_floor_build` is a single value compared to every component's build (alpha floor 0).
 
+- **What the build matrix COMPILES ≠ what the feed RESOLVES (#2555).** An `exempt_platforms` entry is
+  about a FEED-RESOLVABLE default asset, not about whether a repo builds that arch. Concretely:
+  dig-node's CI compiles a linux-arm64 binary but its release ships only `dig-node_<ver>_amd64.deb`
+  (no `_arm64.deb`) — so linux/arm64 is genuinely NOT resolvable for the feed and its exemption is
+  accurate; digstore's arm64 is published as a `.tar.gz` only, which is NOT a feed-resolvable
+  `RawBinary` (`{prefix}-{ver}-linux-arm64`), so its exemption is accurate too. Judge an exemption by
+  `expected_asset_name` for the component's `asset_kind` — the SAME derivation the selector matches on
+  — never by "does the arch build". The `--audit-exemptions` drift check does exactly this over both
+  channels and REDs on an OVER-BROAD exemption (platform IS resolvable), the opposite direction from
+  the #2343 completeness gate (which REDs on a MISSING, unexempted platform). It is deliberately a
+  PR/daily gate OFF the signing cron, so a GitHub blip can never red the live feed.
+
 ## Primary publish + transparency (#535 / #533)
 
 - **The S3 key prefix MUST equal the beacon's `PRIMARY_FEED_BASE` path byte-for-byte.** The beacon

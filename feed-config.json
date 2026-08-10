@@ -7,7 +7,7 @@
     "stable": 0,
     "nightly": 0
   },
-  "_exempt_platforms_note": "exempt_platforms lists (os, arch) a component is ALLOWED to miss (dig_ecosystem#2343). As of 2026-08-10 no DIG release ships a linux/arm64 asset (dig_ecosystem#2306), so every component exempts it to keep both channels green; DROP each exemption as its repo starts publishing that platform. JSON has no comments, hence this sidecar note.",
+  "_exempt_platforms_note": "exempt_platforms lists (os, arch) a component is ALLOWED to miss (dig_ecosystem#2343). As of 2026-08-10 no DIG release ships a feed-resolvable linux/arm64 DEFAULT asset (dig_ecosystem#2306), so every component exempts it to keep both channels green; DROP each exemption as its repo starts publishing that platform. An exemption is legitimate ONLY while the component's latest stable AND nightly release publishes no feed-resolvable default asset for it; the `feedsign --audit-exemptions` drift check (dig_ecosystem#2555, feed.yml + a daily schedule) REDs when a declared exemption is OVER-BROAD (the platform IS resolvable), so a stale exemption cannot silently mask the #2343 completeness gate. JSON has no comments, hence this sidecar note.",
   "components": [
     { "name": "dig-node", "repo": "DIG-Network/dig-node", "asset_prefix": "dig-node", "asset_kind": "native_package", "exempt_platforms": [ { "os": "linux", "arch": "arm64" } ] },
     { "name": "digstore", "repo": "DIG-Network/digstore", "asset_prefix": "digstore", "exempt_platforms": [ { "os": "linux", "arch": "arm64" } ] },

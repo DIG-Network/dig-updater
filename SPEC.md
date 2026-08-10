@@ -1144,6 +1144,20 @@ committed, reviewable declaration that the component genuinely does not ship tho
 defaults to empty. The alpha config exempts `linux/arm64` for every component (no DIG release ships
 that platform yet); each exemption is removed as its repo begins publishing the platform.
 
+**Exemption legitimacy (normative, dig_ecosystem#2555).** An `exempt_platforms` entry is legitimate
+ONLY while the component's latest STABLE and rolling NIGHTLY release each publishes NO feed-resolvable
+DEFAULT asset for that `(os, arch)` — i.e. only while its absence is real. An exemption for a platform
+the release actually ships is OVER-BROAD: it masks the completeness gate for that platform, so a later
+regression that drops the platform would publish a green feed silently missing it. A drift check MUST
+detect this and fail closed: for every declared exemption, the check asserts — over both channels'
+live releases, reusing the SAME asset-name derivation the selector matches on — that the platform is
+NOT resolvable, and REDs naming the component, channel, and resolvable platform otherwise. The check is
+the OPPOSITE direction from the completeness gate (which REDs on a missing, unexempted platform) and
+MUST NOT widen the gate's expected set — a genuinely-missing platform still REDs the gate unchanged. It
+needs no signing secret, so it runs as a PR gate on `feed-config.json` and on a daily schedule
+(`feedsign --audit-exemptions`), deliberately OFF the feed-signing cron path so a transient GitHub
+outage can never red the live feed.
+
 The alpha component set is **dig-node (native package), digstore, dig-updater,
 dig-dns, dig-app (raw binaries)** — dig-app is PUBLISHED in the feed but not yet tracked by the
 broker's catalog (§9.7), and a manifest entry for an untracked component is inert; each component's `asset_kind` comes from the committed `feed-config.json`
