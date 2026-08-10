@@ -167,7 +167,22 @@ fn refuse_unprivileged_exe_dir(
     exe: &Path,
     is_privileged: impl Fn(&Path) -> bool,
 ) -> Result<(), BrokerError> {
-    let _ = (exe, is_privileged); // RED: guard not yet wired — proves the tests below are load-bearing
+    let dir = exe.parent().ok_or_else(|| {
+        BrokerError::Io(format!(
+            "refusing to register a SYSTEM/root daily schedule: the executable path {} has no \
+             parent directory to verify ownership of",
+            exe.display()
+        ))
+    })?;
+    if !is_privileged(dir) {
+        return Err(BrokerError::Io(format!(
+            "refusing to register a SYSTEM/root daily schedule for a binary in {}: that directory is \
+             not owned by a privileged identity, so a later writer of it could replace the binary \
+             this SYSTEM/root daily task runs — turning one elevation approval into a permanent \
+             elevated foothold; register only from a privileged-owned install root",
+            dir.display()
+        )));
+    }
     Ok(())
 }
 
