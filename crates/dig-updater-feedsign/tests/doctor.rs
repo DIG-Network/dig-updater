@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 
 use dig_updater_feedsign::{
-    Channel, DoctorReport, FeedConfig, FeedsignError, GithubRelease, ReleaseSource,
+    audit_exemptions, Channel, DoctorReport, FeedConfig, FeedsignError, GithubRelease,
+    ReleaseSource,
 };
 
 /// An in-memory release source keyed by `owner/repo` (channel-agnostic here — doctor tests fix the
@@ -202,5 +203,192 @@ fn a_mixed_config_reports_all_components_and_fails_on_any() {
     assert!(
         rendered.contains("digstore") && rendered.contains("1.2.3"),
         "the healthy component is still listed, got:\n{rendered}"
+    );
+}
+
+// --- Exemption-drift audit (dig_ecosystem#2555) -----------------------------------------------
+//
+// The audit is the OPPOSITE direction from the completeness gate above: it REDs when a declared
+// exemption is OVER-BROAD — the component's release actually publishes the exempt platform, so the
+// exemption now masks the #2343 gate for it. These tests drive it through a CHANNEL-AWARE in-memory
+// source, since an exemption can be over-broad on one channel while accurate on the other.
+
+/// An in-memory source keyed by `(repo, channel)`, so stable and nightly can return DIFFERENT
+/// releases for the same repo — the two-channel dimension the audit sweeps.
+struct ChannelSource {
+    releases: HashMap<(String, Channel), GithubRelease>,
+}
+
+impl ReleaseSource for ChannelSource {
+    fn release(&self, repo: &str, channel: Channel) -> Result<GithubRelease, FeedsignError> {
+        self.releases
+            .get(&(repo.to_string(), channel))
+            .cloned()
+            .ok_or_else(|| FeedsignError::Fetch {
+                url: repo.to_string(),
+                detail: "no fake release".to_string(),
+            })
+    }
+
+    fn download(&self, _url: &str) -> Result<Vec<u8>, FeedsignError> {
+        Ok(Vec::new())
+    }
+}
+
+fn channel_source(pairs: Vec<(&str, Channel, GithubRelease)>) -> ChannelSource {
+    ChannelSource {
+        releases: pairs
+            .into_iter()
+            .map(|(repo, ch, rel)| ((repo.to_string(), ch), rel))
+            .collect(),
+    }
+}
+
+/// digstore's config declaring linux/arm64 exempt — the shape the audit judges.
+fn digstore_exempts_arm64() -> FeedConfig {
+    FeedConfig::from_json(
+        r#"{"components":[{"name":"digstore","repo":"DIG-Network/digstore","asset_prefix":"digstore",
+            "exempt_platforms":[{"os":"linux","arch":"arm64"}]}]}"#,
+    )
+    .unwrap()
+}
+
+/// A digstore nightly release carrying `assets`, versioned so the recovered version matches.
+fn digstore_nightly(assets: &[&str]) -> GithubRelease {
+    release("nightly", assets)
+}
+
+/// DROPPABLE only when over-broad in EVERY channel: linux/arm64 resolves in BOTH stable and nightly,
+/// so no channel still needs the exemption → the audit fails and names it to DROP. This is the
+/// dig-updater[stable]+[nightly] live case the CI audit caught.
+#[test]
+fn an_all_channel_overbroad_exemption_is_droppable_and_fails() {
+    let src = channel_source(vec![
+        (
+            "DIG-Network/digstore",
+            Channel::Stable,
+            release("v1.2.3", DIGSTORE_ALL), // stable ships linux/arm64
+        ),
+        (
+            "DIG-Network/digstore",
+            Channel::Nightly,
+            digstore_nightly(&[
+                "digstore-1.3.0-nightly.20260810.def456-linux-x64",
+                "digstore-1.3.0-nightly.20260810.def456-linux-arm64", // nightly ships it too
+                "digstore-1.3.0-nightly.20260810.def456-macos-arm64",
+                "digstore-1.3.0-nightly.20260810.def456-macos-x64",
+                "digstore-1.3.0-nightly.20260810.def456-windows-x64.exe",
+            ]),
+        ),
+    ]);
+
+    let audit = audit_exemptions(&digstore_exempts_arm64(), &src);
+
+    assert!(
+        !audit.is_clean(),
+        "an exemption resolvable in every channel is droppable → the audit must fail"
+    );
+    assert_eq!(audit.findings().len(), 1);
+    assert!(
+        audit.findings()[0].is_droppable(),
+        "over-broad in every channel → droppable"
+    );
+    let rendered = audit.render();
+    assert!(
+        rendered.contains("DROP")
+            && rendered.contains("digstore")
+            && rendered.contains("linux/arm64"),
+        "the audit must name the droppable component + platform, got:\n{rendered}"
+    );
+}
+
+/// Legit exemption stays clean: neither channel ships the exempt platform, so the exemption is
+/// accurate and the audit is clean — the truthful control.
+#[test]
+fn a_legitimate_exemption_is_clean_on_both_channels() {
+    let src = channel_source(vec![
+        (
+            "DIG-Network/digstore",
+            Channel::Stable,
+            release(
+                "v1.2.3",
+                &[
+                    "digstore-1.2.3-linux-x64",
+                    "digstore-1.2.3-macos-arm64",
+                    "digstore-1.2.3-macos-x64",
+                    "digstore-1.2.3-windows-x64.exe",
+                ],
+            ),
+        ),
+        (
+            "DIG-Network/digstore",
+            Channel::Nightly,
+            digstore_nightly(&[
+                "digstore-1.2.3-nightly.20260810.abc123-linux-x64",
+                "digstore-1.2.3-nightly.20260810.abc123-macos-arm64",
+                "digstore-1.2.3-nightly.20260810.abc123-macos-x64",
+                "digstore-1.2.3-nightly.20260810.abc123-windows-x64.exe",
+            ]),
+        ),
+    ]);
+
+    let audit = audit_exemptions(&digstore_exempts_arm64(), &src);
+
+    assert!(
+        audit.is_clean(),
+        "an exemption for a genuinely-absent platform on both channels is clean, got:\n{}",
+        audit.render()
+    );
+    assert!(audit.findings().is_empty(), "no over-broad channel at all");
+}
+
+/// THE REGRESSION GUARD for the live CI bug (dig-node linux/arm64: stable YES, nightly NO). An
+/// exemption over-broad in a STRICT SUBSET of channels is LOAD-BEARING for the channel(s) that lack
+/// the platform: dropping it would RED the #2343 gate on nightly and break the live nightly feed. So
+/// the audit must stay CLEAN (exit 0) and RETAIN the exemption, recording it only as an
+/// informational note — NEVER recommend dropping it.
+#[test]
+fn a_single_channel_overbroad_exemption_is_retained_not_dropped() {
+    let src = channel_source(vec![
+        (
+            "DIG-Network/digstore",
+            Channel::Stable,
+            release("v1.2.3", DIGSTORE_ALL), // stable ships linux/arm64
+        ),
+        (
+            "DIG-Network/digstore",
+            Channel::Nightly,
+            // nightly does NOT ship arm64 → exemption still needed for nightly.
+            digstore_nightly(&[
+                "digstore-1.3.0-nightly.20260810.def456-linux-x64",
+                "digstore-1.3.0-nightly.20260810.def456-macos-arm64",
+                "digstore-1.3.0-nightly.20260810.def456-macos-x64",
+                "digstore-1.3.0-nightly.20260810.def456-windows-x64.exe",
+            ]),
+        ),
+    ]);
+
+    let audit = audit_exemptions(&digstore_exempts_arm64(), &src);
+
+    assert!(
+        audit.is_clean(),
+        "a subset-channel over-broad exemption is load-bearing → audit stays clean (exit 0), got:\n{}",
+        audit.render()
+    );
+    assert_eq!(
+        audit.findings().len(),
+        1,
+        "the informational note is still recorded"
+    );
+    let finding = &audit.findings()[0];
+    assert!(
+        !finding.is_droppable(),
+        "resolvable in stable only → NOT droppable"
+    );
+    assert_eq!(finding.overbroad_channels, vec![Channel::Stable]);
+    assert!(
+        audit.render().contains("RETAINED"),
+        "the report must mark it retained, got:\n{}",
+        audit.render()
     );
 }

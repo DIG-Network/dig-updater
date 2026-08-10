@@ -3,13 +3,20 @@
 //! The `dig-updater-feedsign` CI binary: assemble + sign the beacon feed, write it out, print a
 //! secret-free summary.
 //!
-//! ## Two modes
+//! ## Three modes
 //!
 //! - **`doctor`** (subcommand, or `--doctor`) — validate `feed-config.json` against each component's
 //!   LIVE releases for a channel WITHOUT any signing key (dig_ecosystem#2115), printing a
 //!   per-component report and exiting non-zero if any component's release lacks the asset kind it
 //!   declares. Run in CI BEFORE signing so a broken declaration fails as a named report, not a silent
 //!   red at the signing step. Reads `--config`/`--channel`/`GITHUB_TOKEN` only.
+//! - **`audit-exemptions`** (subcommand, or `--audit-exemptions`) — check every declared
+//!   `exempt_platforms` against BOTH channels' live releases WITHOUT any signing key
+//!   (dig_ecosystem#2555), exiting non-zero only on an exemption whose platform is resolvable in
+//!   EVERY signed channel (droppable — it masks the #2343 gate everywhere). A platform resolvable in
+//!   only a subset of channels is a NON-failing informational note (the exemption stays load-bearing
+//!   for the channels that lack it). Reads `--config`/`GITHUB_TOKEN` only; always sweeps both
+//!   channels. A PR/scheduled drift guard.
 //! - **default (sign)** — the full assemble + sign pass below (requires `BEACON_SIGNING_KEY`).
 //!
 //! Inputs (CLI flag falls back to environment):
@@ -43,8 +50,8 @@
 use std::process::ExitCode;
 
 use dig_updater_feedsign::{
-    assert_pinned_root, produce_feed, signing_key_from_secret, Channel, DoctorReport, FeedConfig,
-    FeedsignError, GithubSource,
+    assert_pinned_root, audit_exemptions, produce_feed, signing_key_from_secret, Channel,
+    DoctorReport, FeedConfig, FeedsignError, GithubSource,
 };
 
 fn main() -> ExitCode {
@@ -58,6 +65,19 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("dig-updater-feedsign doctor: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `--audit-exemptions` (dig_ecosystem#2555) checks every declared `exempt_platforms` against
+    // BOTH channels' live releases and exits non-zero on any OVER-BROAD exemption. Like doctor it
+    // needs NO signing key, so it dispatches before the signing pass and is CI-runnable on a PR.
+    if is_audit_exemptions(&args) {
+        return match run_audit_exemptions(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("dig-updater-feedsign audit-exemptions: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -102,6 +122,37 @@ fn run_doctor(args: &[String]) -> Result<ExitCode, FeedsignError> {
     let report = DoctorReport::run(&config, &source, channel);
     print!("{}", report.render());
     Ok(if report.is_healthy() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Whether this invocation selects exemption-audit mode: the `audit-exemptions` subcommand as the
+/// first argument, or an `--audit-exemptions` flag anywhere.
+fn is_audit_exemptions(args: &[String]) -> bool {
+    args.first().is_some_and(|a| a == "audit-exemptions")
+        || args.iter().any(|a| a == "--audit-exemptions")
+}
+
+/// The exemption-audit pass (dig_ecosystem#2555): check every component's `exempt_platforms` against
+/// BOTH channels' live releases (needing NO signing key), print the report, and return
+/// [`ExitCode::FAILURE`] if any exemption is over-broad. It reads only `--config`/`FEEDSIGN_CONFIG`
+/// and `GITHUB_TOKEN`; the channel is not selectable — the audit always sweeps both.
+fn run_audit_exemptions(args: &[String]) -> Result<ExitCode, FeedsignError> {
+    let config_path = input(args, "--config", "FEEDSIGN_CONFIG")
+        .unwrap_or_else(|| "feed-config.json".to_string());
+
+    let config_text = std::fs::read_to_string(&config_path)
+        .map_err(|e| FeedsignError::Config(format!("{config_path}: {e}")))?;
+    let config = FeedConfig::from_json(&config_text)?;
+
+    let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+    let source = GithubSource::github(token);
+
+    let audit = audit_exemptions(&config, &source);
+    print!("{}", audit.render());
+    Ok(if audit.is_clean() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

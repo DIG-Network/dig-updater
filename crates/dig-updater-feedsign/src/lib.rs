@@ -58,7 +58,7 @@ use dig_updater_trust::{Artifact, Component, SignedDelegation, SignedManifest};
 pub use assemble::{assemble_delegation, assemble_manifest};
 pub use channel::Channel;
 pub use config::{AssetKind, ChannelFloors, ComponentConfig, FeedConfig, PlatformKey};
-pub use doctor::DoctorReport;
+pub use doctor::{ComponentExemptions, DoctorReport, ExemptionAudit};
 pub use error::FeedsignError;
 pub use resolve::{
     expected_asset_name, expected_asset_names, resolve_version_from_assets, select_artifacts,
@@ -186,6 +186,36 @@ fn resolve_component(
         build,
         artifacts,
     })
+}
+
+/// Fetch a component's `channel` release and recover the version that channel resolves it to,
+/// WITHOUT selecting or downloading its artifacts.
+///
+/// The exemption audit ([`ExemptionAudit`]) needs the raw release plus the resolved version to ask
+/// [`resolve::overbroad_exemptions`] whether an exempt platform is nonetheless resolvable — a
+/// question independent of whether the full completeness gate ([`select_artifacts`]) passes. This is
+/// the fetch-and-version prefix of [`resolve_component`], stopping before selection so an
+/// incomplete-but-parseable release can still be audited.
+///
+/// # Errors
+///
+/// [`FeedsignError`] if the release cannot be fetched or its version cannot be parsed.
+pub(crate) fn resolve_release_and_version(
+    source: &dyn ReleaseSource,
+    component: &ComponentConfig,
+    channel: Channel,
+) -> Result<(GithubRelease, String), FeedsignError> {
+    let release = source.release(&component.repo, channel)?;
+    let (version, _build) = resolve_version(&release, component, channel)?;
+    Ok((release, version))
+}
+
+/// Audit every component's `exempt_platforms` against BOTH channels' live releases, reporting each
+/// exemption that is OVER-BROAD (the platform is actually resolvable) — the drift check of
+/// dig_ecosystem#2555. Secret-free: it fetches release metadata only, never downloads or signs.
+#[must_use]
+pub fn audit_exemptions(config: &FeedConfig, source: &dyn ReleaseSource) -> ExemptionAudit {
+    ExemptionAudit::run(config, source)
 }
 
 /// Assemble and sign one `channel`'s feed for one run (SPEC §10.1).

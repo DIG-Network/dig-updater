@@ -48,7 +48,17 @@ name: Feed
 
 on:
   schedule:
+    # The 6-hourly feed-signing heartbeat.
     - cron: "0 */6 * * *"
+    # The daily exemption-drift audit (dig_ecosystem#2555) — see the `audit-exemptions` job. Kept a
+    # SEPARATE cron from the signing heartbeat so a GitHub blip that reds the read-only audit can
+    # never interfere with signing the live feed.
+    - cron: "17 4 * * *"
+  # PR gate: an edit to feed-config.json (adding/removing an exemption) re-runs the drift audit, so
+  # an over-broad exemption is caught on the PR that introduces or preserves it — never merged blind.
+  pull_request:
+    paths:
+      - "feed-config.json"
   workflow_dispatch:
 
 concurrency:
@@ -65,13 +75,70 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # THE EXEMPTION-DRIFT AUDIT (dig_ecosystem#2555).
+  #
+  # `feed-config.json` exempts a component from the #2343 completeness gate for platforms it does not
+  # yet publish (e.g. linux/arm64). An exemption that OUTLIVES its cause — the component starts
+  # shipping that platform — silently masks the gate for it: a later regression that drops the
+  # platform would publish a green feed missing it, and nothing would go red. This job checks every
+  # declared exemption against BOTH channels' live releases and REDs when one is OVER-BROAD (the
+  # platform is actually resolvable), naming the component + channel + platform to drop.
+  #
+  # It needs NO signing secret (read-only release metadata), so it runs on PRs that touch
+  # feed-config.json and on a daily schedule — DELIBERATELY OFF the signing cron path, so a transient
+  # GitHub outage that reds this audit can never interfere with signing/serving the live feed. It
+  # never widens the completeness gate's expected set — a genuinely-missing platform still REDs that
+  # gate unchanged.
+  audit-exemptions:
+    name: Audit exemption drift
+    # Skip the every-6h signing heartbeat's extra invocations — this is the PR + daily-audit gate, not
+    # part of the signing cadence. Runs on a PR to feed-config.json, the daily audit cron, and manual
+    # dispatch.
+    if: >-
+      github.event_name == 'pull_request'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'schedule' && github.event.schedule == '17 4 * * *')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build feedsign (release)
+        run: cargo build --release --locked -p dig-updater-feedsign
+
+      # A READ token is enough — the audit fetches public release metadata only, never signs. It
+      # exits non-zero on any over-broad exemption, reddening the PR/audit run.
+      - name: Audit exemption drift (both channels)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./target/release/dig-updater-feedsign audit-exemptions \
+            --config feed-config.json
+
   sign-verify-publish:
     name: ${{ matrix.channel }} — sign, verify, publish
     # H1 (#540): the signing capability is bound to REVIEWED main code. A workflow_dispatch (or any
     # on:push) from an unreviewed branch must never sign with the real pinned key + publish to the
     # bases every shipped beacon trusts — that would bypass the §2.4 PR-review gate. The cron + the
     # production dispatch both run on main, so this guard costs nothing legitimate.
-    if: github.ref == 'refs/heads/main'
+    #
+    # The trailing schedule guard scopes signing to the 6-hourly heartbeat cron ONLY: the daily
+    # exemption-audit cron (`17 4 * * *`, dig_ecosystem#2555) must NOT fire an extra signing run.
+    # workflow_dispatch + push still pass (their `github.event.schedule` is empty).
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name != 'schedule' || github.event.schedule == '0 */6 * * *')
     # BEACON_SIGNING_KEY MUST be a main-scoped GitHub Environment secret (env `feed-signing`, #540)
     # with a main-only deployment branch policy — NEVER a plain repo secret. Referencing the environment
     # here readies that binding (an as-yet-uncreated environment is inert; @mt-dev adds the protected secret to it).
@@ -389,8 +456,13 @@ jobs:
     name: Alert on a failing feed
     needs: sign-verify-publish
     # `always()` — a failed matrix leg must not skip this by way of the implicit `success()`,
-    # which is the exact way an alarm ends up silent in the outage it was built for.
-    if: always() && github.ref == 'refs/heads/main'
+    # which is the exact way an alarm ends up silent in the outage it was built for. The schedule
+    # guard scopes it to the 6-hourly signing heartbeat: on the daily audit cron (`17 4 * * *`)
+    # sign-verify-publish is skipped, so its `result` would be "skipped" and this alarm would file a
+    # FALSE feed-failure issue — exclude that cron here (workflow_dispatch + push still pass).
+    if: >-
+      always() && github.ref == 'refs/heads/main'
+      && (github.event_name != 'schedule' || github.event.schedule == '0 */6 * * *')
     runs-on: ubuntu-latest
     permissions:
       contents: read
