@@ -118,6 +118,21 @@ jobs:
         if: steps.secret.outputs.present == 'true'
         run: cargo build --release --locked -p dig-updater-feedsign -p dig-updater-cli -p dig-updater-worker
 
+      # dig_ecosystem#2115: BEFORE signing, validate feed-config against THIS channel's live releases
+      # — no signing key needed. A component whose published release lacks the asset kind it declares
+      # (the #618 case: dig-node `native_package` while its release shipped only raw binaries) fails
+      # here as a NAMED per-component report, instead of silently reddening the sign step below (which
+      # for three weeks was the ONLY signal). Strictly upstream of the keystone/publish — it changes
+      # no gating, it just surfaces the break sooner and legibly.
+      - name: Doctor — verify feed-config matches live releases
+        if: steps.secret.outputs.present == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./target/release/dig-updater-feedsign doctor \
+            --config feed-config.json \
+            --channel "${{ matrix.channel }}"
+
       - name: Timestamp
         if: steps.secret.outputs.present == 'true'
         id: ts
