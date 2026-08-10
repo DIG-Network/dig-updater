@@ -35,11 +35,22 @@ fn serialize() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// A real, existing file path to register — `install` only needs a plausible target program; it
-/// never executes it (registration is a pure OS-metadata write), so the running test binary
-/// itself is a fine stand-in for the real `dig-updater` executable.
-fn fake_exe() -> PathBuf {
-    std::env::current_exe().expect("current test binary path")
+/// A target program to register whose CONTAINING DIRECTORY is privileged-owned — the precondition
+/// `scheduler::install`/`ensure` now enforce (#2334: a SYSTEM/root daily task must not run a binary
+/// from a user-writable directory, or one elevation approval becomes a permanent foothold).
+///
+/// The exe file need not exist: registration is a pure OS-metadata write that never executes it, and
+/// the guard only stats the PARENT directory. We make that directory privileged-owned via the public
+/// [`secure::claim_privileged_ownership`] (Windows: sets the owner to Administrators; Unix: a no-op,
+/// since a root-run test already creates root-owned `0700` directories). The returned [`TempDir`]
+/// MUST be held for the test's duration — dropping it deletes the directory out from under the OS
+/// registration.
+fn privileged_exe() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("throwaway exe dir");
+    dig_updater_broker::secure::claim_privileged_ownership(dir.path())
+        .expect("make the exe directory privileged-owned");
+    let exe = dir.path().join("dig-updater");
+    (dir, exe)
 }
 
 /// A per-test, throwaway state directory the opt-out sentinel (#584) lives in — isolated from the
@@ -53,7 +64,7 @@ fn state_dir() -> TempDir {
             in the elevated scheduler CI job"]
 fn install_then_status_then_uninstall_round_trips_cleanly() {
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
 
     // Start from a clean slate in case a prior run in this environment left something behind.
@@ -85,7 +96,7 @@ fn install_then_status_then_uninstall_round_trips_cleanly() {
             in the elevated scheduler CI job"]
 fn install_is_idempotent_and_uninstall_of_an_absent_schedule_succeeds() {
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
 
@@ -313,7 +324,7 @@ fn install_must_not_rewrite_the_task_definition_security_descriptor() {
     // marks an inherited ACE `(I)`. A test that merely compared two DACLs could pass on an
     // equivalent-looking explicit rewrite that Task Scheduler would still reject.
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
 
@@ -351,7 +362,7 @@ fn the_task_definition_file_is_not_writable_by_an_unprivileged_identity() {
     // definition to any user, so a readable definition file discloses nothing. WRITE is the bar that
     // matters — a writable definition would let an unprivileged user re-point what SYSTEM executes.
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
     scheduler::install(&exe, state.path()).expect("install");
@@ -399,7 +410,7 @@ fn a_registered_task_is_still_readable_by_task_scheduler_after_install() {
     // re-query, which is the acceptance step recorded on the ticket. Restarting a hosted runner's
     // Task Scheduler mid-job is not a safe thing to do to the machine running the job.
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
     scheduler::install(&exe, state.path()).expect("install");
@@ -429,7 +440,7 @@ fn ensure_self_heals_an_absent_schedule_and_is_idempotent() {
     use dig_updater_broker::scheduler::EnsureAction;
 
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
     // The clean-slate uninstall above records a DELIBERATE opt-out (#584); this test models an
@@ -470,7 +481,7 @@ fn ensure_respects_a_deliberate_uninstall_and_install_re_enables() {
     use dig_updater_broker::scheduler::EnsureAction;
 
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
 
     // Deliberate uninstall records the opt-out; ensure must honor it even with the task absent.
@@ -515,7 +526,7 @@ fn windows_uninstall_leaves_the_task_folder_to_task_scheduler() {
     // folder's fate is explicitly not the beacon's concern, so nothing is asserted about it beyond
     // the beacon not being the one to delete it.
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
     scheduler::install(&exe, state.path()).expect("install");
@@ -551,7 +562,7 @@ fn linux_units_are_root_owned_mode_0644() {
     use std::os::unix::fs::MetadataExt;
 
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
     scheduler::install(&exe, state.path()).expect("install");
@@ -574,7 +585,7 @@ fn macos_plist_is_root_owned_mode_0644() {
     use std::os::unix::fs::MetadataExt;
 
     let _guard = serialize();
-    let exe = fake_exe();
+    let (_exe_dir, exe) = privileged_exe();
     let state = state_dir();
     let _ = scheduler::uninstall(state.path());
     scheduler::install(&exe, state.path()).expect("install");
