@@ -11,7 +11,7 @@
 
 use serde::Deserialize;
 
-use crate::config::{AssetKind, ComponentConfig, VariantSpec};
+use crate::config::{AssetKind, ComponentConfig, PlatformKey, VariantSpec};
 use crate::error::FeedsignError;
 
 /// The `(os, arch)` platforms the beacon ships to, matching the manifest's `artifact.os`/
@@ -306,6 +306,40 @@ fn missing_default_platforms(
     } else {
         Some(missing.join(", "))
     }
+}
+
+/// The `exempt_platforms` entries of `component` that its `release` at `version` actually DOES
+/// publish a feed-resolvable DEFAULT asset for — i.e. exemptions that are OVER-BROAD.
+///
+/// This is the inverse of [`missing_default_platforms`]. That gate REDs when a platform is missing
+/// AND unexempted; this advisory check REDs when a platform is exempt AND resolvable — the exemption
+/// has outlived its cause (the component started publishing that platform) and now MASKS the
+/// completeness gate for it, so a future regression that drops the platform would go unnoticed
+/// (dig_ecosystem#2555). It is derived from the SAME [`expected_asset_name`] the selector matches
+/// on, so it can only ever name a platform the feed genuinely resolves.
+///
+/// Pure over the already-fetched `release`: it fetches nothing and reads no secret.
+#[must_use]
+pub fn overbroad_exemptions(
+    release: &GithubRelease,
+    component: &ComponentConfig,
+    version: &str,
+) -> Vec<PlatformKey> {
+    component
+        .exempt_platforms
+        .iter()
+        .filter(|platform| {
+            let expected = expected_asset_name(
+                &component.asset_prefix,
+                version,
+                &platform.os,
+                &platform.arch,
+                component.asset_kind,
+            );
+            release.assets.iter().any(|asset| asset.name == expected)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Recover the version string shared by a `component`'s assets in a rolling `nightly` release.
@@ -1198,6 +1232,83 @@ mod tests {
                 "dig-node-0.31.1-macos.pkg",
                 "dig-node-0.31.1-windows-x64.msi",
             ]
+        );
+    }
+
+    #[test]
+    fn overbroad_exemption_is_caught_when_the_platform_is_resolvable() {
+        // dig_ecosystem#2555: the release DOES ship the exempt platform's default asset, so the
+        // exemption is over-broad — it now masks the #2343 completeness gate for linux/arm64.
+        let release = GithubRelease {
+            tag_name: "v0.29.0".into(),
+            assets: vec![
+                asset("dig-node-0.29.0-linux-x64"),
+                asset("dig-node-0.29.0-linux-arm64"),
+                asset("dig-node-0.29.0-macos-arm64"),
+                asset("dig-node-0.29.0-macos-x64"),
+                asset("dig-node-0.29.0-windows-x64.exe"),
+            ],
+        };
+        let cfg = ComponentConfig {
+            exempt_platforms: vec![exempt("linux", "arm64")],
+            ..component()
+        };
+        assert_eq!(
+            overbroad_exemptions(&release, &cfg, "0.29.0"),
+            vec![exempt("linux", "arm64")],
+            "an exemption for a resolvable platform must be reported over-broad"
+        );
+    }
+
+    #[test]
+    fn a_legitimate_exemption_stays_clean() {
+        // The release genuinely lacks the exempt platform's asset, so the exemption is accurate and
+        // nothing is reported over-broad. The truthful control for the case above.
+        let release = GithubRelease {
+            tag_name: "v0.29.0".into(),
+            assets: vec![
+                asset("dig-node-0.29.0-linux-x64"),
+                asset("dig-node-0.29.0-macos-arm64"),
+                asset("dig-node-0.29.0-macos-x64"),
+                asset("dig-node-0.29.0-windows-x64.exe"),
+            ],
+        };
+        let cfg = ComponentConfig {
+            exempt_platforms: vec![exempt("linux", "arm64")],
+            ..component()
+        };
+        assert!(
+            overbroad_exemptions(&release, &cfg, "0.29.0").is_empty(),
+            "an exemption for a genuinely-absent platform is legitimate, not over-broad"
+        );
+    }
+
+    #[test]
+    fn overbroad_check_uses_the_components_asset_kind() {
+        // A native-package component's exemption is judged against its `.deb` name, not the raw
+        // binary: an arm64 `.deb` present makes the linux/arm64 exemption over-broad, while a stray
+        // raw `-linux-arm64` binary (never installed for a native-package component) does NOT.
+        let with_deb = GithubRelease {
+            tag_name: "v0.31.1".into(),
+            assets: vec![asset("dig-node_0.31.1_arm64.deb")],
+        };
+        let cfg = ComponentConfig {
+            exempt_platforms: vec![exempt("linux", "arm64")],
+            ..native_package_component()
+        };
+        assert_eq!(
+            overbroad_exemptions(&with_deb, &cfg, "0.31.1"),
+            vec![exempt("linux", "arm64")],
+            "the arm64 .deb makes the native-package exemption over-broad"
+        );
+
+        let raw_only = GithubRelease {
+            tag_name: "v0.31.1".into(),
+            assets: vec![asset("dig-node-0.31.1-linux-arm64")],
+        };
+        assert!(
+            overbroad_exemptions(&raw_only, &cfg, "0.31.1").is_empty(),
+            "a raw binary a native-package component never installs must not count as resolvable"
         );
     }
 

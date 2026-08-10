@@ -13,10 +13,13 @@
 //! (respecting `exempt_platforms`, dig_ecosystem#2343).
 
 use crate::channel::Channel;
-use crate::config::FeedConfig;
-use crate::resolve::ResolvedArtifact;
+use crate::config::{FeedConfig, PlatformKey};
+use crate::resolve::{overbroad_exemptions, ResolvedArtifact};
 use crate::source::ReleaseSource;
-use crate::{resolve_all, ComponentResolution};
+use crate::{resolve_all, resolve_release_and_version, ComponentResolution};
+
+/// Both channels, in report + iteration order — the fixed pair the feed publishes (SPEC §10.1).
+const ALL_CHANNELS: [Channel; 2] = [Channel::Stable, Channel::Nightly];
 
 /// A secret-free, per-component health report of one channel's `feed-config.json` resolution.
 ///
@@ -78,6 +81,110 @@ impl DoctorReport {
         }
         out
     }
+}
+
+/// One component's over-broad exemptions on ONE channel: the `exempt_platforms` entries whose asset
+/// the channel's release actually publishes, so the exemption masks the #2343 completeness gate for
+/// them (dig_ecosystem#2555). Empty when every declared exemption is still accurate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentExemptions {
+    /// The component id from the config.
+    pub name: String,
+    /// The channel this finding is for.
+    pub channel: Channel,
+    /// The declared-exempt platforms that ARE resolvable on this channel — the over-broad ones.
+    pub overbroad: Vec<PlatformKey>,
+}
+
+/// A secret-free audit of every component's `exempt_platforms` against BOTH channels' live releases,
+/// flagging each exemption that has become OVER-BROAD — the platform is now resolvable, so the
+/// exemption should be dropped lest it hide a future regression (dig_ecosystem#2555).
+///
+/// It is the OPPOSITE direction from the #2343 completeness gate: that gate REDs on a MISSING,
+/// unexempted platform; this REDs on an EXEMPT, resolvable one. It never widens the gate's expected
+/// set — a genuinely-missing platform still REDs [`crate::select_artifacts`] unchanged.
+#[derive(Debug)]
+pub struct ExemptionAudit {
+    findings: Vec<ComponentExemptions>,
+}
+
+impl ExemptionAudit {
+    /// Audit every component on both channels. A component whose release cannot be fetched or whose
+    /// version cannot be parsed on a channel yields NO over-broad finding there — judging an
+    /// exemption over-broad requires a resolvable release, and a genuine resolution failure is the
+    /// [`DoctorReport`]/completeness gate's concern, not this drift check's.
+    #[must_use]
+    pub fn run(config: &FeedConfig, source: &dyn ReleaseSource) -> Self {
+        let mut findings = Vec::new();
+        for channel in ALL_CHANNELS {
+            for component in &config.components {
+                if component.exempt_platforms.is_empty() {
+                    continue;
+                }
+                let Ok((release, version)) =
+                    resolve_release_and_version(source, component, channel)
+                else {
+                    continue;
+                };
+                let overbroad = overbroad_exemptions(&release, component, &version);
+                if !overbroad.is_empty() {
+                    findings.push(ComponentExemptions {
+                        name: component.name.clone(),
+                        channel,
+                        overbroad,
+                    });
+                }
+            }
+        }
+        Self { findings }
+    }
+
+    /// `true` when no exemption is over-broad on either channel — every declared exemption still
+    /// names a platform the component genuinely does not publish.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.findings.is_empty()
+    }
+
+    /// The over-broad findings, one per `(component, channel)` that has any.
+    #[must_use]
+    pub fn findings(&self) -> &[ComponentExemptions] {
+        &self.findings
+    }
+
+    /// A legible, secret-free report + a one-line verdict, suitable for a CI log. It reads no secret
+    /// and names, per over-broad finding, the component, channel, and the resolvable platforms whose
+    /// exemption should be dropped.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::from("feed exemption audit (dig_ecosystem#2555)\n");
+        if self.findings.is_empty() {
+            out.push_str("all declared exemptions are accurate — no over-broad exemption.\n");
+            return out;
+        }
+        for finding in &self.findings {
+            out.push_str(&format!(
+                "  OVER-BROAD {} [{}] — resolvable, drop the exemption for: {}\n",
+                finding.name,
+                finding.channel.as_str(),
+                render_platform_keys(&finding.overbroad),
+            ));
+        }
+        out.push_str(&format!(
+            "{} over-broad exemption(s) — a resolvable platform is masking the #2343 gate.\n",
+            self.findings.len()
+        ));
+        out
+    }
+}
+
+/// `os/arch` platform keys, comma-joined, for the audit report.
+fn render_platform_keys(platforms: &[PlatformKey]) -> String {
+    platforms
+        .iter()
+        .map(|p| format!("{}/{}", p.os, p.arch))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The `os/arch` platforms a component resolved, comma-joined, annotating any non-default variant.

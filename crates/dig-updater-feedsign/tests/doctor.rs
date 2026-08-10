@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 
 use dig_updater_feedsign::{
-    Channel, DoctorReport, FeedConfig, FeedsignError, GithubRelease, ReleaseSource,
+    audit_exemptions, Channel, DoctorReport, FeedConfig, FeedsignError, GithubRelease,
+    ReleaseSource,
 };
 
 /// An in-memory release source keyed by `owner/repo` (channel-agnostic here — doctor tests fix the
@@ -203,4 +204,182 @@ fn a_mixed_config_reports_all_components_and_fails_on_any() {
         rendered.contains("digstore") && rendered.contains("1.2.3"),
         "the healthy component is still listed, got:\n{rendered}"
     );
+}
+
+// --- Exemption-drift audit (dig_ecosystem#2555) -----------------------------------------------
+//
+// The audit is the OPPOSITE direction from the completeness gate above: it REDs when a declared
+// exemption is OVER-BROAD — the component's release actually publishes the exempt platform, so the
+// exemption now masks the #2343 gate for it. These tests drive it through a CHANNEL-AWARE in-memory
+// source, since an exemption can be over-broad on one channel while accurate on the other.
+
+/// An in-memory source keyed by `(repo, channel)`, so stable and nightly can return DIFFERENT
+/// releases for the same repo — the two-channel dimension the audit sweeps.
+struct ChannelSource {
+    releases: HashMap<(String, Channel), GithubRelease>,
+}
+
+impl ReleaseSource for ChannelSource {
+    fn release(&self, repo: &str, channel: Channel) -> Result<GithubRelease, FeedsignError> {
+        self.releases
+            .get(&(repo.to_string(), channel))
+            .cloned()
+            .ok_or_else(|| FeedsignError::Fetch {
+                url: repo.to_string(),
+                detail: "no fake release".to_string(),
+            })
+    }
+
+    fn download(&self, _url: &str) -> Result<Vec<u8>, FeedsignError> {
+        Ok(Vec::new())
+    }
+}
+
+fn channel_source(pairs: Vec<(&str, Channel, GithubRelease)>) -> ChannelSource {
+    ChannelSource {
+        releases: pairs
+            .into_iter()
+            .map(|(repo, ch, rel)| ((repo.to_string(), ch), rel))
+            .collect(),
+    }
+}
+
+/// digstore's config declaring linux/arm64 exempt — the shape the audit judges.
+fn digstore_exempts_arm64() -> FeedConfig {
+    FeedConfig::from_json(
+        r#"{"components":[{"name":"digstore","repo":"DIG-Network/digstore","asset_prefix":"digstore",
+            "exempt_platforms":[{"os":"linux","arch":"arm64"}]}]}"#,
+    )
+    .unwrap()
+}
+
+/// Over-broad caught: the release DOES ship the exempt linux/arm64 asset, so the exemption masks the
+/// #2343 gate and the audit must flag it — naming the component AND the resolvable platform.
+#[test]
+fn an_overbroad_exemption_is_flagged_and_named() {
+    let src = channel_source(vec![
+        (
+            "DIG-Network/digstore",
+            Channel::Stable,
+            release("v1.2.3", DIGSTORE_ALL), // ships linux/arm64 → exemption is over-broad
+        ),
+        (
+            "DIG-Network/digstore",
+            Channel::Nightly,
+            // nightly ships no arm64, so this channel is accurate — the finding is stable-only.
+            release(
+                "nightly",
+                &[
+                    "digstore-1.2.3-nightly.20260810.abc123-linux-x64",
+                    "digstore-1.2.3-nightly.20260810.abc123-macos-arm64",
+                    "digstore-1.2.3-nightly.20260810.abc123-macos-x64",
+                    "digstore-1.2.3-nightly.20260810.abc123-windows-x64.exe",
+                ],
+            ),
+        ),
+    ]);
+
+    let audit = audit_exemptions(&digstore_exempts_arm64(), &src);
+
+    assert!(
+        !audit.is_clean(),
+        "a resolvable exempt platform must make the audit unclean"
+    );
+    let rendered = audit.render();
+    assert!(
+        rendered.contains("digstore") && rendered.contains("linux/arm64"),
+        "the audit must name the component and the over-broad platform, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("stable"),
+        "the finding must name the channel it was found on, got:\n{rendered}"
+    );
+}
+
+/// Legit exemption stays clean: neither channel ships the exempt platform, so the exemption is
+/// accurate and the audit is clean — the truthful control for the case above.
+#[test]
+fn a_legitimate_exemption_is_clean_on_both_channels() {
+    let no_arm64 = &[
+        "digstore-1.2.3-linux-x64",
+        "digstore-1.2.3-macos-arm64",
+        "digstore-1.2.3-macos-x64",
+        "digstore-1.2.3-windows-x64.exe",
+    ];
+    let src = channel_source(vec![
+        (
+            "DIG-Network/digstore",
+            Channel::Stable,
+            release("v1.2.3", no_arm64),
+        ),
+        (
+            "DIG-Network/digstore",
+            Channel::Nightly,
+            release(
+                "nightly",
+                &[
+                    "digstore-1.2.3-nightly.20260810.abc123-linux-x64",
+                    "digstore-1.2.3-nightly.20260810.abc123-macos-arm64",
+                    "digstore-1.2.3-nightly.20260810.abc123-macos-x64",
+                    "digstore-1.2.3-nightly.20260810.abc123-windows-x64.exe",
+                ],
+            ),
+        ),
+    ]);
+
+    let audit = audit_exemptions(&digstore_exempts_arm64(), &src);
+
+    assert!(
+        audit.is_clean(),
+        "an exemption for a genuinely-absent platform on both channels is clean, got:\n{}",
+        audit.render()
+    );
+}
+
+/// Both-channel sweep: an exemption accurate on STABLE but over-broad on NIGHTLY still fails the
+/// audit — proving it inspects both channels, not just `releases/latest`.
+#[test]
+fn an_exemption_overbroad_only_in_nightly_still_fails() {
+    let stable_no_arm64 = &[
+        "digstore-1.2.3-linux-x64",
+        "digstore-1.2.3-macos-arm64",
+        "digstore-1.2.3-macos-x64",
+        "digstore-1.2.3-windows-x64.exe",
+    ];
+    let src = channel_source(vec![
+        (
+            "DIG-Network/digstore",
+            Channel::Stable,
+            release("v1.2.3", stable_no_arm64), // stable: exemption accurate
+        ),
+        (
+            "DIG-Network/digstore",
+            Channel::Nightly,
+            // nightly HAS an arm64 build → exemption over-broad on nightly only.
+            release(
+                "nightly",
+                &[
+                    "digstore-1.3.0-nightly.20260810.def456-linux-x64",
+                    "digstore-1.3.0-nightly.20260810.def456-linux-arm64",
+                    "digstore-1.3.0-nightly.20260810.def456-macos-arm64",
+                    "digstore-1.3.0-nightly.20260810.def456-macos-x64",
+                    "digstore-1.3.0-nightly.20260810.def456-windows-x64.exe",
+                ],
+            ),
+        ),
+    ]);
+
+    let audit = audit_exemptions(&digstore_exempts_arm64(), &src);
+
+    assert!(
+        !audit.is_clean(),
+        "an over-broad exemption on nightly alone must fail the audit"
+    );
+    assert_eq!(
+        audit.findings().len(),
+        1,
+        "exactly the nightly finding, not stable"
+    );
+    assert_eq!(audit.findings()[0].channel, Channel::Nightly);
+    assert!(audit.render().contains("nightly"));
 }
