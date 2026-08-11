@@ -11,11 +11,14 @@ authors.workspace = true
 dig-updater-trust = { path = "../dig-updater-trust" }
 dig-updater-worker = { path = "../dig-updater-worker" }
 # The SHARED, already-released component-resolution + Install/Update/Skip decision matrix
-# (factored out of dig-installer, #508). The broker consumes `detect_installed_version` + `decide`
-# so the enumeration decision is IDENTICAL to what the installer ships — never a second copy that
-# could drift (SPEC §12, CLAUDE.md §4.1 release-first). Consumed from crates.io by version
-# (NC-7: pull DIG crates from crates.io by version, never a bare git dep — epic #681).
-dig-release-resolver = "0.1"
+# (factored out of dig-installer, #508) PLUS the shared host-loadability check (its `loadability`
+# module — the ELF-needs parse + host-soname decision — lifted verbatim from this crate's former
+# `elf.rs`/`loadable.rs` in resolver 0.2, so update-time and install-time selectors share ONE copy,
+# #2694). The broker consumes `detect_installed_version` + `decide` + `loadability::*` so both the
+# enumeration decision AND the loadability check are IDENTICAL to what the installer ships — never a
+# second copy that could drift (SPEC §12, CLAUDE.md §4.1 release-first). Consumed from crates.io by
+# version (NC-7: pull DIG crates from crates.io by version, never a bare git dep — epic #681).
+dig-release-resolver = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

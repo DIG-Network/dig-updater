@@ -47,13 +47,13 @@ use crate::install::{
     InstallOutcome, RetryPolicy,
 };
 use crate::installed::InstalledBuildStore;
-use crate::loadable::{Loadability, LoadabilityCheck};
 use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONENT_NAME};
 use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
 use crate::selfupdate::apply_self_update;
 use crate::service::{ServiceAction, ServiceControl};
 use crate::state::{LoadedState, TrustStateStore};
+use dig_release_resolver::loadability::{Loadability, LoadabilityCheck};
 
 /// What one component's apply produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -73,7 +73,7 @@ pub enum ComponentResult {
     /// already current; a hold asserts nothing about it except that the beacon left it alone.
     Held,
     /// The verified artifact was REFUSED before anything on disk was touched: this host cannot LOAD
-    /// it (dig_ecosystem#1870 — [`crate::loadable`]). The bytes passed every signature and digest
+    /// it (dig_ecosystem#1870 — [`dig_release_resolver::loadability`]). The bytes passed every signature and digest
     /// check; they simply require shared libraries this host does not provide, so installing them
     /// would replace a WORKING binary with one that dies in the dynamic linker before `main`. The
     /// live binary was never moved aside, no snapshot was taken, and no service was stopped.
@@ -304,7 +304,7 @@ pub struct Installer<'a> {
     /// neither step ever executes it. Production wires [`crate::hashing::installed_digest_hex`].
     pub digest: &'a DigestReader<'a>,
     /// Decide whether THIS host can actually load a verified artifact, BEFORE it is installed
-    /// (dig_ecosystem#1870). Production wires [`crate::loadable::host_check`]; tests inject a scripted
+    /// (dig_ecosystem#1870). Production wires [`dig_release_resolver::loadability::host_checker`]; tests inject a scripted
     /// answer so the refuse / apply / indeterminate branches are all exercised on every OS runner.
     pub loadability: &'a LoadabilityCheck<'a>,
     /// What build of each component this beacon last installed, per channel — read to hold back an
@@ -594,7 +594,7 @@ impl Installer<'_> {
                     indeterminate,
                 } => {
                     if let Some(why) = &indeterminate {
-                        // No answer is NOT a refusal (see [`crate::loadable`]): a `.deb`/`.msi` private
+                        // No answer is NOT a refusal (see [`dig_release_resolver::loadability`]): a `.deb`/`.msi` private
                         // copy, a musl host, a non-ELF platform. The install proceeds exactly as it did
                         // before this check existed, and the reason travels into the report so the silence
                         // is legible.

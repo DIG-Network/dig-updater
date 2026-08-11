@@ -131,9 +131,9 @@ dependencies = [
 
 [[package]]
 name = "dig-release-resolver"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b84160b3204633f9e7390cc46585145e833836b130eb17a6317b26a24633af17"
+checksum = "a76dd0171b14ba547744c173a9923b61d66139509efbf3770445366a08b9d43f"
 dependencies = [
  "serde",
  "serde_json",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-broker"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "base64 0.23.1",
  "dig-release-resolver",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-cli"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "dig-updater-broker",
  "dig-updater-trust",
@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-feedsign"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "base64 0.23.1",
  "dig-updater-trust",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-trust"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-worker"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "base64 0.23.1",
  "dig-updater-trust",

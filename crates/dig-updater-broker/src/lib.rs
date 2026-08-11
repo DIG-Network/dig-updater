@@ -52,14 +52,12 @@
 pub mod config;
 pub mod display;
 pub mod elevation;
-pub mod elf;
 mod error;
 pub mod ext_forcelist;
 mod hashing;
 pub mod health;
 pub mod install;
 pub mod installed;
-pub mod loadable;
 pub mod lock;
 pub mod optout;
 mod pass;
@@ -99,7 +97,11 @@ pub use hashing::{installed_digest_hex, DigestReader};
 pub use health::VersionProbe;
 pub use install::RetryPolicy;
 pub use installed::{InstalledBuildStore, InstalledBuilds};
-pub use loadable::{host_checker, Host, Loadability, LoadabilityCheck};
+// The host-loadability check lives in the SHARED `dig-release-resolver` (its `loadability` module,
+// #2694) so update-time (this broker) and install-time (the installer) selectors run ONE identical
+// copy. Re-exported here so the broker's own consumers (the CLI, tests) keep reading these names off
+// this crate without depending on `dig-release-resolver` directly.
+pub use dig_release_resolver::loadability::{host_checker, Host, Loadability, LoadabilityCheck};
 pub use pass::{ComponentOutcome, ComponentResult, Installer, PassReport};
 pub use plan::{
     Catalog, ComponentTarget, HeldComponent, InstallMethod, Plan, PlannedComponent, PlannedVariant,
@@ -490,7 +492,7 @@ impl Broker {
         // dig_ecosystem#1870: enumerate this host's shared libraries ONCE per pass, not once per
         // component — the scan reads seven-plus directories and shells out to `ldconfig`, and the
         // answer cannot change meaningfully mid-pass.
-        let host_check = loadable::host_checker();
+        let host_check = dig_release_resolver::loadability::host_checker();
 
         let installer = Installer {
             store: &store,

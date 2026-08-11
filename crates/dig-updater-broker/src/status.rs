@@ -148,7 +148,7 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub schedule_registered: ScheduleRegistration,
     /// The components whose artifact this host cannot LOAD, and which the last pass therefore REFUSED
-    /// to install (dig_ecosystem#1870 — [`crate::loadable`]). Empty on a host that can load everything
+    /// to install (dig_ecosystem#1870 — [`dig_release_resolver::loadability`]). Empty on a host that can load everything
     /// the feed offers it.
     ///
     /// This is how a refusal stays visible: it is deliberately not a pass FAULT (a headless host's
