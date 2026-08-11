@@ -21,8 +21,10 @@
 //! hardening closes (the residual needs an *elevated* misconfiguration to exist in the first
 //! place). So the leniency is deliberate and asymmetric:
 //!
-//! - a DACL we could **not read** is `None` from [`read`], never a [`DaclVerdict`], and does NOT
-//!   reject — the owner check stands alone, exactly as it did before this module existed;
+//! - a security descriptor we could **not read** is `None` from [`read_snapshot`], never a
+//!   [`DaclVerdict`], and proves nothing — so the path is not honored, which is exactly the answer
+//!   the owner check alone gave before this module existed (`READ_CONTROL` governs both halves of
+//!   the descriptor, so neither can be read without the other);
 //! - a DACL we **could** read and which is permissive DOES reject;
 //! - a DENY ACE that PRECEDES a grant is subtracted from the same principal's allowed mask, so a
 //!   directory an administrator hardened with an explicit deny over an inherited grant is not
@@ -33,17 +35,18 @@
 //!   subtracted too — and no other group is, because only a SUPERSET of every principal can be
 //!   subtracted without excusing access someone still holds (see [`EVERYONE`]);
 //! - an `INHERIT_ONLY` ACE grants nothing on the object itself and is ignored;
-//! - an ACE whose CONDITION cannot be evaluated, or whose TRUSTEE cannot be read, is assumed to
-//!   grant. This is the one place the leniency stops, and it stops there because the alternative
+//! - an ACE whose CONDITION cannot be evaluated, whose TRUSTEE cannot be read, or which cannot be
+//!   READ AT ALL, is assumed to grant, and the walk continues past it rather than collapsing. This is the one place the leniency stops, and it stops there because the alternative
 //!   was measured: a conditional grant (`XA` with a trivially-true `Member_of{SID(WD)}`) and an
 //!   object grant (`OA`) each left a directory an unprivileged process could plant a binary in
 //!   while this module reported it clean — reachable, like the trailing-DENY bypass above, with a
 //!   single `SetFileSecurityW` call needing only `WRITE_DAC`.
 //!
-//! Distinguishing "read the DACL, found nothing bad" from "could not read the DACL" is the whole
-//! point of [`Dacl`] being returned inside an [`Option`]: a restrictive directory can enumerate as
-//! empty rather than failing, and collapsing those two into one "clean" answer would be a false
-//! all-clear.
+//! Distinguishing "read the DACL, found nothing bad" from "could not read the descriptor" is the
+//! whole point of [`read_snapshot`] returning an [`Option`]: a restrictive directory can enumerate
+//! as empty rather than failing, and collapsing those two into one "clean" answer would be a false
+//! all-clear. The `Option` is reserved for the DESCRIPTOR, never for an entry inside it — a single
+//! unreadable ACE is a finding, not an absence of evidence.
 
 /// A rights mask bit granting write-equivalent access to a directory — enough to plant, replace or
 /// remove the binary a privileged schedule runs, or to re-ACL the directory so that one can.
@@ -309,10 +312,10 @@ mod imp {
     pub struct Snapshot {
         /// Whether the owner SID is `BUILTIN\Administrators` or `Local System`.
         pub owner_is_privileged: bool,
-        /// The DACL, or `None` if the ACL could not be WALKED. That is distinct from the
-        /// descriptor being unreadable (which is `None` from [`read_snapshot`] itself) and from a
-        /// DACL that walked cleanly and held no entries.
-        pub dacl: Option<Dacl>,
+        /// The DACL. [`Dacl::Absent`] is a NULL DACL — world-writable — and NOT the same as a
+        /// present DACL holding no entries; neither is the same as [`read_snapshot`] answering
+        /// `None`, which means the descriptor itself could not be read.
+        pub dacl: Dacl,
     }
 
     /// Read `path`'s owner and DACL in ONE `GetNamedSecurityInfoW` call, or `None` if the security
@@ -371,9 +374,9 @@ mod imp {
         // SAFETY: on success `dacl` is either NULL (no DACL) or a valid ACL inside `descriptor`,
         // which outlives the read because it is freed only after `entries` returns owned data.
         let parsed = if dacl.is_null() {
-            Some(Dacl::Absent)
+            Dacl::Absent
         } else {
-            unsafe { entries(dacl) }.map(Dacl::Present)
+            Dacl::Present(unsafe { entries(dacl) })
         };
         // SAFETY: exactly the allocation `GetNamedSecurityInfoW` returned, freed once.
         unsafe {
@@ -388,16 +391,19 @@ mod imp {
     /// Just the DACL half of [`read_snapshot`] — the shape the `judge` fixtures read against.
     #[cfg(test)]
     pub fn read(path: &Path) -> Option<Dacl> {
-        read_snapshot(path)?.dacl
+        Some(read_snapshot(path)?.dacl)
     }
 
-    /// Walk every ACE in `acl` into owned [`Ace`] data. `None` if the ACL could not be walked —
-    /// which stays distinct from an ACL that walked cleanly and held no entries.
+    /// Walk every ACE in `acl` into owned [`Ace`] data.
+    ///
+    /// The walk always completes. An entry it cannot decode becomes a maximally-pessimistic GRANT
+    /// ([`unreadable_grant`]) rather than aborting the read, because the caller reads a failed read
+    /// as "no descriptor" and accepts on the owner check alone — see the arms below.
     ///
     /// # Safety
     ///
     /// `acl` must be a valid, non-NULL `ACL` that outlives the call.
-    unsafe fn entries(acl: *mut ACL) -> Option<Vec<Ace>> {
+    unsafe fn entries(acl: *mut ACL) -> Vec<Ace> {
         use windows::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER};
         use windows::Win32::System::SystemServices::{
             ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
@@ -411,11 +417,16 @@ mod imp {
         let mut out = Vec::with_capacity(count as usize);
         for index in 0..count {
             let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
-            // SAFETY: `index` is below the ACL's own AceCount, so the ACE exists.
+            // SAFETY: `index` is below the ACL's own AceCount, so the ACE should exist; a
+            // malformed ACL whose header over-counts is handled by the failure arm.
             if unsafe { GetAce(acl, index, &mut raw) }.is_err() || raw.is_null() {
-                // One unreadable ACE makes the WHOLE list untrustworthy: the entry we could not
-                // read is exactly the one that might carry the permissive grant.
-                return None;
+                // The entry we could not read is exactly the one that might carry the permissive
+                // grant, so it counts as GRANTING and the walk CONTINUES. Aborting to `None` would
+                // report "no descriptor", which the caller accepts on the owner check alone — a
+                // fail-OPEN reachable after the owner read has already succeeded, so nothing
+                // upstream refuses on its behalf.
+                out.push(unreadable_grant(false));
+                continue;
             }
             // SAFETY: `GetAce` yielded a pointer to a well-formed ACE, whose header is its first
             // field for every ACE type.
@@ -443,12 +454,7 @@ mod imp {
                 // does grant, to a principal we cannot name. This is the same policy the
                 // unreadable-ACE arm above applies, for the same reason.
                 ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
-                    out.push(Ace {
-                        kind: AceKind::Allow,
-                        sid: super::UNREADABLE_TRUSTEE.to_string(),
-                        mask: u32::MAX,
-                        inherit_only,
-                    });
+                    out.push(unreadable_grant(inherit_only));
                     continue;
                 }
                 // A DENY whose trustee is unreadable can be dropped rather than flagged: it grants
@@ -477,7 +483,16 @@ mod imp {
             let mask = unsafe { (*raw.cast::<ACCESS_ALLOWED_ACE>()).Mask };
             let sid_offset = core::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
             // SAFETY: `SidStart` is the first byte of the ACE's trailing SID, in bounds of the ACE.
-            let sid = unsafe { sid_string(raw.byte_add(sid_offset)) }?;
+            let Some(sid) = (unsafe { sid_string(raw.byte_add(sid_offset)) }) else {
+                // Same policy as the object-ACE arm below, for the same reason: an ALLOW whose
+                // trustee cannot be named could name anyone, so it is a finding. A DENY whose
+                // trustee cannot be named is DROPPED rather than flagged — it grants nothing, and
+                // an unnamed deny could never have excused a grant anyway.
+                if kind == AceKind::Allow {
+                    out.push(unreadable_grant(inherit_only));
+                }
+                continue;
+            };
             out.push(Ace {
                 kind,
                 sid,
@@ -485,7 +500,21 @@ mod imp {
                 inherit_only,
             });
         }
-        Some(out)
+        out
+    }
+
+    /// An ACE the parser could not decode, rendered in the only shape that cannot become a false
+    /// all-clear: a grant of EVERY right to a trustee that can never be privileged.
+    ///
+    /// [`super::UNREADABLE_TRUSTEE`] is not a real SID, so it never matches
+    /// [`super::PRIVILEGED_SIDS`] and can only ever produce a finding.
+    fn unreadable_grant(inherit_only: bool) -> Ace {
+        Ace {
+            kind: AceKind::Allow,
+            sid: super::UNREADABLE_TRUSTEE.to_string(),
+            mask: u32::MAX,
+            inherit_only,
+        }
     }
 
     /// Render a SID as its canonical `S-1-…` string, or `None` if it could not be converted.
@@ -512,6 +541,52 @@ mod imp {
             let _ = LocalFree(Some(HLOCAL(text.as_ptr().cast())));
         }
         owned
+    }
+
+    #[cfg(test)]
+    mod unreadable_ace {
+        use super::{entries, ACL};
+        use crate::dacl::{judge, Dacl, DaclVerdict};
+
+        /// An ACL header claiming an ACE the buffer does not contain, so `GetAce` FAILS on it.
+        ///
+        /// `ACL` must be DWORD-aligned, which the wrapper guarantees.
+        #[repr(align(4))]
+        struct AlignedAcl(ACL);
+
+        #[test]
+        fn an_ace_that_cannot_be_read_is_a_finding_not_an_accept() {
+            // Aborting the walk on an unreadable ACE returned `None`, and `None` means "no
+            // descriptor" — which `secure` deliberately ACCEPTS on the owner check alone. That
+            // leniency is defensible only where it fires BEFORE anything is read (`READ_CONTROL`
+            // governs the owner read too, so the owner leg refuses first); mid-walk, nothing
+            // upstream refuses on its behalf. An ACE we cannot decode is exactly the ACE that might
+            // carry the permissive grant, so it must count as GRANTING — the policy the object-ACE
+            // and conditional-ACE arms already apply.
+            let mut acl = AlignedAcl(ACL {
+                AclRevision: 2,
+                Sbz1: 0,
+                AclSize: u16::try_from(size_of::<ACL>()).expect("the ACL header is 8 bytes"),
+                AceCount: 1,
+                Sbz2: 0,
+            });
+            // SAFETY: a well-formed, correctly-aligned ACL header that outlives the call. Its
+            // AceCount deliberately exceeds the bytes present, which is precisely the read failure
+            // under test.
+            let walked = unsafe { entries(&mut acl.0) };
+            assert_eq!(
+                walked.len(),
+                1,
+                "the claimed ACE must still be accounted for"
+            );
+            assert!(
+                matches!(
+                    judge(&Dacl::Present(walked)),
+                    DaclVerdict::UnprivilegedWrite { .. }
+                ),
+                "an ACE that cannot be read must count as granting, never as an accept"
+            );
+        }
     }
 }
 

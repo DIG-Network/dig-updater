@@ -195,18 +195,13 @@ pub fn path_is_privileged_owned(path: &Path) -> bool {
 /// holding `WRITE_DAC` could pass the owner leg and then make the DACL unreadable to collect the
 /// deliberate accept-on-owner-alone leniency below. See that function for the full reasoning.
 ///
-/// The three outcomes are deliberately NOT collapsed (dig_ecosystem#2571):
-///
-/// - the DACL is readable and privileged-write-only → `true`;
-/// - the DACL is readable and grants an unprivileged principal write → `false`, the finding;
-/// - the DACL could NOT be walked → the owner check stands ALONE, with a warning. This is an
-///   ABSENCE of evidence, never evidence of cleanliness, and treating it as a refusal would fail in
-///   the expensive direction: a refused `schedule install` means no daily wake, so the machine stops
-///   receiving security updates entirely — strictly worse than the elevated-misconfiguration
-///   residual this closes.
-///
-/// A descriptor that could not be read AT ALL — which includes the path not existing — answers
-/// `false`: nothing has been proven privileged, so no marker is honored.
+/// A descriptor that could not be read — which includes the path not existing — answers `false`:
+/// nothing has been proven privileged, so no marker is honored. That is the SAME answer the owner
+/// check gave on its own before the DACL check existed, because `READ_CONTROL` governs both halves
+/// of the descriptor: a path whose DACL cannot be read cannot have its owner read either. There is
+/// therefore no "read the owner but not the DACL" state left for a leniency to apply to, and an
+/// individual ACE that cannot be DECODED does not produce one — it counts as granting
+/// ([`crate::dacl`]), so an undecodable entry is a finding rather than an absence of evidence.
 ///
 /// This is the third and final `unsafe` site in the workspace (beside `sandbox.rs`'s privilege-drop
 /// and `lock.rs`'s named-mutex DACL), and it lives entirely behind [`crate::dacl`].
@@ -224,17 +219,13 @@ fn windows_path_is_privileged(path: &Path) -> bool {
     if !snapshot.owner_is_privileged {
         return false;
     }
-    let Some(dacl) = snapshot.dacl else {
-        eprintln!(
-            "dig-updater: warning: could not read the DACL of {shown}; accepting it on the owner              check alone"
-        );
-        return true;
-    };
-    match judge(&dacl) {
+    match judge(&snapshot.dacl) {
         DaclVerdict::PrivilegedWriteOnly => true,
         DaclVerdict::UnprivilegedWrite { sid } => {
             eprintln!(
-                "dig-updater: warning: {shown} is privileged-owned but its DACL grants                  write-equivalent access to {sid}, which could replace what a privileged consumer                  later runs"
+                "dig-updater: warning: {shown} is privileged-owned but its DACL grants \
+                 write-equivalent access to {sid}, which could replace what a privileged consumer \
+                 later runs"
             );
             false
         }

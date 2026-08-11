@@ -535,9 +535,20 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
   SID: an `Administrators`-owned directory can still carry an ACE granting write-equivalent access
   (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`,
   `GENERIC_WRITE`, `GENERIC_ALL`) to an unprivileged principal such as `Users`, and a NULL DACL grants every
-  principal full control while enumerating as no entries at all. A DACL that could not be read is an
-  absence of evidence and MUST NOT be reported as a clean one; it leaves the owner check standing
-  alone rather than rejecting, because a false refusal here stops the host updating entirely.
+  principal full control while enumerating as no entries at all. A security descriptor that could
+  not be read is an absence of evidence and MUST NOT be reported as a clean one; nothing has been
+  proven privileged, so the path is not honored — the same answer the owner check alone already
+  gave, since `READ_CONTROL` governs the owner and the DACL alike.
+- The owner SID and the DACL MUST be read from ONE security-descriptor snapshot. A security
+  descriptor is mutable, so two reads describe two moments: an attacker holding `WRITE_DAC` could
+  let an owner-only read succeed and then make the descriptor unreadable before a separate DACL
+  read, collecting whatever leniency the unreadable case carries. One read admits no such window.
+- An individual ACE the implementation cannot READ or DECODE MUST NOT abort the walk. It MUST be
+  recorded as a grant of every right to a trustee that is never privileged, so it can only produce a
+  finding, and the walk MUST continue. Aborting would report "no descriptor" — an absence of
+  evidence, which is not a refusal — for an entry read AFTER the owner has already been accepted,
+  where nothing upstream refuses on its behalf. This is the same policy the unparsable-ACE rule
+  below states, for the same reason.
 - The DACL MUST be evaluated **in ACE order**, as Windows evaluates it. A DENY ACE reduces a
   principal's effective mask ONLY where Windows would reach it — that is, only when it PRECEDES the
   ALLOW under judgement. A DENY that FOLLOWS the grant MUST NOT be subtracted: Windows stops at the
