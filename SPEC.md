@@ -538,6 +538,14 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
   principal full control while enumerating as no entries at all. A DACL that could not be read is an
   absence of evidence and MUST NOT be reported as a clean one; it leaves the owner check standing
   alone rather than rejecting, because a false refusal here stops the host updating entirely.
+- The DACL MUST be evaluated **in ACE order**, as Windows evaluates it. A DENY ACE reduces a
+  principal's effective mask ONLY where Windows would reach it — that is, only when it PRECEDES the
+  ALLOW under judgement. A DENY that FOLLOWS the grant MUST NOT be subtracted: Windows stops at the
+  first matching ACE, `SetFileSecurityW` stores a non-canonical order verbatim, and writing such an
+  order requires only `WRITE_DAC` — a right contained in the very `FILE_ALL_ACCESS` grant this check
+  exists to detect. Honouring an unreachable DENY would therefore let a principal who already holds
+  full write make the directory report privileged-write-only. The canonical hardened shape (DENY
+  first, which Windows itself canonicalizes to) MUST still be accepted.
 
 The always-on driver kicks `schedule ensure` but NEVER touches the OS scheduler directly and NEVER
 decides opt-out — the beacon remains the sole authority over the schedule artifact and honors the

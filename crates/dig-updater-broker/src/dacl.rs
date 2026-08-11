@@ -24,8 +24,11 @@
 //! - a DACL we could **not read** is `None` from [`read`], never a [`DaclVerdict`], and does NOT
 //!   reject — the owner check stands alone, exactly as it did before this module existed;
 //! - a DACL we **could** read and which is permissive DOES reject;
-//! - a DENY ACE is subtracted from the same principal's allowed mask, so a directory an
-//!   administrator hardened with an explicit deny over an inherited grant is not flagged;
+//! - a DENY ACE that PRECEDES a grant is subtracted from the same principal's allowed mask, so a
+//!   directory an administrator hardened with an explicit deny over an inherited grant is not
+//!   flagged. A DENY that FOLLOWS the grant is not subtracted, because Windows stops at the first
+//!   matching ACE and so never reaches it — honouring it would let one `SetFileSecurityW` call
+//!   silence this check while leaving the directory world-writable;
 //! - an `INHERIT_ONLY` ACE grants nothing on the object itself and is ignored.
 //!
 //! Distinguishing "read the DACL, found nothing bad" from "could not read the DACL" is the whole
@@ -179,11 +182,13 @@ pub(crate) fn judge(dacl: &Dacl) -> DaclVerdict {
         Dacl::Present(entries) => entries,
     };
 
-    for ace in entries {
+    for (index, ace) in entries.iter().enumerate() {
         if ace.kind != AceKind::Allow || ace.inherit_only || is_privileged_sid(&ace.sid) {
             continue;
         }
-        let denied = denied_mask_for(entries, &ace.sid);
+        // Only the ACEs Windows would have evaluated BEFORE this grant can take anything away from
+        // it — see `denied_mask_for`.
+        let denied = denied_mask_for(&entries[..index], &ace.sid);
         if ace.mask & rights::WRITE_EQUIVALENT & !denied != 0 {
             return DaclVerdict::UnprivilegedWrite {
                 sid: ace.sid.clone(),
@@ -193,9 +198,19 @@ pub(crate) fn judge(dacl: &Dacl) -> DaclVerdict {
     DaclVerdict::PrivilegedWriteOnly
 }
 
-/// Every bit denied to `sid` by an applicable DENY ACE anywhere in the list.
-fn denied_mask_for(entries: &[Ace], sid: &str) -> u32 {
-    entries
+/// Every bit denied to `sid` by an applicable DENY ACE in `preceding` — the ACEs that sit BEFORE
+/// the grant under judgement.
+///
+/// The slice is a prefix on purpose. Windows evaluates a DACL strictly in order and stops at the
+/// first ACE matching the requested access, so a DENY placed AFTER an ALLOW is never reached and
+/// takes nothing away. `SetFileSecurityW` stores a non-canonical order verbatim, so an
+/// allow-then-deny DACL is a real, reachable shape — and one an attacker holding `WRITE_DAC` (a bit
+/// contained in the very `FILE_ALL_ACCESS` misconfiguration this module detects) could write to keep
+/// full write access while making the check report clean. Honouring a DENY only where Windows
+/// honours it closes that bypass while keeping the intended leniency for the canonical hardened
+/// shape, which Windows itself canonicalizes to DENY-first.
+fn denied_mask_for(preceding: &[Ace], sid: &str) -> u32 {
+    preceding
         .iter()
         .filter(|ace| ace.kind == AceKind::Deny && !ace.inherit_only && ace.sid == sid)
         .fold(0, |acc, ace| acc | ace.mask)
@@ -599,24 +614,33 @@ mod tests {
     }
 
     #[test]
-    fn a_deny_is_subtracted_whichever_side_of_the_grant_it_sits() {
-        // Windows evaluates ACEs in order, so a DENY placed AFTER an ALLOW does not actually take
-        // away what the ALLOW already granted. This check subtracts it anyway, and does so on
-        // purpose: the strict reading would flag a directory whose administrator plainly INTENDED
-        // to deny, and a false refusal here stops the machine updating at all. Producing such a
-        // DACL already requires the write access this check is looking for.
-        let denied_first = judge(&Dacl::Present(vec![
-            Ace::deny(USERS, rights::WRITE_EQUIVALENT),
-            Ace::allow(USERS, FULL),
-        ]));
-        let allowed_first = judge(&Dacl::Present(vec![
-            Ace::allow(USERS, FULL),
-            Ace::deny(USERS, rights::WRITE_EQUIVALENT),
-        ]));
-        assert_eq!(denied_first, DaclVerdict::PrivilegedWriteOnly);
+    fn a_deny_counts_only_where_windows_would_reach_it() {
+        // The two orders are NOT equivalent, and treating them as if they were was a real bypass:
+        // Windows evaluates ACEs in sequence and stops at the first match, so a DENY placed AFTER
+        // an ALLOW never runs. `SetFileSecurityW` stores that non-canonical order verbatim, and
+        // writing it needs only `WRITE_DAC` — a bit inside the very FILE_ALL_ACCESS grant this
+        // module exists to flag. Subtracting the trailing DENY therefore let an attacker who
+        // already held full write make the directory report clean, with one call and no elevation.
+        // Measured on Windows 11: a directory with `D:P(A;;FA;;;BU)(D;;FA;;;BU)` accepted a planted
+        // binary from an unprivileged process, while `D:P(D;;FA;;;BU)(A;;FA;;;BU)` refused one.
         assert_eq!(
-            allowed_first, denied_first,
-            "ACE order must not change the verdict"
+            judge(&Dacl::Present(vec![
+                Ace::deny(USERS, rights::WRITE_EQUIVALENT),
+                Ace::allow(USERS, FULL),
+            ])),
+            DaclVerdict::PrivilegedWriteOnly,
+            "a DENY before the grant is honoured by Windows, so it must be honoured here — the \
+             canonical hardened shape must keep installing"
+        );
+        assert_eq!(
+            judge(&Dacl::Present(vec![
+                Ace::allow(USERS, FULL),
+                Ace::deny(USERS, rights::WRITE_EQUIVALENT),
+            ])),
+            DaclVerdict::UnprivilegedWrite {
+                sid: USERS.to_string()
+            },
+            "a DENY after the grant is unreachable on Windows and must not excuse it"
         );
     }
 
@@ -705,5 +729,173 @@ mod tests {
             judge(&Dacl::Present(vec![])),
             DaclVerdict::PrivilegedWriteOnly
         );
+    }
+
+    /// The fixture battery above never touches [`read`], so an ACL shape the OS can hold but the
+    /// parser mis-reads would be invisible to every test in it — which is exactly how a
+    /// non-canonical allow-then-deny DACL passed 18 green tests. These build REAL directories with
+    /// REAL ACLs and run the whole `read` → `judge` path over them.
+    ///
+    /// They need no elevation: an ordinary user owns the directories it creates in `%TEMP%` and so
+    /// already holds `WRITE_DAC` over them.
+    #[cfg(windows)]
+    mod real_acls {
+        use super::super::{judge, read, Dacl, DaclVerdict};
+        use std::path::Path;
+
+        /// Replace `path`'s DACL with the one `sddl` describes, protected from inheritance.
+        ///
+        /// `SetFileSecurityW` writes the ACE sequence VERBATIM — it does not canonicalize — which is
+        /// what makes a non-canonical allow-then-deny order reachable in the first place.
+        fn set_dacl(path: &Path, sddl: &str) {
+            use std::os::windows::ffi::OsStrExt;
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::{LocalFree, HLOCAL};
+            use windows::Win32::Security::Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            };
+            use windows::Win32::Security::{
+                SetFileSecurityW, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            };
+
+            let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let wide_path: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            // SAFETY: both inputs are NUL-terminated wide strings; the descriptor is LocalAlloc'd on
+            // success and freed below.
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(wide_sddl.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    None,
+                )
+            }
+            .expect("SDDL must convert");
+            // SAFETY: `descriptor` is the valid descriptor just converted.
+            unsafe {
+                SetFileSecurityW(
+                    PCWSTR(wide_path.as_ptr()),
+                    DACL_SECURITY_INFORMATION,
+                    descriptor,
+                )
+            }
+            .expect("the test process owns the directory, so it may re-DACL it");
+            // SAFETY: exactly the allocation the conversion returned, freed once.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+            }
+        }
+
+        /// Whether an UNPRIVILEGED principal can actually create a file here — the ground truth the
+        /// verdict is being compared against. The test process is a member of `BUILTIN\Users`, so
+        /// its own success or failure IS the answer for a `BU`-granting DACL.
+        fn a_file_can_be_planted(dir: &Path) -> bool {
+            std::fs::write(dir.join("planted.exe"), b"MZ").is_ok()
+        }
+
+        #[test]
+        fn a_trailing_deny_does_not_hide_a_world_writable_directory() {
+            let root = tempfile::tempdir().expect("temp dir");
+            let dir = root.path().join("allow-then-deny");
+            std::fs::create_dir(&dir).expect("create");
+            // Non-canonical on purpose: Windows stops at the leading ALLOW, so `BUILTIN\Users`
+            // really does hold full control here.
+            set_dacl(&dir, "D:P(A;;FA;;;BU)(D;;FA;;;BU)");
+
+            assert!(
+                a_file_can_be_planted(&dir),
+                "ground truth: this directory IS writable by an unprivileged principal"
+            );
+            assert_eq!(
+                judge(&read(&dir).expect("the DACL is readable")),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: "S-1-5-32-545".to_string()
+                },
+                "a writable directory must be a finding whatever order the DENY sits in"
+            );
+        }
+
+        #[test]
+        fn the_canonical_hardened_shape_is_still_accepted() {
+            let root = tempfile::tempdir().expect("temp dir");
+            let dir = root.path().join("deny-then-allow");
+            std::fs::create_dir(&dir).expect("create");
+            // The order Windows itself canonicalizes to: the DENY is reached first and wins.
+            set_dacl(&dir, "D:P(D;;FA;;;BU)(A;;FA;;;BU)(A;;FA;;;SY)(A;;FA;;;BA)");
+
+            assert!(
+                !a_file_can_be_planted(&dir),
+                "ground truth: the leading DENY really does make this unwritable"
+            );
+            assert_eq!(
+                judge(&read(&dir).expect("the DACL is readable")),
+                DaclVerdict::PrivilegedWriteOnly,
+                "refusing a genuinely hardened directory would stop the host updating at all"
+            );
+        }
+
+        #[test]
+        fn an_inherited_grant_is_read_off_the_child() {
+            let root = tempfile::tempdir().expect("temp dir");
+            let parent = root.path().join("parent");
+            std::fs::create_dir(&parent).expect("create");
+            // `OICI` — object- and container-inherit, NOT inherit-only, so the child carries an
+            // applicable grant it never had written to it directly.
+            set_dacl(&parent, "D:P(A;OICI;FA;;;BU)(A;OICI;FA;;;SY)");
+            let child = parent.join("child");
+            std::fs::create_dir(&child).expect("create");
+
+            let Some(Dacl::Present(entries)) = read(&child) else {
+                panic!("the child's DACL must be readable and present");
+            };
+            assert!(
+                entries.iter().any(|ace| ace.sid == "S-1-5-32-545" && !ace.inherit_only),
+                "the inherited Users grant must arrive as an ACE that applies to the child itself, \
+                 got {entries:?}"
+            );
+            assert_eq!(
+                judge(&Dacl::Present(entries)),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: "S-1-5-32-545".to_string()
+                }
+            );
+        }
+
+        #[test]
+        fn a_null_dacl_read_off_a_real_directory_is_a_finding() {
+            let root = tempfile::tempdir().expect("temp dir");
+            let dir = root.path().join("null-dacl");
+            std::fs::create_dir(&dir).expect("create");
+            // `D:NO_ACCESS_CONTROL` is how SDDL spells a NULL DACL — the world-writable state that
+            // enumerates as no entries at all, and the one the parser must NOT report as clean.
+            set_dacl(&dir, "D:NO_ACCESS_CONTROL");
+
+            assert_eq!(
+                read(&dir),
+                Some(Dacl::Absent),
+                "a NULL DACL must arrive as `Absent`, never as an empty `Present`"
+            );
+            assert!(matches!(
+                judge(&read(&dir).expect("the descriptor is readable")),
+                DaclVerdict::UnprivilegedWrite { .. }
+            ));
+        }
+
+        #[test]
+        fn a_stock_system_directory_reads_as_privileged_write_only() {
+            // The other direction of the same instrument: a real, untouched, hardened OS directory
+            // must not be flagged, or `schedule install` refuses on every stock machine.
+            let system32 = Path::new("C:\\Windows\\System32");
+            assert_eq!(
+                judge(&read(system32).expect("System32's DACL is readable")),
+                DaclVerdict::PrivilegedWriteOnly
+            );
+        }
     }
 }
