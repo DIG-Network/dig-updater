@@ -35,22 +35,84 @@ fn serialize() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// A target program to register whose CONTAINING DIRECTORY is privileged-owned — the precondition
-/// `scheduler::install`/`ensure` now enforce (#2334: a SYSTEM/root daily task must not run a binary
-/// from a user-writable directory, or one elevation approval becomes a permanent foothold).
+/// A target program to register that satisfies the precondition `scheduler::install`/`ensure`
+/// enforce (#2334, dig_ecosystem#2571: a SYSTEM/root daily task must not run a binary that a
+/// non-privileged principal can replace, or one elevation approval becomes a permanent foothold).
 ///
-/// The exe file need not exist: registration is a pure OS-metadata write that never executes it, and
-/// the guard only stats the PARENT directory. We make that directory privileged-owned via the public
-/// [`secure::claim_privileged_ownership`] (Windows: sets the owner to Administrators; Unix: a no-op,
-/// since a root-run test already creates root-owned `0700` directories). The returned [`TempDir`]
-/// MUST be held for the test's duration — dropping it deletes the directory out from under the OS
-/// registration.
+/// **The binary is CREATED, not merely named.** An earlier version of this fixture returned a path to
+/// a file that never existed, on the premise that "registration is a pure OS-metadata write that
+/// never executes it, and the guard only stats the PARENT directory". The second half of that stopped
+/// being true when the guard grew its binary leg: a privilege predicate answers `false` for a path
+/// that is not there, so every elevated test in this file refused on ALL THREE operating systems with
+/// a message about the binary's ACL. A fixture that sidesteps the object under test is worse than no
+/// fixture — it reports green on a guard it never reached, and red for a reason that is not the one
+/// stated.
+///
+/// Both objects are then made privileged-owned via the public [`secure::claim_privileged_ownership`]
+/// (Windows: sets the owner to Administrators; Unix: a no-op, since a root-run test already creates
+/// root-owned files). The mode is set EXPLICITLY on Unix rather than inherited from the runner's
+/// umask, so the fixture cannot acquire a group/other write bit on a runner configured differently
+/// from ours and fail for a reason that has nothing to do with the test.
+///
+/// The returned [`TempDir`] MUST be held for the test's duration — dropping it deletes the directory
+/// out from under the OS registration.
 fn privileged_exe() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("throwaway exe dir");
-    dig_updater_broker::secure::claim_privileged_ownership(dir.path())
-        .expect("make the exe directory privileged-owned");
     let exe = dir.path().join("dig-updater");
+    std::fs::write(
+        &exe,
+        b"not a real binary: registration is metadata-only and never runs it\n",
+    )
+    .expect("create the binary the schedule will name");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 0755 root-owned is the shape a root-installed executable has: nobody but root may write it.
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+            .expect("restrict the binary to root writes");
+    }
+    for object in [dir.path(), exe.as_path()] {
+        dig_updater_broker::secure::claim_privileged_ownership(object)
+            .expect("make the schedule target privileged-owned");
+    }
     (dir, exe)
+}
+
+#[test]
+#[ignore = "claims privileged ownership; requires Administrator/root — run via `-- --ignored` in \
+            the elevated scheduler CI job"]
+fn the_fixture_target_satisfies_every_leg_of_the_guard() {
+    // Asserts the PRECONDITION the rest of this file depends on, directly and on its own.
+    //
+    // When the fixture returned a path to a binary it never created, all eight tests here failed at
+    // once, on all three operating systems, with a refusal about the binary's ACL — a message that
+    // named the wrong cause, because a privilege predicate cannot distinguish "restricted to the
+    // wrong principals" from "not there at all". The failure was read as a Windows check firing on
+    // Unix and cost a lane. One test asserting the precondition turns the next such drift into one
+    // legible failure instead of eight misleading ones.
+    use dig_updater_broker::secure::{dir_creates_privileged_files_only, path_is_privileged_owned};
+
+    let (dir, exe) = privileged_exe();
+    assert!(
+        exe.is_file(),
+        "the fixture must CREATE the binary, not merely name it: {}",
+        exe.display()
+    );
+    assert!(
+        path_is_privileged_owned(dir.path()),
+        "the fixture root must satisfy the guard's directory leg: {}",
+        dir.path().display()
+    );
+    assert!(
+        path_is_privileged_owned(&exe),
+        "the fixture binary must satisfy the guard's binary leg: {}",
+        exe.display()
+    );
+    assert!(
+        dir_creates_privileged_files_only(dir.path()),
+        "the fixture root must satisfy the guard's inheritance leg: {}",
+        dir.path().display()
+    );
 }
 
 /// A per-test, throwaway state directory the opt-out sentinel (#584) lives in — isolated from the

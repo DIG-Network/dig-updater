@@ -199,17 +199,20 @@ fn refuse_unprivileged_exe_dir(
     if !is_privileged(dir) {
         return Err(refusal(
             dir,
-            "that directory is not restricted to privileged identities — either it is not owned by \
-             one, or its DACL grants write-equivalent access to one that is not",
+            &format!(
+                "that directory is not restricted to privileged identities — \
+                 {NOT_RESTRICTED_BECAUSE}"
+            ),
             "a later writer of it could put its own binary there in place of the one",
         ));
     }
     if !is_privileged(exe) {
         return Err(refusal(
             exe,
-            "that BINARY is not restricted to privileged identities, even though its directory is \
-             — on Windows a file and its directory are independent objects, and the file's own DACL \
-             is what governs writing it",
+            &format!(
+                "that BINARY is not restricted to privileged identities, even though its directory \
+                 is — {BINARY_IS_ITS_OWN_OBJECT}"
+            ),
             "a later writer of it could overwrite the image of",
         ));
     }
@@ -224,19 +227,104 @@ fn refuse_unprivileged_exe_dir(
     Ok(())
 }
 
+/// The platform-specific halves of the refusal message.
+///
+/// This guard runs on all three operating systems and the message was written entirely in Windows
+/// terms, so a Linux operator refused on `/tmp/.../dig-updater` was told that "on Windows a file and
+/// its directory are independent objects", pointed at a warning naming the offending SID that the
+/// Unix path structurally never prints (its predicate is one `stat`), and told to fix an ACL. Every
+/// sentence was true; not one of them was true THERE, and a refusal whose stated cause does not hold
+/// where it fired is one an operator learns to route around.
+///
+/// **Both texts are compiled in on every platform, and the active one is selected by `cfg!`** rather
+/// than by `#[cfg]` on two definitions. That is what makes the choice testable: a test can hold the
+/// INACTIVE text and assert it is absent from the rendered message, which is the only assertion that
+/// goes red if the arms are ever swapped. With `#[cfg]`-selected definitions the wrong text does not
+/// exist to compare against, so the test can only guess at phrases — and a guess that misses is a
+/// green test over a message written in the wrong platform's language.
+mod prose {
+    /// The two ways an object can fail the privilege predicate. The predicate answers ONE bool for
+    /// two questions — owner, and who may write — so the refusal must name both, or the operator
+    /// fixes the named one and is refused again for the other.
+    pub(super) const WINDOWS_NOT_RESTRICTED: &str =
+        "either it is not owned by one, or its DACL grants write-equivalent access to one that is \
+         not";
+    /// The Unix form of [`WINDOWS_NOT_RESTRICTED`] — the same two questions, of a uid and a mode.
+    pub(super) const UNIX_NOT_RESTRICTED: &str =
+        "either it is not root-owned, or its mode grants write access to its group or to other";
+
+    /// Why the BINARY is a separate object from its directory: on Windows the file's own DACL is
+    /// what governs writing it.
+    pub(super) const WINDOWS_BINARY_IS_ITS_OWN_OBJECT: &str =
+        "on Windows a file and its directory are independent securable objects, and the file's own \
+         DACL is what governs writing it";
+    /// The Unix form of [`WINDOWS_BINARY_IS_ITS_OWN_OBJECT`] — owner and mode, not a DACL.
+    pub(super) const UNIX_BINARY_IS_ITS_OWN_OBJECT: &str =
+        "on Unix a file carries its own owner and mode, and those — not the directory's — are what \
+         govern overwriting its contents in place";
+
+    /// How the operator finds WHICH principal was objected to: the Windows DACL walk warns first,
+    /// naming the SID ([`crate::secure`]).
+    pub(super) const WINDOWS_HOW_TO_SEE: &str = "any preceding warning names the offending SID";
+    /// The Unix form of [`WINDOWS_HOW_TO_SEE`]. Nothing is printed before the refusal there, so
+    /// pointing at a warning would send the operator hunting for output that never existed.
+    pub(super) const UNIX_HOW_TO_SEE: &str =
+        "the owning uid and the group/other write bits are what were read";
+
+    /// What the operator actually does about it — an ownership + ACE change on Windows.
+    pub(super) const WINDOWS_REMEDY: &str =
+        "Take privileged ownership AND remove every write grant to a non-privileged principal, on \
+         BOTH the install root and the binary in it";
+    /// The Unix form of [`WINDOWS_REMEDY`] — the same two requirements, as `chown` and `chmod`.
+    pub(super) const UNIX_REMEDY: &str =
+        "Make BOTH the install root and the binary in it root-owned with no group or other write \
+         bit (`chown root` then `chmod go-w`)";
+}
+
+/// See [`prose`] — the two ways an object can fail the privilege predicate, on THIS platform.
+const NOT_RESTRICTED_BECAUSE: &str = if cfg!(windows) {
+    prose::WINDOWS_NOT_RESTRICTED
+} else {
+    prose::UNIX_NOT_RESTRICTED
+};
+
+/// See [`prose`] — why the BINARY is a separate question from its directory, on THIS platform.
+const BINARY_IS_ITS_OWN_OBJECT: &str = if cfg!(windows) {
+    prose::WINDOWS_BINARY_IS_ITS_OWN_OBJECT
+} else {
+    prose::UNIX_BINARY_IS_ITS_OWN_OBJECT
+};
+
+/// See [`prose`] — how the operator sees which principal was objected to, on THIS platform.
+const HOW_TO_SEE_THE_PRINCIPAL: &str = if cfg!(windows) {
+    prose::WINDOWS_HOW_TO_SEE
+} else {
+    prose::UNIX_HOW_TO_SEE
+};
+
+/// See [`prose`] — what the operator types to fix it, on THIS platform.
+const REMEDY: &str = if cfg!(windows) {
+    prose::WINDOWS_REMEDY
+} else {
+    prose::UNIX_REMEDY
+};
+
 /// The one refusal message, parameterised by WHICH object failed and WHAT that lets an attacker do.
 ///
 /// Three near-identical strings would drift, and the operator needs the specific object named: the
 /// remedy for a directory ACE is not the remedy for a file ACE. `cause` completes "…: <cause> …" and
 /// `consequence` completes "…so <consequence> this SYSTEM/root daily task runs…", so each reads as
 /// one sentence rather than as a template.
+///
+/// The diagnosis and the remedy are platform-selected ([`BINARY_IS_ITS_OWN_OBJECT`],
+/// [`HOW_TO_SEE_THE_PRINCIPAL`], [`REMEDY`]): this guard runs on all three operating systems, so a
+/// message written only in Windows terms is wrong two thirds of the time it is read.
 fn refusal(object: &Path, cause: &str, consequence: &str) -> BrokerError {
     BrokerError::Io(format!(
-        "refusing to register a SYSTEM/root daily schedule for {}: {cause} (any preceding warning \
-         names the offending SID), so {consequence} this SYSTEM/root daily task runs, turning one \
-         elevation approval into a permanent elevated foothold. Take privileged ownership AND \
-         remove every write grant to a non-privileged principal, on BOTH the install root and the \
-         binary in it, or register only from an install root that already is both",
+        "refusing to register a SYSTEM/root daily schedule for {}: {cause} \
+         ({HOW_TO_SEE_THE_PRINCIPAL}), so {consequence} this SYSTEM/root daily task runs, turning \
+         one elevation approval into a permanent elevated foothold. {REMEDY}, or register only \
+         from an install root that already is both",
         object.display()
     ))
 }
@@ -1210,27 +1298,103 @@ mod tests {
             // The remedy has to name BOTH objects in every variant: the operator cannot tell from a
             // bool predicate which one is at fault, and fixing only the named one leaves the guard
             // refusing for the other reason on the next run.
-            for expected in ["take privileged ownership", "install root and the binary"] {
+            assert!(
+                err.to_lowercase().contains("install root and the binary"),
+                "{which}: the message must name both objects to fix: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_is_written_in_the_terms_of_the_platform_it_fired_on() {
+        // The message was written entirely in Windows terms and is printed on all three operating
+        // systems, so a Linux operator was told "on Windows a file and its directory are independent
+        // objects" about a `/tmp` path, pointed at a SID warning the Unix path never prints, and told
+        // to fix an ACL. See `prose` for why both texts are compiled in.
+        //
+        // Each pair asserts the ACTIVE text is present AND the INACTIVE one is absent. The second
+        // half is the load-bearing one: it is the only assertion that goes red if the two arms are
+        // ever swapped, and it compares against the REAL other-platform string rather than a phrase
+        // this test guessed at — a guess that misses reads exactly like a pass.
+        let exe = exe_with_parent();
+        let dir_refusal = refuse_unprivileged_exe_dir(&exe, |_object| false, |_dir| true)
+            .expect_err("a non-privileged directory must be refused")
+            .to_string();
+        let binary_refusal = refuse_unprivileged_exe_dir(
+            &exe,
+            |object| object == Path::new("/opt/dig/bin"),
+            |_| true,
+        )
+        .expect_err("a non-privileged binary must be refused")
+        .to_string();
+
+        let (this_platform, the_other): ([&str; 4], [&str; 4]) = if cfg!(windows) {
+            (
+                [
+                    prose::WINDOWS_NOT_RESTRICTED,
+                    prose::WINDOWS_BINARY_IS_ITS_OWN_OBJECT,
+                    prose::WINDOWS_HOW_TO_SEE,
+                    prose::WINDOWS_REMEDY,
+                ],
+                [
+                    prose::UNIX_NOT_RESTRICTED,
+                    prose::UNIX_BINARY_IS_ITS_OWN_OBJECT,
+                    prose::UNIX_HOW_TO_SEE,
+                    prose::UNIX_REMEDY,
+                ],
+            )
+        } else {
+            (
+                [
+                    prose::UNIX_NOT_RESTRICTED,
+                    prose::UNIX_BINARY_IS_ITS_OWN_OBJECT,
+                    prose::UNIX_HOW_TO_SEE,
+                    prose::UNIX_REMEDY,
+                ],
+                [
+                    prose::WINDOWS_NOT_RESTRICTED,
+                    prose::WINDOWS_BINARY_IS_ITS_OWN_OBJECT,
+                    prose::WINDOWS_HOW_TO_SEE,
+                    prose::WINDOWS_REMEDY,
+                ],
+            )
+        };
+
+        // Which refusal each half is expected to appear in: the two causes are per-variant, the
+        // diagnosis and remedy are shared by every variant.
+        let carriers = [
+            vec![dir_refusal.as_str()],
+            vec![binary_refusal.as_str()],
+            vec![dir_refusal.as_str(), binary_refusal.as_str()],
+            vec![dir_refusal.as_str(), binary_refusal.as_str()],
+        ];
+
+        for ((mine, theirs), messages) in this_platform.iter().zip(the_other).zip(carriers) {
+            for message in messages {
                 assert!(
-                    err.to_lowercase().contains(expected),
-                    "{which}: the message must name {expected:?} so the operator knows what to fix: \
-                     {err}"
+                    message.contains(mine),
+                    "the refusal must carry this platform's text {mine:?}: {message}"
+                );
+                assert!(
+                    !message.contains(theirs),
+                    "the refusal must not explain this platform in the other one's terms — \
+                     found {theirs:?}: {message}"
                 );
             }
         }
 
-        // And the directory variant keeps naming both of ITS causes, which are indistinguishable to
-        // the caller: an owner that is not privileged, or a DACL that grants one that is not.
-        let dir_refusal = refuse_unprivileged_exe_dir(&exe, |_object| false, |_dir| true)
-            .expect_err("a non-privileged directory must be refused")
-            .to_string()
-            .to_lowercase();
-        for expected in ["not owned by one", "dacl grants"] {
-            assert!(
-                dir_refusal.contains(expected),
-                "the directory refusal must name {expected:?}: {dir_refusal}"
-            );
-        }
+        // The inheritable-ACE variant is Windows-only vocabulary by nature and structurally
+        // unreachable on Unix — there `dir_creates_privileged_files_only` IS the directory
+        // predicate, so a run reaching the third leg has already passed the first — but it shares
+        // the builder, so its diagnosis and remedy must still be this platform's.
+        let inheritance_refusal = refuse_unprivileged_exe_dir(&exe, |_object| true, |_dir| false)
+            .expect_err("a root that hands away the files created in it must be refused")
+            .to_string();
+        assert!(
+            inheritance_refusal.contains(HOW_TO_SEE_THE_PRINCIPAL)
+                && inheritance_refusal.contains(REMEDY),
+            "every variant shares the diagnosis and remedy: {inheritance_refusal}"
+        );
     }
 
     #[test]
