@@ -203,7 +203,34 @@ fn denied_mask_for(entries: &[Ace], sid: &str) -> u32 {
 
 /// Whether a string SID names a principal expected to hold write access to a privileged root.
 fn is_privileged_sid(sid: &str) -> bool {
-    PRIVILEGED_SIDS.contains(&sid)
+    PRIVILEGED_SIDS.contains(&sid) || is_administrator_account(sid)
+}
+
+/// Whether `sid` is one of the domain-relative accounts/groups that are administrator-equivalent by
+/// definition — the built-in `Administrator`, or the `Domain`/`Schema`/`Enterprise Admins` groups.
+///
+/// These cannot go in [`PRIVILEGED_SIDS`] because their SID embeds the machine's or domain's own
+/// identifier (`S-1-5-21-<domain>-500`), so only the trailing RID is well known. Recognising them
+/// is not a courtesy: a stock elevated Windows host grants the built-in Administrator full control
+/// of the directories it creates, so treating RID 500 as an unprivileged writer reports a finding on
+/// an ordinary machine — and a false refusal here stops the host updating at all, which is the
+/// expensive direction (module docs).
+///
+/// The match is deliberately narrow. It requires the `S-1-5-21-` domain prefix AND a well-known
+/// administrative RID, so an ordinary local account (`…-1001`) — the account an attacker would
+/// actually control — is NOT covered by it.
+fn is_administrator_account(sid: &str) -> bool {
+    /// RID 500 `Administrator`, 512 `Domain Admins`, 518 `Schema Admins`, 519 `Enterprise Admins`.
+    const ADMINISTRATIVE_RIDS: &[&str] = &["500", "512", "518", "519"];
+
+    let Some(domain_and_rid) = sid.strip_prefix("S-1-5-21-") else {
+        return false;
+    };
+    let Some((domain, rid)) = domain_and_rid.rsplit_once('-') else {
+        return false;
+    };
+    // A bare `S-1-5-21-500` has no domain identifier and is not a real account SID.
+    !domain.is_empty() && ADMINISTRATIVE_RIDS.contains(&rid)
 }
 
 #[cfg(windows)]
@@ -479,6 +506,53 @@ mod tests {
                     sid: sid.to_string()
                 },
                 "{sid} must not hold write access to a privileged install root"
+            );
+        }
+    }
+
+    #[test]
+    fn the_built_in_administrator_account_may_hold_write_access() {
+        // Measured, not assumed: an elevated process on a stock Windows host creates directories
+        // whose DACL grants RID 500 full control, so flagging it refuses an ordinary machine. The
+        // SID below is the shape a real runner produced.
+        for sid in [
+            "S-1-5-21-1178926710-2200278958-3596451971-500",
+            // Domain Admins / Schema Admins / Enterprise Admins.
+            "S-1-5-21-1178926710-2200278958-3596451971-512",
+            "S-1-5-21-1178926710-2200278958-3596451971-518",
+            "S-1-5-21-1178926710-2200278958-3596451971-519",
+        ] {
+            assert_eq!(
+                judge(&Dacl::Present(vec![Ace::allow(sid, FULL)])),
+                DaclVerdict::PrivilegedWriteOnly,
+                "{sid} is administrator-equivalent"
+            );
+        }
+    }
+
+    #[test]
+    fn the_administrative_rid_match_does_not_spread_to_ordinary_accounts() {
+        // The guard rail on the rule above. Each of these ends in or contains an administrative
+        // RID's digits without BEING one, and every one of them must still be a finding —
+        // otherwise the RID check has become a way to launder an attacker-controlled account SID.
+        for sid in [
+            // An ordinary local account — the SID an attacker actually controls.
+            "S-1-5-21-1178926710-2200278958-3596451971-1001",
+            // RID 500's digits as a prefix of a larger RID.
+            "S-1-5-21-1178926710-2200278958-3596451971-5000",
+            // An administrative RID in the DOMAIN position rather than the RID position.
+            "S-1-5-21-500-2200278958-3596451971-1001",
+            // The right RID under the wrong authority (not a `S-1-5-21-` account SID).
+            "S-1-5-32-500",
+            // No domain identifier at all.
+            "S-1-5-21-500",
+        ] {
+            assert_eq!(
+                judge(&Dacl::Present(vec![Ace::allow(sid, FULL)])),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: sid.to_string()
+                },
+                "{sid} must not be mistaken for an administrative account"
             );
         }
     }
