@@ -178,10 +178,13 @@ fn refuse_unprivileged_exe_dir(
     })?;
     if !is_privileged(dir) {
         return Err(BrokerError::Io(format!(
-            "refusing to register a SYSTEM/root daily schedule for a binary in {}: that directory is \
-             is not restricted to privileged identities — either it is not owned by one, or its DACL grants \n             write-equivalent access to one that is not (any preceding warning names the offending \n             SID) — so a later writer of it could replace the binary \
-             this SYSTEM/root daily task runs — turning one elevation approval into a permanent \
-             elevated foothold; take privileged ownership of the directory AND remove any write grant to a non-privileged \n             principal, or register only from an install root that already is both",
+            "refusing to register a SYSTEM/root daily schedule for a binary in {}: that directory \
+             is not restricted to privileged identities — either it is not owned by one, or its \
+             DACL grants write-equivalent access to one that is not (any preceding warning names \
+             the offending SID). Either way a later writer of it could replace the binary this \
+             SYSTEM/root daily task runs, turning one elevation approval into a permanent elevated \
+             foothold. Take privileged ownership of the directory AND remove any write grant to a \
+             non-privileged principal, or register only from an install root that already is both",
             dir.display()
         )));
     }
@@ -1042,6 +1045,47 @@ mod tests {
     fn refuse_unprivileged_exe_dir_allows_a_privileged_owned_dir() {
         refuse_unprivileged_exe_dir(&exe_with_parent(), |_dir| true)
             .expect("a privileged-owned install root must be allowed");
+    }
+
+    #[test]
+    fn the_refusal_reads_as_prose_an_operator_can_act_on() {
+        // This is the one string a blocked administrator actually reads, and it is assembled from
+        // seven continued source lines — a shape that has now been mangled twice while the source
+        // still LOOKED right: once into "that directory is is not restricted" when an edit
+        // duplicated a word across the seam, and once into hard newlines followed by 13 spaces
+        // mid-sentence when a `\n` escape was written where a line-continuation belonged. Neither
+        // is visible to `cargo fmt`, and neither changes behaviour, so only an assertion on the
+        // RENDERED text catches them.
+        let err = refuse_unprivileged_exe_dir(&exe_with_parent(), |_dir| false)
+            .expect_err("a non-privileged directory must be refused")
+            .to_string();
+
+        assert!(
+            !err.contains("  "),
+            "the message must not carry a run of spaces from a broken line continuation: {err}"
+        );
+        assert!(
+            !err.contains('\n'),
+            "the message must be one flowing line, not hard-wrapped source: {err}"
+        );
+        for doubled in ["is is", "the the", "a a ", "of of"] {
+            assert!(
+                !err.contains(doubled),
+                "the message repeats {doubled:?} across a continuation seam: {err}"
+            );
+        }
+        // Both causes and both remedies, because the caller cannot tell them apart (the predicate
+        // is a bool) and acting on the wrong one changes nothing.
+        for expected in [
+            "not owned by one",
+            "dacl grants",
+            "take privileged ownership",
+        ] {
+            assert!(
+                err.to_lowercase().contains(expected),
+                "the message must name {expected:?} so the operator knows what to fix: {err}"
+            );
+        }
     }
 
     #[test]

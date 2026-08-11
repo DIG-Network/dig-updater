@@ -571,11 +571,16 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
   string equality alone MUST NOT be done — it refuses `Everyone:(DENY)` over an inherited grant,
   which is both the canonical hardening `icacls` produces and the published remediation for a
   directory inheriting `Authenticated Users:(M)` from the `C:\` root.
-- The widening MUST stop at `Everyone`. Subtracting a DENY whose trustee is not the granted
-  principal is sound only when that trustee is a SUPERSET of every principal the grant can reach,
-  since only then is the DENY guaranteed to be reached by every requester. `Everyone` is that
-  superset by definition; `Authenticated Users` (`S-1-5-11`) is NOT, because it excludes
-  `ANONYMOUS LOGON` and `Guest`, so honouring it would excuse a grant those principals still hold.
+- The widening MUST stop at `Everyone`, and MUST NOT be applied to a grant whose trustee is
+  `ANONYMOUS LOGON` (`S-1-5-7`). Subtracting a DENY whose trustee is not the granted principal is
+  sound only when that trustee is a SUPERSET of the granted one, since only then is the DENY
+  guaranteed to be reached by every requester. `Everyone` is a superset of every principal EXCEPT
+  `ANONYMOUS LOGON`: since Windows XP SP2 an anonymous token carries `S-1-5-7` WITHOUT `S-1-1-0`
+  unless `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\everyoneincludesanonymous` is set, and it
+  defaults to 0, while any local process may obtain such a token via `ImpersonateAnonymousToken`
+  without privilege. `Authenticated Users` (`S-1-5-11`) is not a superset either, because it
+  excludes `ANONYMOUS LOGON` and `Guest`, so honouring it would excuse a grant those principals
+  still hold.
 - An ACE the implementation cannot fully parse MUST be treated as GRANTING, never as inert. A
   conditional (callback) ALLOW carries a condition this check does not evaluate, and an object ALLOW
   places its object-type GUIDs between the mask and the trustee so the trustee cannot be read; for a
