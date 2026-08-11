@@ -533,8 +533,8 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
 - "Admin/SYSTEM-only" is a statement about who can WRITE the directory, not only about who OWNS it.
   On Windows the implementation MUST therefore check the directory's DACL in addition to its owner
   SID: an `Administrators`-owned directory can still carry an ACE granting write-equivalent access
-  (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`, `GENERIC_WRITE`,
-  `GENERIC_ALL`) to an unprivileged principal such as `Users`, and a NULL DACL grants every
+  (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`,
+  `GENERIC_WRITE`, `GENERIC_ALL`) to an unprivileged principal such as `Users`, and a NULL DACL grants every
   principal full control while enumerating as no entries at all. A DACL that could not be read is an
   absence of evidence and MUST NOT be reported as a clean one; it leaves the owner check standing
   alone rather than rejecting, because a false refusal here stops the host updating entirely.
@@ -546,6 +546,16 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
   exists to detect. Honouring an unreachable DENY would therefore let a principal who already holds
   full write make the directory report privileged-write-only. The canonical hardened shape (DENY
   first, which Windows itself canonicalizes to) MUST still be accepted.
+- An ACE the implementation cannot fully parse MUST be treated as GRANTING, never as inert. A
+  conditional (callback) ALLOW carries a condition this check does not evaluate, and an object ALLOW
+  places its object-type GUIDs between the mask and the trustee so the trustee cannot be read; for a
+  FILE object the kernel ignores that GUID and applies the mask regardless. Scoring either as
+  "grants nothing" is the same bypass as the unreachable DENY above and is reachable by the same
+  single `SetFileSecurityW` call: an attacker holding the `WRITE_DAC` contained in a flagged
+  `FILE_ALL_ACCESS` grant rewrites it into a conditional form and launders the verdict clean while
+  the directory stays writable. The resulting over-refusal on a condition that is genuinely false is
+  deliberate and carries no availability cost, because audit/alarm ACEs are unrepresentable in a
+  DACL and conditional/object ACEs do not occur on real install roots.
 
 The always-on driver kicks `schedule ensure` but NEVER touches the OS scheduler directly and NEVER
 decides opt-out — the beacon remains the sole authority over the schedule artifact and honors the

@@ -29,7 +29,13 @@
 //!   flagged. A DENY that FOLLOWS the grant is not subtracted, because Windows stops at the first
 //!   matching ACE and so never reaches it — honouring it would let one `SetFileSecurityW` call
 //!   silence this check while leaving the directory world-writable;
-//! - an `INHERIT_ONLY` ACE grants nothing on the object itself and is ignored.
+//! - an `INHERIT_ONLY` ACE grants nothing on the object itself and is ignored;
+//! - an ACE whose CONDITION cannot be evaluated, or whose TRUSTEE cannot be read, is assumed to
+//!   grant. This is the one place the leniency stops, and it stops there because the alternative
+//!   was measured: a conditional grant (`XA` with a trivially-true `Member_of{SID(WD)}`) and an
+//!   object grant (`OA`) each left a directory an unprivileged process could plant a binary in
+//!   while this module reported it clean — reachable, like the trailing-DENY bypass above, with a
+//!   single `SetFileSecurityW` call needing only `WRITE_DAC`.
 //!
 //! Distinguishing "read the DACL, found nothing bad" from "could not read the DACL" is the whole
 //! point of [`Dacl`] being returned inside an [`Option`]: a restrictive directory can enumerate as
@@ -40,14 +46,19 @@
 /// remove the binary a privileged schedule runs, or to re-ACL the directory so that one can.
 ///
 /// `WRITE_DAC`/`WRITE_OWNER` are included because either one lets its holder grant itself the
-/// rest; `DELETE` is included because deleting the install root's binary and recreating it is
-/// replacement by another name.
+/// rest. Both delete rights are included, and they are NOT the same right: `DELETE` removes the
+/// install root itself, while `FILE_DELETE_CHILD` removes the binary INSIDE it — bypassing that
+/// binary's own DACL. Either one is enough to make the daily privileged task fail, which is the
+/// stale-pin harm this hardening exists to prevent, and `FILE_DELETE_CHILD` combined with
+/// `FILE_ADD_FILE` is outright binary replacement.
 mod rights {
     /// `FILE_WRITE_DATA` / `FILE_ADD_FILE`.
     pub const WRITE_DATA: u32 = 0x0000_0002;
     /// `FILE_APPEND_DATA` / `FILE_ADD_SUBDIRECTORY`.
     pub const ADD_SUBDIRECTORY: u32 = 0x0000_0004;
-    /// `DELETE`.
+    /// `FILE_DELETE_CHILD` — delete a child of this directory REGARDLESS of the child's own DACL.
+    pub const DELETE_CHILD: u32 = 0x0000_0040;
+    /// `DELETE` — delete this object itself.
     pub const DELETE: u32 = 0x0001_0000;
     /// `WRITE_DAC` — re-ACL the object, i.e. grant yourself everything else.
     pub const WRITE_DAC: u32 = 0x0004_0000;
@@ -61,6 +72,7 @@ mod rights {
     /// Every write-equivalent bit, as one mask.
     pub const WRITE_EQUIVALENT: u32 = WRITE_DATA
         | ADD_SUBDIRECTORY
+        | DELETE_CHILD
         | DELETE
         | WRITE_DAC
         | WRITE_OWNER
@@ -70,6 +82,10 @@ mod rights {
 
 /// `INHERIT_ONLY_ACE` — the ACE applies to children only, never to the object carrying it.
 const INHERIT_ONLY_ACE: u8 = 0x08;
+
+/// Stands in for the trustee of an ACE whose SID could not be read — never a real SID, so it can
+/// never match [`PRIVILEGED_SIDS`] and can only ever produce a finding.
+const UNREADABLE_TRUSTEE: &str = "<object ACE: trustee unreadable>";
 
 /// The well-known string SIDs whose write access to a privileged install root is EXPECTED, so a
 /// grant to one of them is not a finding.
@@ -99,7 +115,8 @@ pub(crate) enum AceKind {
     Allow,
     /// `ACCESS_DENIED_ACE_TYPE`.
     Deny,
-    /// An audit/alarm/callback ACE — affects logging, never access.
+    /// An ACE that neither grants access nor takes any away — an audit/alarm entry, or a DENY the
+    /// parser cannot rely on (see [`read`] on conditional and object ACEs).
     Other,
 }
 
@@ -317,7 +334,10 @@ mod imp {
     unsafe fn entries(acl: *mut ACL) -> Option<Vec<Ace>> {
         use windows::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER};
         use windows::Win32::System::SystemServices::{
-            ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
+            ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+            ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+            ACCESS_DENIED_ACE_TYPE, ACCESS_DENIED_CALLBACK_ACE_TYPE,
+            ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_DENIED_OBJECT_ACE_TYPE,
         };
 
         // SAFETY: the caller guarantees `acl` is a valid ACL.
@@ -334,23 +354,53 @@ mod imp {
             // SAFETY: `GetAce` yielded a pointer to a well-formed ACE, whose header is its first
             // field for every ACE type.
             let header = unsafe { *raw.cast::<ACE_HEADER>() };
+            let inherit_only = header.AceFlags & super::INHERIT_ONLY_ACE != 0;
             let kind = match u32::from(header.AceType) {
-                ACCESS_ALLOWED_ACE_TYPE => AceKind::Allow,
+                // The CALLBACK variants lay out `{header, mask, SidStart}` exactly like their
+                // basic equivalents — the conditional expression trails the SID — so the code
+                // below reads them correctly. The condition itself is NOT evaluated, and the
+                // asymmetry in how that is handled is deliberate: a grant whose condition cannot
+                // be evaluated is assumed to APPLY (it is a finding), while a deny whose condition
+                // cannot be evaluated is assumed NOT to apply (it excuses nothing). Both halves
+                // refuse to take an unevaluable condition as evidence of safety, because Windows —
+                // which CAN evaluate it — may well grant, and a trivially-true condition such as
+                // `Member_of{SID(WD)}` always does.
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => AceKind::Allow,
                 ACCESS_DENIED_ACE_TYPE => AceKind::Deny,
+                ACCESS_DENIED_CALLBACK_ACE_TYPE => AceKind::Other,
+                // The OBJECT variants carry `Flags` and up to two GUIDs BETWEEN the mask and the
+                // trailing SID, so their trustee genuinely cannot be read at the basic layout's
+                // offset — reading it there would yield a SID from the wrong bytes, possibly
+                // resolving to a privileged principal and excusing the grant. An ALLOW whose
+                // trustee is unknown must therefore be a FINDING: on a file object the kernel
+                // ignores the object-type GUID and applies the mask in full, so this ACE really
+                // does grant, to a principal we cannot name. This is the same policy the
+                // unreadable-ACE arm above applies, for the same reason.
+                ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => {
+                    out.push(Ace {
+                        kind: AceKind::Allow,
+                        sid: super::UNREADABLE_TRUSTEE.to_string(),
+                        mask: u32::MAX,
+                        inherit_only,
+                    });
+                    continue;
+                }
+                // A DENY whose trustee is unreadable can be dropped rather than flagged: it grants
+                // nothing, and `judge` only ever subtracts a DENY from a trustee it matches by
+                // name, so an unnamed one could never have excused anything.
+                ACCESS_DENIED_OBJECT_ACE_TYPE | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE => {
+                    AceKind::Other
+                }
+                // What remains is audit/alarm, which lives in the SACL and cannot appear in a DACL
+                // at all — plus any type a future Windows adds. Both grant nothing here.
                 _ => AceKind::Other,
             };
-            // Only the two basic types are parsed past the header, and that restriction is load
-            // bearing rather than an optimization: the OBJECT and CALLBACK_OBJECT variants carry
-            // extra `Flags`/GUID fields BEFORE their trailing SID, so reading them at the basic
-            // layout's offset would yield a SID from the wrong bytes — which could resolve to a
-            // privileged principal and silently excuse a permissive grant. Every unparsed type is
-            // an audit/alarm/object ACE, none of which can produce a finding.
             if kind == AceKind::Other {
                 out.push(Ace {
                     kind,
                     sid: String::new(),
                     mask: 0,
-                    inherit_only: header.AceFlags & super::INHERIT_ONLY_ACE != 0,
+                    inherit_only,
                 });
                 continue;
             }
@@ -366,7 +416,7 @@ mod imp {
                 kind,
                 sid,
                 mask,
-                inherit_only: header.AceFlags & super::INHERIT_ONLY_ACE != 0,
+                inherit_only,
             });
         }
         Some(out)
@@ -751,32 +801,15 @@ mod tests {
             use std::os::windows::ffi::OsStrExt;
             use windows::core::PCWSTR;
             use windows::Win32::Foundation::{LocalFree, HLOCAL};
-            use windows::Win32::Security::Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-            };
-            use windows::Win32::Security::{
-                SetFileSecurityW, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-            };
+            use windows::Win32::Security::{SetFileSecurityW, DACL_SECURITY_INFORMATION};
 
-            let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
             let wide_path: Vec<u16> = path
                 .as_os_str()
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect();
 
-            let mut descriptor = PSECURITY_DESCRIPTOR::default();
-            // SAFETY: both inputs are NUL-terminated wide strings; the descriptor is LocalAlloc'd on
-            // success and freed below.
-            unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    PCWSTR(wide_sddl.as_ptr()),
-                    SDDL_REVISION_1,
-                    &mut descriptor,
-                    None,
-                )
-            }
-            .expect("SDDL must convert");
+            let descriptor = sddl_to_descriptor(sddl).expect("SDDL must convert");
             // SAFETY: `descriptor` is the valid descriptor just converted.
             unsafe {
                 SetFileSecurityW(
@@ -790,6 +823,33 @@ mod tests {
             unsafe {
                 let _ = LocalFree(Some(HLOCAL(descriptor.0)));
             }
+        }
+
+        /// Convert an SDDL string into a security descriptor, surfacing the conversion FAILURE as
+        /// an error rather than a panic — some shapes (an audit ACE inside a `D:` section) are
+        /// deliberately unrepresentable, and a test asserts exactly that.
+        fn sddl_to_descriptor(
+            sddl: &str,
+        ) -> windows::core::Result<windows::Win32::Security::PSECURITY_DESCRIPTOR> {
+            use windows::core::PCWSTR;
+            use windows::Win32::Security::Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            };
+            use windows::Win32::Security::PSECURITY_DESCRIPTOR;
+
+            let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            // SAFETY: the input is a NUL-terminated wide string; on success the descriptor is
+            // LocalAlloc'd and freed by the caller.
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(wide_sddl.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    None,
+                )
+            }?;
+            Ok(descriptor)
         }
 
         /// Whether an UNPRIVILEGED principal can actually create a file here — the ground truth the
@@ -885,6 +945,185 @@ mod tests {
                 judge(&read(&dir).expect("the descriptor is readable")),
                 DaclVerdict::UnprivilegedWrite { .. }
             ));
+        }
+
+        /// `BUILTIN\Users`, the trustee every exploit below grants to.
+        const USERS: &str = "S-1-5-32-545";
+        /// `Authenticated Users`.
+        const AUTHENTICATED_USERS: &str = "S-1-5-11";
+
+        /// Build a directory with `sddl` as its protected DACL, returning the temp root (which must
+        /// outlive the directory) and the directory itself.
+        fn dir_with_dacl(name: &str, sddl: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+            let root = tempfile::tempdir().expect("temp dir");
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).expect("create");
+            set_dacl(&dir, sddl);
+            (root, dir)
+        }
+
+        #[test]
+        fn a_conditional_grant_is_a_finding_because_its_condition_is_true() {
+            // `Member_of{SID(WD)}` holds for EVERY token — everyone is in `Everyone` — so the
+            // kernel really does hand `BUILTIN\Users` FILE_ALL_ACCESS here. Scoring a callback ACE
+            // as granting nothing let one `SetFileSecurityW` call (needing only WRITE_DAC, a bit
+            // inside the very FILE_ALL_ACCESS grant this module detects) silence the check while
+            // leaving the directory world-writable.
+            let (_root, dir) = dir_with_dacl(
+                "callback-allow",
+                "D:P(XA;;FA;;;BU;(Member_of{SID(WD)}))(A;;FA;;;SY)(A;;FA;;;BA)",
+            );
+
+            assert!(
+                a_file_can_be_planted(&dir),
+                "ground truth: Windows honours the conditional ACE and this directory IS writable"
+            );
+            assert_eq!(
+                judge(&read(&dir).expect("the DACL is readable")),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: USERS.to_string()
+                },
+            );
+        }
+
+        #[test]
+        fn a_conditional_grant_to_authenticated_users_is_a_finding() {
+            // The same bypass under a different trustee and a different (also always-true)
+            // condition, so the fix cannot be a special case for one SID.
+            let (_root, dir) = dir_with_dacl(
+                "callback-allow-au",
+                "D:P(XA;;FA;;;AU;(Member_of{SID(AU)}))(A;;FA;;;SY)(A;;FA;;;BA)",
+            );
+
+            assert!(
+                a_file_can_be_planted(&dir),
+                "ground truth: an authenticated token is in Authenticated Users, so this is writable"
+            );
+            assert_eq!(
+                judge(&read(&dir).expect("the DACL is readable")),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: AUTHENTICATED_USERS.to_string()
+                },
+            );
+        }
+
+        #[test]
+        fn the_attacker_rewrite_of_a_flagged_directory_stays_flagged() {
+            // The exploit in the shape an attacker actually reaches it: start from the classic
+            // misconfiguration this module already flags, then spend the WRITE_DAC that grant
+            // contains on ONE `SetFileSecurityW` rewriting it to a conditional form. The owner is
+            // untouched, so the owner leg keeps passing, and the directory stays writable.
+            let (_root, dir) = dir_with_dacl("attacker-rewrite", "D:P(A;;FA;;;BU)(A;;FA;;;SY)");
+            assert!(matches!(
+                judge(&read(&dir).expect("readable")),
+                DaclVerdict::UnprivilegedWrite { .. }
+            ));
+
+            set_dacl(
+                &dir,
+                "D:P(XA;;FA;;;WD;(Member_of{SID(BU)}))(A;;FA;;;SY)(A;;FA;;;BA)",
+            );
+            assert!(
+                a_file_can_be_planted(&dir),
+                "ground truth: the rewrite changed the verdict, not the writability"
+            );
+            assert!(
+                matches!(
+                    judge(&read(&dir).expect("readable")),
+                    DaclVerdict::UnprivilegedWrite { .. }
+                ),
+                "an attacker must not be able to launder a flagged directory into a clean verdict"
+            );
+        }
+
+        #[test]
+        fn a_grant_whose_condition_is_false_is_still_a_finding() {
+            // Deliberate, documented over-refusal. `@USER.ex` is an attribute no ordinary token
+            // carries, so this condition is FALSE and the directory is genuinely unwritable — yet
+            // it is reported as a finding, because the parser does not evaluate conditions and a
+            // condition assumed false is exactly how the bypass above worked. Erring toward a
+            // finding on an unevaluable grant is the safe direction; conditional ACEs do not occur
+            // on real install roots, so the availability cost is nil (see the control tests).
+            let (_root, dir) = dir_with_dacl(
+                "condition-false",
+                "D:P(XA;;FA;;;BU;(@USER.ex==1))(A;;FA;;;SY)(A;;FA;;;BA)",
+            );
+
+            assert!(
+                !a_file_can_be_planted(&dir),
+                "ground truth: an unsatisfiable condition really does withhold the grant"
+            );
+            assert_eq!(
+                judge(&read(&dir).expect("the DACL is readable")),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: USERS.to_string()
+                },
+                "an unevaluable condition must never be read as evidence of safety"
+            );
+        }
+
+        #[test]
+        fn an_object_grant_is_a_finding_even_though_its_trustee_is_unreadable() {
+            // For a FILE object the kernel ignores the object-type GUID and applies the mask, so
+            // this grants `BUILTIN\Users` full control. The parser cannot read the trustee — the
+            // GUIDs sit between the mask and the SID — which is precisely why the ACE must be a
+            // FINDING and not an excuse: an unreadable trustee could be anyone.
+            let (_root, dir) = dir_with_dacl(
+                "object-allow",
+                "D:P(OA;;FA;;bf967aba-0de6-11d0-a285-00aa003049e2;BU)(A;;FA;;;SY)(A;;FA;;;BA)",
+            );
+
+            assert!(
+                a_file_can_be_planted(&dir),
+                "ground truth: the object-type GUID is ignored on a file, so this IS writable"
+            );
+            assert!(
+                matches!(
+                    judge(&read(&dir).expect("the DACL is readable")),
+                    DaclVerdict::UnprivilegedWrite { .. }
+                ),
+                "an object ACE whose trustee cannot be read must never read as clean"
+            );
+        }
+
+        #[test]
+        fn file_delete_child_alone_is_a_finding_because_the_binary_can_be_removed() {
+            // `FILE_DELETE_CHILD` (0x40) is the right to delete a child bypassing the child's OWN
+            // DACL — distinct from `DELETE` (0x0001_0000), which deletes the directory itself.
+            // Alone it is a denial-of-update primitive: the beacon binary vanishes, the SYSTEM
+            // daily task fails, and the host silently stops receiving security updates.
+            let (_root, dir) = dir_with_dacl("delete-child", "D:P(A;;FA;;;BU)");
+            let binary = dir.join("dig-updater.exe");
+            std::fs::write(&binary, b"MZ").expect("seed the binary before locking the directory");
+            set_dacl(
+                &dir,
+                "D:P(A;;0x40;;;BU)(A;;0x1200a9;;;BU)(A;;FA;;;SY)(A;;FA;;;BA)",
+            );
+
+            assert!(
+                std::fs::remove_file(&binary).is_ok(),
+                "ground truth: FILE_DELETE_CHILD really does let the binary be deleted"
+            );
+            assert_eq!(
+                judge(&read(&dir).expect("the DACL is readable")),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: USERS.to_string()
+                },
+            );
+        }
+
+        #[test]
+        fn an_audit_ace_cannot_be_written_into_a_dacl() {
+            // The claim that makes tightening the unparsed-ACE arm free of availability cost:
+            // audit/alarm ACEs live in the SACL, so no DACL a caller could hand us contains one.
+            // Verified rather than assumed — SDDL refuses to place one in the `D:` section.
+            let root = tempfile::tempdir().expect("temp dir");
+            let dir = root.path().join("audit-in-dacl");
+            std::fs::create_dir(&dir).expect("create");
+            assert!(
+                sddl_to_descriptor("D:P(AU;;FA;;;BU)").is_err(),
+                "an audit ACE must be unrepresentable in a DACL"
+            );
         }
 
         #[test]
