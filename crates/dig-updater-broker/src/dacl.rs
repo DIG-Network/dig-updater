@@ -182,7 +182,24 @@ fn an_everyone_deny_is_reached_by(granted_sid: &str) -> bool {
 ///
 /// `CREATOR OWNER` and `OWNER RIGHTS` are here because the owner has already been proven privileged
 /// by the caller ([`crate::secure::path_is_privileged_owned`] checks the owner SID first); an ACE
-/// naming the owner therefore names a privileged identity by construction. Every other principal —
+/// naming the owner therefore names a privileged identity by construction.
+///
+/// **That justification holds for [`judge`] and NOT for [`judge_files_created_in`].** [`judge`] asks
+/// about an object that EXISTS and whose owner WAS checked; the file question asks about a file that
+/// does not exist yet, where `CREATOR OWNER` resolves to whoever creates it. Measured: a parent
+/// carrying `(A;OICIIO;FA;;;CO)` — which the real install root does, as `(A;OICIIOID;GA;;;CO)` —
+/// produced a child whose DACL read `S-1-5-21-…-1002 : 0x001F01FF`, the creating user with full
+/// control, while [`judge_files_created_in`] answered [`DaclVerdict::PrivilegedWriteOnly`].
+///
+/// The entry STAYS regardless, and removing it would be the wrong fix: it would refuse every stock
+/// `%ProgramFiles%` root, which is the availability failure this guard must not cause. The shape is
+/// benign wherever the creator is privileged — on a stock host the elevated admin token's default
+/// owner is `BUILTIN\Administrators`, and the daily task creates the binary as SYSTEM — and turns
+/// live only where the "Default owner for objects created by members of the Administrators group"
+/// policy is set to Object creator. The durable answer is to judge the binary that EXISTS after an
+/// update writes it, which the caller's second leg already does (dig_ecosystem#2740).
+///
+/// Every other principal —
 /// including `Users`, `Authenticated Users`, `Everyone`, `LOCAL SERVICE` and `NETWORK SERVICE` —
 /// is unprivileged for this purpose: none of them should be able to replace a binary that runs as
 /// SYSTEM.
@@ -374,6 +391,28 @@ pub(crate) fn judge(dacl: &Dacl) -> DaclVerdict {
 /// Only [`Ace::object_inherit`] ACEs are considered, and [`Ace::inherit_only`] is deliberately NOT
 /// consulted: whether an inheritable ACE also applies to the directory says nothing about whether a
 /// file inherits it.
+///
+/// # What this canNOT see — it is a NECESSARY condition, never a sufficient one
+///
+/// It predicts only the INHERITED portion of a future file's DACL. Two parts of that DACL do not
+/// come from inheritance at all, so no parent-only check can see them. Both measured:
+///
+/// 1. **`CREATOR OWNER` resolution** — see [`PRIVILEGED_SIDS`], where the allowlist entry and the
+///    reason it cannot be removed are stated. The principal it resolves to is unknown until the file
+///    is created.
+/// 2. **The creator's token DEFAULT DACL** — a parent with NO inheritable ACEs gives the child that
+///    default rather than nothing. On `D:P(A;;FA;;;WD)(A;CI;FA;;;BU)(A;;FA;;;SY)` the child read
+///    `S-1-5-21-…-1002:F, BA:F, SY:F` while this function answered
+///    [`DaclVerdict::PrivilegedWriteOnly`]. `icacls` does not default to `(OI)(CI)`, so
+///    `icacls <root> /inheritance:r /grant Administrators:F /grant SYSTEM:F` produces exactly that
+///    shape.
+///
+/// So a clean verdict here means "nothing INHERITED hands the file away", which is strictly weaker
+/// than "the file will be safe". The guard that consumes it
+/// ([`crate::secure::dir_creates_privileged_files_only`], via
+/// `scheduler::refuse_unprivileged_exe_dir`) also judges the binary that concretely EXISTS, and that
+/// leg is what covers the image the daily task runs today. Enforcement of the residue is
+/// dig_ecosystem#2740.
 pub(crate) fn judge_files_created_in(dacl: &Dacl) -> DaclVerdict {
     judge_grants(dacl, |ace| ace.object_inherit)
 }
