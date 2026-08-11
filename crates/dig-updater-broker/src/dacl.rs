@@ -91,6 +91,14 @@ mod rights {
 /// `INHERIT_ONLY_ACE` — the ACE applies to children only, never to the object carrying it.
 const INHERIT_ONLY_ACE: u8 = 0x08;
 
+/// `OBJECT_INHERIT_ACE` — the ACE is inherited by NON-container children, i.e. by the files created
+/// in this directory.
+///
+/// This flag is what [`judge_files_created_in`] reads, and it is independent of
+/// [`INHERIT_ONLY_ACE`]: an ACE carrying both applies to children ONLY, one carrying just this flag
+/// applies to the directory AND its files.
+const OBJECT_INHERIT_ACE: u8 = 0x01;
+
 /// Stands in for the trustee of an ACE whose SID could not be read — never a real SID, so it can
 /// never match [`PRIVILEGED_SIDS`] and can only ever produce a finding.
 const UNREADABLE_TRUSTEE: &str = "<object ACE: trustee unreadable>";
@@ -104,23 +112,62 @@ const UNREADABLE_TRUSTEE: &str = "<object ACE: trustee unreadable>";
 /// token, so a superset deny is reached by *every* requester and cannot subtract more than Windows
 /// itself would.
 ///
-/// `Everyone` is a superset of every principal EXCEPT [`ANONYMOUS_LOGON`] — NOT "by definition",
-/// and the difference is the whole reason this constant is paired with an exception. Writing the
-/// bound as a definition rather than a measured fact is exactly what let an anonymous-token bypass
-/// through review once already. `Authenticated Users` (`S-1-5-11`) is not a superset either — it
-/// excludes `ANONYMOUS LOGON` and `Guest` — so subtracting it would excuse a grant those principals
-/// still hold, which is a real false negative on the check this module exists to be.
+/// `Everyone` is NOT that superset "by definition", and the exception to it is not a single
+/// principal either. The sound question is asked of the TOKEN rather than of group nesting, and
+/// [`an_everyone_deny_is_reached_by`] is where it is asked. `Authenticated Users` (`S-1-5-11`) is
+/// not a superset on any reading — it excludes `ANONYMOUS LOGON` and `Guest` — so subtracting it
+/// would excuse a grant those principals still hold, which is a real false negative on the check
+/// this module exists to be.
 const EVERYONE: &str = "S-1-1-0";
 
-/// `ANONYMOUS LOGON` — the one principal [`EVERYONE`] does NOT contain, and therefore the one
-/// trustee an `Everyone` DENY may not be subtracted from.
-///
-/// Since Windows XP SP2 an anonymous token carries `S-1-5-7` WITHOUT `S-1-1-0`, unless
-/// `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\everyoneincludesanonymous` is set — and it defaults
-/// to 0. Any local process can obtain such a token with `ImpersonateAnonymousToken`, which requires
-/// no privilege, so honouring the deny against this trustee would report a genuinely writable
-/// directory as clean.
+/// `ANONYMOUS LOGON` — a token holding this can omit [`EVERYONE`].
 const ANONYMOUS_LOGON: &str = "S-1-5-7";
+
+/// `NETWORK` — carried by a null session, which is an anonymous token and so can omit [`EVERYONE`].
+const NETWORK: &str = "S-1-5-2";
+
+/// The SIDs a token can hold **without** also holding [`EVERYONE`], and therefore exactly the grants
+/// an `Everyone` DENY may NOT be subtracted from.
+///
+/// # The rule, stated as a question about tokens
+///
+/// *Does every token containing the granted SID necessarily also contain `S-1-1-0`?* That is a
+/// property of TOKENS, not of group nesting, and it is the only form of the rule that has held.
+/// Phrasing it as "`Everyone` contains every principal except …" has now been wrong twice: first as
+/// "by definition", which missed anonymous logons entirely, then as the single exception
+/// [`ANONYMOUS_LOGON`], which missed the other SID an anonymous token carries alongside it. Asking
+/// the token question exposes the whole hole at once instead of one SID at a time.
+///
+/// Since Windows XP SP2 an anonymous token omits `S-1-1-0` unless
+/// `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\everyoneincludesanonymous` is set, and it defaults to
+/// `0`. Such a token needs no privilege to obtain — locally via `ImpersonateAnonymousToken`, or
+/// remotely as a null session, which is why [`NETWORK`] is here too.
+///
+/// Every OTHER principal a DACL realistically grants write to implies an authenticated or local
+/// logon, and every such token carries `S-1-1-0`: `BUILTIN\Users`, `Authenticated Users`,
+/// `INTERACTIVE`, `BATCH`, `SERVICE`, `Guests`, app-container package SIDs, service SIDs,
+/// LOCAL/NETWORK SERVICE, SYSTEM, restricted and deny-only tokens, and ordinary account SIDs.
+///
+/// # Honest limit — this leg is defence in depth, not the only barrier
+///
+/// An anonymous token runs at **Untrusted** integrity, so the mandatory label denies it write to a
+/// default-Medium file BEFORE the DACL is consulted at all. Neither entry here is therefore
+/// demonstrably exploitable on a stock host, and that caveat applies equally to the `S-1-5-7` case
+/// this exception was first written for. They are listed because the algebra must not claim a
+/// subtraction Windows would not perform, and because a mandatory-integrity mitigation is not this
+/// module's to lean on.
+///
+/// **A new SID belongs here whenever a token can hold it without `S-1-1-0`** — that is the test to
+/// apply, not "does it look anonymous".
+const SIDS_A_TOKEN_CAN_HOLD_WITHOUT_EVERYONE: &[&str] = &[ANONYMOUS_LOGON, NETWORK];
+
+/// Whether a DENY to [`EVERYONE`] is guaranteed to be reached by every requester who could exercise
+/// a grant to `granted_sid`, and so may be subtracted from it.
+///
+/// See [`SIDS_A_TOKEN_CAN_HOLD_WITHOUT_EVERYONE`] for the rule this decides and its honest limits.
+fn an_everyone_deny_is_reached_by(granted_sid: &str) -> bool {
+    !SIDS_A_TOKEN_CAN_HOLD_WITHOUT_EVERYONE.contains(&granted_sid)
+}
 
 /// The well-known string SIDs whose write access to a privileged install root is EXPECTED, so a
 /// grant to one of them is not a finding.
@@ -155,18 +202,76 @@ pub(crate) enum AceKind {
     Other,
 }
 
+/// Who an ACE names — a SID the parser could read, or nobody it can name.
+///
+/// # Why this is a type and not an `Option<String>` or a sentinel string
+///
+/// [`read`] deliberately mints ALLOW entries for ACEs it cannot decode: an object ACE hides its
+/// trustee behind object-type GUIDs, and a `GetAce` failure yields no trustee at all. Those entries
+/// are grants of every right to a principal that cannot be named — and the principal they hide
+/// **could be [`ANONYMOUS_LOGON`]**.
+///
+/// While the trustee was a plain `String` carrying a sentinel, every SID-equality rule silently
+/// applied to it, including the [`EVERYONE`]-deny carve-out that must NOT: `sid != ANONYMOUS_LOGON`
+/// is TRUE of a sentinel, so an `Everyone` DENY was subtracted from an unnameable grant. That
+/// bypass was survivable at the time only by coincidence — Windows stores a deny mask
+/// generic-mapped, so `GENERIC_ALL|GENERIC_WRITE` outlived subtracting `u32::MAX` — i.e. by two
+/// undocumented details in unrelated code, with no test watching either.
+///
+/// Making the distinction a TYPE removes the class instead of the instance: a rule about SIDs cannot
+/// be written against a trustee that has none, so the carve-out is unexpressible here rather than
+/// merely excluded by a comparison that the next mask change would quietly undo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Trustee {
+    /// A trustee the parser read, as a string SID (`S-1-5-32-544`) — a string so the whole allowlist
+    /// is pure and testable off-Windows.
+    Sid(String),
+    /// An ACE whose trustee could not be read. It names SOME principal; which one is unknown, so no
+    /// SID-based rule — privileged-allowlist or deny-subtraction — may be applied to it.
+    Unreadable,
+}
+
+impl Trustee {
+    /// The SID this trustee names, or `None` when it cannot be named.
+    ///
+    /// Callers that reach for this are asking a SID question; `None` is the answer that keeps them
+    /// from accidentally treating "unknown principal" as "some particular principal".
+    fn sid(&self) -> Option<&str> {
+        match self {
+            Self::Sid(sid) => Some(sid),
+            Self::Unreadable => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Trustee {
+    /// Renders into the refusal message an operator reads, so an unnameable trustee must SAY it is
+    /// unnameable rather than print as an empty string.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sid(sid) => f.write_str(sid),
+            Self::Unreadable => f.write_str(UNREADABLE_TRUSTEE),
+        }
+    }
+}
+
 /// One access-control entry, reduced to the four things the decision depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Ace {
     /// Allow, deny, or neither.
     pub kind: AceKind,
-    /// The trustee, as a string SID (`S-1-5-32-544`) — a string so the whole allowlist is pure and
-    /// testable off-Windows.
-    pub sid: String,
+    /// Who the entry names.
+    pub trustee: Trustee,
     /// The access mask.
     pub mask: u32,
     /// `INHERIT_ONLY_ACE` — grants nothing on the object itself.
     pub inherit_only: bool,
+    /// `OBJECT_INHERIT_ACE` — every FILE created in this directory inherits this ACE.
+    ///
+    /// Independent of [`Ace::inherit_only`]: an ACE may apply to the object and its children, to
+    /// children only, or to the object only. [`judge`] answers for the object;
+    /// [`judge_files_created_in`] answers for the files, and reads this field.
+    pub object_inherit: bool,
 }
 
 impl Ace {
@@ -176,9 +281,22 @@ impl Ace {
     pub fn allow(sid: &str, mask: u32) -> Self {
         Self {
             kind: AceKind::Allow,
-            sid: sid.to_string(),
+            trustee: Trustee::Sid(sid.to_string()),
             mask,
             inherit_only: false,
+            object_inherit: false,
+        }
+    }
+
+    /// An `ACCESS_ALLOWED` ACE that applies to the FILES created in this directory and NOT to the
+    /// directory itself — the `(OI)(IO)` shape, which [`judge`] must ignore and
+    /// [`judge_files_created_in`] must not.
+    #[cfg(test)]
+    pub fn allow_files_only(sid: &str, mask: u32) -> Self {
+        Self {
+            inherit_only: true,
+            object_inherit: true,
+            ..Self::allow(sid, mask)
         }
     }
 
@@ -223,6 +341,36 @@ pub(crate) enum DaclVerdict {
 /// is the lenient direction, and lenient is the direction this check must err in — see the module
 /// docs on failure direction.
 pub(crate) fn judge(dacl: &Dacl) -> DaclVerdict {
+    judge_grants(dacl, |ace| !ace.inherit_only)
+}
+
+/// Judge the DACL a directory will hand to the FILES created in it: does any non-privileged
+/// principal inherit write-equivalent access to them?
+///
+/// This is a DIFFERENT question from [`judge`], and asking only [`judge`] left a real hole
+/// (dig_ecosystem#2571). A root carrying `(A;OICIIO;FA;;;BU)` grants `Users` nothing on the
+/// directory itself, so [`judge`] correctly answers [`DaclVerdict::PrivilegedWriteOnly`] — and every
+/// file created there still carries an explicit `Users:F`. Measured, not reasoned: on
+/// `D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;FA;;;BU)`, `std::fs::copy` (`CopyFileEx`) produced a
+/// child reading `BUILTIN\Users:(I)(F)`. `CopyFileEx` does NOT carry the source's descriptor across,
+/// so the destination directory's inheritable ACEs govern — there is no clean first hop.
+///
+/// That matters because the binary a SYSTEM daily task runs is created by exactly that copy, and
+/// [`crate::secure::harden_state_dir`] is never applied to the install root.
+///
+/// Only [`Ace::object_inherit`] ACEs are considered, and [`Ace::inherit_only`] is deliberately NOT
+/// consulted: whether an inheritable ACE also applies to the directory says nothing about whether a
+/// file inherits it.
+pub(crate) fn judge_files_created_in(dacl: &Dacl) -> DaclVerdict {
+    judge_grants(dacl, |ace| ace.object_inherit)
+}
+
+/// [`judge`] and [`judge_files_created_in`] over one walk, differing only in WHICH ACEs apply to the
+/// object being judged (`applies`).
+///
+/// The deny arithmetic is shared on purpose: it is the part an adversarial review has already walked
+/// end to end, and a second copy of it would be the drift bug this crate exists to prevent.
+fn judge_grants(dacl: &Dacl, applies: impl Fn(&Ace) -> bool) -> DaclVerdict {
     let entries = match dacl {
         // A NULL DACL is world-writable. We DID read the descriptor, so this is a real finding and
         // not an unreadable one.
@@ -235,15 +383,15 @@ pub(crate) fn judge(dacl: &Dacl) -> DaclVerdict {
     };
 
     for (index, ace) in entries.iter().enumerate() {
-        if ace.kind != AceKind::Allow || ace.inherit_only || is_privileged_sid(&ace.sid) {
+        if ace.kind != AceKind::Allow || !applies(ace) || is_privileged_trustee(&ace.trustee) {
             continue;
         }
         // Only the ACEs Windows would have evaluated BEFORE this grant can take anything away from
         // it — see `denied_mask_for`.
-        let denied = denied_mask_for(&entries[..index], &ace.sid);
+        let denied = denied_mask_for(&entries[..index], &ace.trustee, &applies);
         if ace.mask & rights::WRITE_EQUIVALENT & !denied != 0 {
             return DaclVerdict::UnprivilegedWrite {
-                sid: ace.sid.clone(),
+                sid: ace.trustee.to_string(),
             };
         }
     }
@@ -265,24 +413,42 @@ pub(crate) fn judge(dacl: &Dacl) -> DaclVerdict {
 /// A DENY counts when its trustee is the granted principal itself OR [`EVERYONE`], because Windows
 /// applies a DENY to any group in the requester's token — matching on the granted SID alone missed
 /// the commonest hardening there is (deny `Everyone` over an inherited grant) and REFUSED a
-/// directory that was genuinely unwritable. The widening stops at [`EVERYONE`], and carves
-/// [`ANONYMOUS_LOGON`] back out of it: an anonymous token holds `S-1-5-7` without `S-1-1-0`, so
-/// Windows never reaches the deny for that trustee. See those constants for why a superset is the
-/// only sound generalization and why `Authenticated Users` is not one.
-fn denied_mask_for(preceding: &[Ace], sid: &str) -> u32 {
+/// directory that was genuinely unwritable. The widening stops at [`EVERYONE`], and applies only
+/// where an `Everyone` DENY is actually REACHED — [`an_everyone_deny_is_reached_by`] decides that
+/// from the granted SID, because a token can hold some SIDs without holding `S-1-1-0` at all. See
+/// that predicate for the rule, and [`EVERYONE`] for why `Authenticated Users` is not a sound
+/// generalization.
+/// A DENY only counts against the object actually being judged, which is why `applies` is the SAME
+/// predicate the grant walk uses: a deny that applies to the directory but is not inherited by files
+/// takes nothing away from a file, and vice versa. Handing the two walks different deny sets would
+/// let a directory-only deny excuse an inherited grant.
+fn denied_mask_for(preceding: &[Ace], granted: &Trustee, applies: &impl Fn(&Ace) -> bool) -> u32 {
+    // An unnameable grant has NOTHING subtracted from it: no deny can be matched to a trustee that
+    // cannot be named, and an `Everyone` deny cannot be shown to reach it either, because the
+    // principal it hides may be one that holds no `S-1-1-0`. This is the arm the `Trustee` type
+    // exists to make reachable-by-construction rather than by remembering to exclude a sentinel.
+    let Some(sid) = granted.sid() else {
+        return 0;
+    };
     preceding
         .iter()
         .filter(|ace| {
             ace.kind == AceKind::Deny
-                && !ace.inherit_only
-                && (ace.sid == sid || (ace.sid == EVERYONE && sid != ANONYMOUS_LOGON))
+                && applies(ace)
+                && ace.trustee.sid().is_some_and(|denied| {
+                    denied == sid || (denied == EVERYONE && an_everyone_deny_is_reached_by(sid))
+                })
         })
         .fold(0, |acc, ace| acc | ace.mask)
 }
 
 /// Whether a string SID names a principal expected to hold write access to a privileged root.
-fn is_privileged_sid(sid: &str) -> bool {
-    PRIVILEGED_SIDS.contains(&sid) || is_administrator_account(sid)
+fn is_privileged_trustee(trustee: &Trustee) -> bool {
+    // An unnameable trustee is never privileged: the allowlist is a set of SIDs, and "we could not
+    // read who this is" is not a member of it. Answering `false` keeps such an ACE a finding.
+    trustee
+        .sid()
+        .is_some_and(|sid| PRIVILEGED_SIDS.contains(&sid) || is_administrator_account(sid))
 }
 
 /// Whether `sid` is one of the domain-relative accounts/groups that are administrator-equivalent by
@@ -321,7 +487,7 @@ pub(crate) use imp::read;
 /// Reading the real owner and DACL off a path — the one impure, Windows-only part of this module.
 #[cfg(windows)]
 mod imp {
-    use super::{Ace, AceKind, Dacl};
+    use super::{Ace, AceKind, Dacl, Trustee};
     use std::path::Path;
     use windows::Win32::Security::ACL;
 
@@ -452,6 +618,7 @@ mod imp {
             // field for every ACE type.
             let header = unsafe { *raw.cast::<ACE_HEADER>() };
             let inherit_only = header.AceFlags & super::INHERIT_ONLY_ACE != 0;
+            let object_inherit = header.AceFlags & super::OBJECT_INHERIT_ACE != 0;
             let kind = match u32::from(header.AceType) {
                 // The CALLBACK variants lay out `{header, mask, SidStart}` exactly like their
                 // basic equivalents — the conditional expression trails the SID — so the code
@@ -495,9 +662,10 @@ mod imp {
             if kind == AceKind::Other {
                 out.push(Ace {
                     kind,
-                    sid: String::new(),
+                    trustee: Trustee::Unreadable,
                     mask: 0,
                     inherit_only,
+                    object_inherit,
                 });
                 continue;
             }
@@ -520,9 +688,10 @@ mod imp {
             };
             out.push(Ace {
                 kind,
-                sid,
+                trustee: Trustee::Sid(sid),
                 mask,
                 inherit_only,
+                object_inherit,
             });
         }
         out
@@ -533,12 +702,19 @@ mod imp {
     ///
     /// [`super::UNREADABLE_TRUSTEE`] is not a real SID, so it never matches
     /// [`super::PRIVILEGED_SIDS`] and can only ever produce a finding.
+    /// `object_inherit` is forced TRUE rather than read from the flags, because it is not always
+    /// readable here (the `GetAce` failure site has no header at all) and because the fail-closed
+    /// answer differs per question: an undecodable ACE must be a finding for the object AND for the
+    /// files created under it. `inherit_only` stays as read — it can only ever make the object
+    /// verdict MORE lenient, and forcing it would flip an ACE that grants nothing on the object into
+    /// a finding against it.
     fn unreadable_grant(inherit_only: bool) -> Ace {
         Ace {
             kind: AceKind::Allow,
-            sid: super::UNREADABLE_TRUSTEE.to_string(),
+            trustee: Trustee::Unreadable,
             mask: u32::MAX,
             inherit_only,
+            object_inherit: true,
         }
     }
 

@@ -213,25 +213,74 @@ pub fn path_is_privileged_owned(path: &Path) -> bool {
 /// and `lock.rs`'s named-mutex DACL), and it lives entirely behind [`crate::dacl`].
 #[cfg(windows)]
 fn windows_path_is_privileged(path: &Path) -> bool {
-    use crate::dacl::{judge, DaclVerdict};
-
-    // The path can originate outside this process, so it is neutralized before it reaches a
-    // terminal — the same discipline every other diagnostic in this crate follows.
-    let shown = crate::display::without_control_chars(&path.display().to_string());
-
     let Some(snapshot) = crate::dacl::read_snapshot(path) else {
         return false;
     };
     if !snapshot.owner_is_privileged {
         return false;
     }
-    match judge(&snapshot.dacl) {
+    windows_dacl_withholds_write(
+        path,
+        crate::dacl::judge(&snapshot.dacl),
+        "is privileged-owned but its DACL grants write-equivalent access to",
+    )
+}
+
+/// Whether every FILE created in `dir` will withhold write-equivalent access from non-privileged
+/// principals — the inheritance question, which is NOT answered by
+/// [`path_is_privileged_owned(dir)`](path_is_privileged_owned).
+///
+/// A directory can grant nothing on itself while handing every file created in it an explicit
+/// `Users:F` through an `(OI)(IO)` ACE (dig_ecosystem#2571, measured — see
+/// [`crate::dacl::judge_files_created_in`]). That is the shape that matters for an install root,
+/// because the binary a SYSTEM daily task runs is CREATED there by `std::fs::copy` on every update,
+/// long after any install-time check has passed.
+///
+/// - **Windows:** the inheritable ACEs are judged with [`crate::dacl::judge_files_created_in`]. An
+///   unreadable descriptor answers `false` — nothing has been proven, so the caller refuses.
+/// - **Unix:** the same answer as [`path_is_privileged_owned`], and deliberately not a second
+///   computation: there is no ACL inheritance, so who may create or replace an entry in a directory
+///   is governed by that directory's own write bits, which that function already checks.
+#[must_use]
+pub fn dir_creates_privileged_files_only(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let Some(snapshot) = crate::dacl::read_snapshot(dir) else {
+            return false;
+        };
+        windows_dacl_withholds_write(
+            dir,
+            crate::dacl::judge_files_created_in(&snapshot.dacl),
+            "is privileged-owned but its DACL grants every file created in it write-equivalent access to",
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        path_is_privileged_owned(dir)
+    }
+}
+
+/// A [`crate::dacl::DaclVerdict`] rendered as a boolean, warning on the way through so the operator
+/// learns WHICH principal caused a refusal.
+///
+/// `grants` completes the sentence "`<path>` …", so it names the question that failed rather than
+/// leaving two different checks to produce one indistinguishable warning.
+#[cfg(windows)]
+fn windows_dacl_withholds_write(
+    path: &Path,
+    verdict: crate::dacl::DaclVerdict,
+    grants: &str,
+) -> bool {
+    use crate::dacl::DaclVerdict;
+    match verdict {
         DaclVerdict::PrivilegedWriteOnly => true,
         DaclVerdict::UnprivilegedWrite { sid } => {
+            // The path can originate outside this process, so it is neutralized before it reaches a
+            // terminal — the same discipline every other diagnostic in this crate follows.
+            let shown = crate::display::without_control_chars(&path.display().to_string());
             eprintln!(
-                "dig-updater: warning: {shown} is privileged-owned but its DACL grants \
-                 write-equivalent access to {sid}, which could replace what a privileged consumer \
-                 later runs"
+                "dig-updater: warning: {shown} {grants} {sid}, which could replace what a \
+                 privileged consumer later runs"
             );
             false
         }
