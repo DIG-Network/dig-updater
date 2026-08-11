@@ -44,7 +44,7 @@ members = [
 # The RELEASE version of the beacon. The nightly-release orchestrator + version-increment CI read
 # this `[workspace.package].version` from the ROOT manifest (§3.6 / SPEC §14); the members inherit
 # it via `version.workspace = true`, so a release fires off this single value.
-version = "0.32.1"
+version = "0.34.0"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/DIG-Network/dig-updater"
@@ -88,6 +88,10 @@ features = [
     # mutex to Administrators + Local System (src/lock.rs) the same way `secure.rs` icacls-DACLs
     # the state/staging/last-known-good directories.
     "Win32_Security_Authorization",
+    # `ACCESS_ALLOWED_ACE_TYPE` / `ACCESS_DENIED_ACE_TYPE`. The ACE *structs* live under
+    # `Win32_Security`, but the numeric ACE-type discriminants they are matched against are
+    # generated into `Win32_System_SystemServices` — so classifying an ACE needs both (src/dacl.rs).
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",

@@ -530,6 +530,93 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
 - The sentinel MUST live in the Admin/SYSTEM-only state dir (never the dry-check-relocatable one) so
   a non-privileged process cannot FORGE it to suppress auto-updates — an update-suppression /
   stale-pin vector. Its mere presence is the entire signal; its contents carry no trust.
+- The sentinel is subject to the SAME two-part privileged-path test as the install root below: it is
+  honored only when it is privileged-OWNED *and* its DACL withholds write-equivalent access from
+  every non-privileged principal. Ownership remains the un-forgeability anchor — a hardened-looking
+  DACL is not one, since a planted file's creator-owner keeps `WRITE_DAC` — but a marker an
+  unprivileged principal could REWRITE is no more trustworthy than one it could plant, so both legs
+  MUST pass. Failing either re-arms the schedule (fail-OPEN toward availability), and the beacon's
+  own `set_opted_out` hardens the marker to privileged SIDs only, so a marker it wrote passes both.
+- Registration MUST verify THREE objects, and MUST refuse unless all three pass. Checking the install
+  root alone is insufficient and MUST NOT be relied on: on Windows a directory and a file within it
+  are independent securable objects, and a file's own DACL governs writing that file, so a root
+  restricted to `Administrators` and `SYSTEM` may still contain a binary an unprivileged principal can
+  overwrite in place (measured: such a binary, granting `Users:F`, was overwritten by an unelevated
+  non-administrator process; `SeChangeNotifyPrivilege` is granted to `Everyone` by default, so
+  traverse is not a barrier). The three are:
+  1. the install root — a writer of the directory can replace the binary by renaming;
+  2. the BINARY itself — a writer of the file replaces the image in place;
+  3. the files the install root CREATES — an inheritable ACE (`OBJECT_INHERIT_ACE`, including
+     `INHERIT_ONLY`) grants nothing on the directory yet is carried by every file created there. This
+     leg is required because the binary is re-created by a copy on each update, after registration:
+     measured, `CopyFileEx` does NOT propagate the source's security descriptor, so the destination
+     directory's inheritable ACEs govern the new file and there is no clean first hop.
+  The refusal MUST name WHICH object failed, since the remedy for a directory ACE differs from the
+  remedy for a file ACE.
+- "Admin/SYSTEM-only" is a statement about who can WRITE the directory, not only about who OWNS it.
+  On Windows the implementation MUST therefore check the directory's DACL in addition to its owner
+  SID: an `Administrators`-owned directory can still carry an ACE granting write-equivalent access
+  (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`,
+  `GENERIC_WRITE`, `GENERIC_ALL`) to an unprivileged principal such as `Users`, and a NULL DACL grants every
+  principal full control while enumerating as no entries at all. A security descriptor that could
+  not be read is an absence of evidence and MUST NOT be reported as a clean one; nothing has been
+  proven privileged, so the path is not honored — the same answer the owner check alone already
+  gave, since `READ_CONTROL` governs the owner and the DACL alike.
+- The owner SID and the DACL MUST be read from ONE security-descriptor snapshot. A security
+  descriptor is mutable, so two reads describe two moments: an attacker holding `WRITE_DAC` could
+  let an owner-only read succeed and then make the descriptor unreadable before a separate DACL
+  read, collecting whatever leniency the unreadable case carries. One read admits no such window.
+- An individual ACE the implementation cannot READ or DECODE MUST NOT abort the walk. It MUST be
+  recorded as a grant of every right to a trustee that is never privileged, so it can only produce a
+  finding, and the walk MUST continue. Aborting would report "no descriptor" — an absence of
+  evidence, which is not a refusal — for an entry read AFTER the owner has already been accepted,
+  where nothing upstream refuses on its behalf. This is the same policy the unparsable-ACE rule
+  below states, for the same reason.
+- The DACL MUST be evaluated **in ACE order**, as Windows evaluates it. A DENY ACE reduces a
+  principal's effective mask ONLY where Windows would reach it — that is, only when it PRECEDES the
+  ALLOW under judgement. A DENY that FOLLOWS the grant MUST NOT be subtracted: Windows stops at the
+  first matching ACE, `SetFileSecurityW` stores a non-canonical order verbatim, and writing such an
+  order requires only `WRITE_DAC` — a right contained in the very `FILE_ALL_ACCESS` grant this check
+  exists to detect. Honouring an unreachable DENY would therefore let a principal who already holds
+  full write make the directory report privileged-write-only. The canonical hardened shape (DENY
+  first, which Windows itself canonicalizes to) MUST still be accepted.
+- A DENY ACE reduces a principal's effective mask whether its trustee is that principal ITSELF or
+  `Everyone` (`S-1-1-0`), because Windows applies a DENY to any group present in the requester's
+  token. Both bounds above still apply unchanged: such a DENY counts only where it PRECEDES the
+  grant, and only for the bits it actually denies. Matching the deny's trustee to the grant's by
+  string equality alone MUST NOT be done — it refuses `Everyone:(DENY)` over an inherited grant,
+  which is both the canonical hardening `icacls` produces and the published remediation for a
+  directory inheriting `Authenticated Users:(M)` from the `C:\` root.
+- The widening MUST stop at `Everyone`, and MUST NOT be applied to a grant whose trustee is
+  `ANONYMOUS LOGON` (`S-1-5-7`). The sound test is asked of the TOKEN, not of group nesting: a DENY
+  whose trustee is not the granted principal may be subtracted only when every token that could hold
+  the granted SID necessarily also holds the denied one. Since Windows XP SP2 an anonymous token
+  carries `S-1-5-7` WITHOUT `S-1-1-0` unless
+  `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\everyoneincludesanonymous` is set, and it defaults to 0,
+  while any local process may obtain such a token via `ImpersonateAnonymousToken` without privilege.
+  `Authenticated Users` (`S-1-5-11`) fails the same test, because it excludes `ANONYMOUS LOGON` and
+  `Guest`. A new exception MUST be justified by a MEASURED token, never by a plausible one: `NETWORK`
+  (`S-1-5-2`) was proposed and refuted, the anonymous token having `GroupCount = 1`.
+  - This requirement bounds what the DACL algebra may CLAIM; it is not a statement that such a grant
+    is exploitable. Measured, an anonymous token opening a file whose DACL grants it `FILE_ALL_ACCESS`
+    receives `0x001200A9` — read and execute — because it runs at Untrusted integrity and the
+    mandatory label check precedes the DACL, removing every write-class right including `WRITE_OWNER`
+    and `WRITE_DAC`. The requirement stands because a mandatory label is not part of a DACL and
+    because that defence lapses if the object's label drops or `everyoneincludesanonymous` becomes 1.
+- A DENY MUST NOT be subtracted from a grant whose trustee could not be READ, since no trustee-match
+  can be established and an `Everyone` DENY cannot be shown to reach an unknown principal. An
+  implementation SHOULD make this unexpressible in its types rather than rely on comparing against a
+  sentinel value.
+- An ACE the implementation cannot fully parse MUST be treated as GRANTING, never as inert. A
+  conditional (callback) ALLOW carries a condition this check does not evaluate, and an object ALLOW
+  places its object-type GUIDs between the mask and the trustee so the trustee cannot be read; for a
+  FILE object the kernel ignores that GUID and applies the mask regardless. Scoring either as
+  "grants nothing" is the same bypass as the unreachable DENY above and is reachable by the same
+  single `SetFileSecurityW` call: an attacker holding the `WRITE_DAC` contained in a flagged
+  `FILE_ALL_ACCESS` grant rewrites it into a conditional form and launders the verdict clean while
+  the directory stays writable. The resulting over-refusal on a condition that is genuinely false is
+  deliberate and carries no availability cost, because audit/alarm ACEs are unrepresentable in a
+  DACL and conditional/object ACEs do not occur on real install roots.
 
 The always-on driver kicks `schedule ensure` but NEVER touches the OS scheduler directly and NEVER
 decides opt-out — the beacon remains the sole authority over the schedule artifact and honors the

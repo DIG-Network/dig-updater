@@ -9,8 +9,11 @@
 //! (Windows) / root, mode `0700` (Unix), and — before a pass installs anything — [`acl_self_check`]
 //! VERIFIES it, repairing a directory the broker owns or ABORTING fail-closed otherwise.
 //!
-//! This module contains NO `unsafe` — Unix uses the safe `PermissionsExt`; Windows shells out to
-//! the built-in `icacls`.
+//! Applying permissions needs NO `unsafe` — Unix uses the safe `PermissionsExt`; Windows shells
+//! out to the built-in `icacls`. READING them back does: owner and DACL come from ONE
+//! `GetNamedSecurityInfoW` call plus `GetAce` ([`crate::dacl::read_snapshot`], reached here via
+//! [`windows_path_is_privileged`]), neither of which has a safe wrapper. They are read TOGETHER
+//! because a security descriptor is mutable, so two reads can describe two different states.
 
 use std::path::{Path, PathBuf};
 
@@ -147,12 +150,23 @@ pub fn claim_privileged_ownership(path: &Path) -> Result<(), BrokerError> {
 /// check the opt-out sentinel ([`crate::optout`]) gates on.
 ///
 /// A non-existent path, or ANY inability to determine ownership, answers `false` — so the caller
-/// stays FAIL-OPEN (a marker that can't be proven privileged is NOT honored). Only a marker
-/// provably owned by a privileged identity answers `true`.
+/// stays FAIL-OPEN (a marker that can't be proven privileged is NOT honored). Only a path provably
+/// owned by a privileged identity AND withholding write-equivalent access from every non-privileged
+/// principal answers `true` — owning a directory is not the same as being the only one able to
+/// write it.
 ///
 /// - **Windows:** the owner SID is the Administrators (`S-1-5-32-544`) or Local System
-///   (`S-1-5-18`) well-known SID. An unprivileged user's planted file is owned by that user, so it
-///   fails — even if the user hardened its DACL, since ownership (not the DACL) is checked.
+///   (`S-1-5-18`) well-known SID, AND — when the DACL is readable — no non-privileged principal
+///   holds write-equivalent access to it ([`crate::dacl`], dig_ecosystem#2571). Ownership alone
+///   answers "who owns this", which is not "who can write this": an Administrators-owned directory
+///   can still carry a write ACE for `Users`, and on the schedule install root that means an
+///   attacker plants a binary the daily SYSTEM task later runs elevated. An unprivileged user's
+///   planted file is owned by that user, so it fails the owner check regardless of its DACL.
+///   A security descriptor that could NOT be read answers `false` — nothing has been proven
+///   privileged, so the path is not honored. `READ_CONTROL` governs the owner and the DACL
+///   alike: there is no state where the owner is readable and the DACL is not, so there is no
+///   leniency for a partially-readable descriptor. An individual ACE that cannot be decoded is
+///   counted as granting (a finding), not as an absence of evidence. See [`crate::dacl`].
 /// - **Unix:** `uid == 0` (root-owned) AND no group/other write bit (`mode & 0o022 == 0`), read
 ///   from the symlink's own metadata (never following a symlink an attacker might plant).
 #[must_use]
@@ -167,7 +181,7 @@ pub fn path_is_privileged_owned(path: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        windows_owner_is_privileged(path).unwrap_or(false)
+        windows_path_is_privileged(path)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -179,63 +193,98 @@ pub fn path_is_privileged_owned(path: &Path) -> bool {
     }
 }
 
-/// Read `path`'s owner SID and report whether it is the Administrators or Local System well-known
-/// SID. `None` on ANY failure (including the file not existing) so the caller fails open.
+/// Whether `path` is BOTH owned by a privileged identity AND withholds write-equivalent access
+/// from every non-privileged principal — read from ONE security-descriptor snapshot.
+///
+/// The two questions are answered from a single [`crate::dacl::read_snapshot`] because a security
+/// descriptor is mutable: asking twice asks about two different objects-in-time, and an attacker
+/// holding `WRITE_DAC` could pass the owner leg and then make the DACL unreadable to collect the
+/// deliberate accept-on-owner-alone leniency below. See that function for the full reasoning.
+///
+/// A descriptor that could not be read — which includes the path not existing — answers `false`:
+/// nothing has been proven privileged, so no marker is honored. That is the SAME answer the owner
+/// check gave on its own before the DACL check existed, because `READ_CONTROL` governs both halves
+/// of the descriptor: a path whose DACL cannot be read cannot have its owner read either. There is
+/// therefore no "read the owner but not the DACL" state left for a leniency to apply to, and an
+/// individual ACE that cannot be DECODED does not produce one — it counts as granting
+/// ([`crate::dacl`]), so an undecodable entry is a finding rather than an absence of evidence.
 ///
 /// This is the third and final `unsafe` site in the workspace (beside `sandbox.rs`'s privilege-drop
-/// and `lock.rs`'s named-mutex DACL): reading a file's owner needs `GetNamedSecurityInfoW`, which
-/// has no safe wrapper. The `unsafe` is confined to the two documented FFI calls + the `LocalFree`
-/// of the descriptor they allocate.
+/// and `lock.rs`'s named-mutex DACL), and it lives entirely behind [`crate::dacl`].
 #[cfg(windows)]
-fn windows_owner_is_privileged(path: &Path) -> Option<bool> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
-    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows::Win32::Security::{
-        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID,
+fn windows_path_is_privileged(path: &Path) -> bool {
+    let Some(snapshot) = crate::dacl::read_snapshot(path) else {
+        return false;
     };
+    if !snapshot.owner_is_privileged {
+        return false;
+    }
+    windows_dacl_withholds_write(
+        path,
+        crate::dacl::judge(&snapshot.dacl),
+        "is privileged-owned but its DACL grants write-equivalent access to",
+    )
+}
 
-    // A wide, NUL-terminated copy of the path for the -W API.
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let mut owner = PSID::default();
-    let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `GetNamedSecurityInfoW` writes `owner` (a pointer INTO the descriptor it allocates)
-    // and `security_descriptor` (LocalAlloc'd, freed with `LocalFree` below). On failure it touches
-    // neither, and we never dereference `owner`.
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            Some(&mut owner),
-            None,
-            None,
-            None,
-            &mut security_descriptor,
+/// Whether every FILE created in `dir` will withhold write-equivalent access from non-privileged
+/// principals — the inheritance question, which is NOT answered by
+/// [`path_is_privileged_owned(dir)`](path_is_privileged_owned).
+///
+/// A directory can grant nothing on itself while handing every file created in it an explicit
+/// `Users:F` through an `(OI)(IO)` ACE (dig_ecosystem#2571, measured — see
+/// [`crate::dacl::judge_files_created_in`]). That is the shape that matters for an install root,
+/// because the binary a SYSTEM daily task runs is CREATED there by `std::fs::copy` on every update,
+/// long after any install-time check has passed.
+///
+/// - **Windows:** the inheritable ACEs are judged with [`crate::dacl::judge_files_created_in`]. An
+///   unreadable descriptor answers `false` — nothing has been proven, so the caller refuses.
+/// - **Unix:** the same answer as [`path_is_privileged_owned`], and deliberately not a second
+///   computation: there is no ACL inheritance, so who may create or replace an entry in a directory
+///   is governed by that directory's own write bits, which that function already checks.
+#[must_use]
+pub fn dir_creates_privileged_files_only(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let Some(snapshot) = crate::dacl::read_snapshot(dir) else {
+            return false;
+        };
+        windows_dacl_withholds_write(
+            dir,
+            crate::dacl::judge_files_created_in(&snapshot.dacl),
+            "is privileged-owned but its DACL grants every file created in it write-equivalent access to",
         )
-    };
-    if status != ERROR_SUCCESS {
-        // Includes "file not found" — treated as "not privileged-owned" => not opted out.
-        return Some(false);
     }
-    // SAFETY: on success `owner` is a valid SID pointer within the returned descriptor.
-    let privileged = unsafe {
-        IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
-            || IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
-    };
-    // SAFETY: `security_descriptor` is exactly the allocation `GetNamedSecurityInfoW` returned,
-    // freed once (LocalAlloc semantics, per the API contract).
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(security_descriptor.0)));
+    #[cfg(not(windows))]
+    {
+        path_is_privileged_owned(dir)
     }
-    Some(privileged)
+}
+
+/// A [`crate::dacl::DaclVerdict`] rendered as a boolean, warning on the way through so the operator
+/// learns WHICH principal caused a refusal.
+///
+/// `grants` completes the sentence "`<path>` …", so it names the question that failed rather than
+/// leaving two different checks to produce one indistinguishable warning.
+#[cfg(windows)]
+fn windows_dacl_withholds_write(
+    path: &Path,
+    verdict: crate::dacl::DaclVerdict,
+    grants: &str,
+) -> bool {
+    use crate::dacl::DaclVerdict;
+    match verdict {
+        DaclVerdict::PrivilegedWriteOnly => true,
+        DaclVerdict::UnprivilegedWrite { sid } => {
+            // The path can originate outside this process, so it is neutralized before it reaches a
+            // terminal — the same discipline every other diagnostic in this crate follows.
+            let shown = crate::display::without_control_chars(&path.display().to_string());
+            eprintln!(
+                "dig-updater: warning: {shown} {grants} {sid}, which could replace what a \
+                 privileged consumer later runs"
+            );
+            false
+        }
+    }
 }
 
 /// Restrict `path` so ONLY the broker can WRITE it, but ANYONE can READ it — the mirror-image

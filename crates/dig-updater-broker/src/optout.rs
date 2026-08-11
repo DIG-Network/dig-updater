@@ -23,9 +23,11 @@
 //!   OWNERSHIP of it ([`crate::secure::claim_privileged_ownership`] — Administrators on Windows,
 //!   root on Unix). Assigning that ownership requires the same privilege `schedule uninstall`
 //!   already demands, so an unprivileged user cannot reproduce it.
-//! - [`is_opted_out`] VERIFIES ownership before honoring the marker. Ownership (not the DACL) is the
-//!   discriminator, because a planted file's creator-owner retains `WRITE_DAC` and could otherwise
-//!   re-restrict its DACL to look hardened.
+//! - [`is_opted_out`] VERIFIES that before honoring the marker. OWNERSHIP is the un-forgeability
+//!   anchor — a hardened-looking DACL is not, because a planted file's creator-owner retains
+//!   `WRITE_DAC` and could re-restrict it at will. The DACL is checked IN ADDITION (never instead):
+//!   a marker that is privileged-owned but carries a write grant for a non-privileged principal is
+//!   not honored either, since whoever holds that grant could rewrite what the marker suppresses.
 //!
 //! ## Fail-OPEN toward availability
 //!
@@ -61,11 +63,13 @@ pub fn marker_path(state_dir: &Path) -> PathBuf {
 /// Whether the operator has DELIBERATELY opted out of the daily schedule (a `schedule uninstall`
 /// wrote a privileged-owned sentinel into `state_dir`).
 ///
-/// FAIL-OPEN + UN-FORGEABLE: answers `true` only for a marker that provably exists AND is owned by a
-/// privileged identity ([`path_is_privileged_owned`]); a missing marker, an unreadable one, or one
-/// owned by a non-privileged identity (e.g. a file an unprivileged user planted in the state dir)
-/// answers `false` (re-arm). See the module doc for why availability is the safe failure and why
-/// ownership — not mere existence — is the un-forgeability anchor.
+/// FAIL-OPEN + UN-FORGEABLE: answers `true` only for a marker that provably exists, is owned by a
+/// privileged identity, AND withholds write-equivalent access from every non-privileged principal
+/// ([`path_is_privileged_owned`]). A missing marker, an unreadable one, one owned by a
+/// non-privileged identity (e.g. a file an unprivileged user planted in the state dir), or one an
+/// unprivileged principal holds a write grant on answers `false` (re-arm). [`set_opted_out`]
+/// hardens the marker to privileged SIDs only, so a marker this beacon wrote passes both legs. See
+/// the module doc for why availability is the safe failure.
 #[must_use]
 pub fn is_opted_out(state_dir: &Path) -> bool {
     path_is_privileged_owned(&marker_path(state_dir))
@@ -88,7 +92,8 @@ pub fn set_opted_out(state_dir: &Path) -> Result<(), BrokerError> {
     let path = marker_path(state_dir);
     std::fs::write(&path, OPTOUT_MARKER_NOTE).map_err(|e| BrokerError::Io(e.to_string()))?;
     harden_state_dir(&path)?;
-    // Ownership — not the DACL — is what makes the marker un-forgeable ([`is_opted_out`]).
+    // Ownership is the un-forgeability anchor ([`is_opted_out`]); the hardening applied above
+    // satisfies the DACL leg of the same check, which is verified in addition to it.
     claim_privileged_ownership(&path)
 }
 
