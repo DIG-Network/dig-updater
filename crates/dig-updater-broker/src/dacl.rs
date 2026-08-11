@@ -221,14 +221,19 @@ pub(crate) enum AceKind {
 ///
 /// While the trustee was a plain `String` carrying a sentinel, every SID-equality rule silently
 /// applied to it, including the [`EVERYONE`]-deny carve-out that must NOT: `sid != ANONYMOUS_LOGON`
-/// is TRUE of a sentinel, so an `Everyone` DENY was subtracted from an unnameable grant. That
-/// bypass was survivable at the time only by coincidence — Windows stores a deny mask
-/// generic-mapped, so `GENERIC_ALL|GENERIC_WRITE` outlived subtracting `u32::MAX` — i.e. by two
-/// undocumented details in unrelated code, with no test watching either.
+/// is TRUE of a sentinel, so an `Everyone` DENY was subtracted from an unnameable grant.
 ///
-/// Making the distinction a TYPE removes the class instead of the instance: a rule about SIDs cannot
-/// be written against a trustee that has none, so the carve-out is unexpressible here rather than
-/// merely excluded by a comparison that the next mask change would quietly undo.
+/// **That was not an exploitable bypass, and this type is not sold as fixing one.** Measured: a deny
+/// mask is generic-mapped when Windows stores it — writing `D:P(D;;GA;;;WD)…` and reading it back
+/// yields `0x001F01FF`, without `GENERIC_ALL`/`GENERIC_WRITE`. Both bits are in
+/// [`rights::WRITE_EQUIVALENT`], so no deny that came off disk could cover the synthetic `u32::MAX`
+/// grant, and the old code reached the right verdict anyway.
+///
+/// It reached it for a reason no part of this module states or tests, in code that knows nothing
+/// about this rule. Making the distinction a TYPE is what turns that into a property: a rule about
+/// SIDs cannot be written against a trustee that has none, so the carve-out is unexpressible here
+/// rather than merely excluded by a comparison whose safety rests on the storage format continuing
+/// to strip two bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Trustee {
     /// A trustee the parser read, as a string SID (`S-1-5-32-544`) — a string so the whole allowlist
@@ -1163,35 +1168,53 @@ mod tests {
 
     #[test]
     fn an_everyone_deny_excuses_nothing_for_a_trustee_that_cannot_be_named() {
-        // The discriminator for the `Trustee` type, and the reason it is a type at all.
+        // The rule: a DENY cannot be matched to a trustee nobody can name, so it excuses nothing.
         //
-        // `read` mints this exact shape for an object ACE or a failed `GetAce`: a grant of every
-        // right to a principal it cannot name. While the trustee was a sentinel STRING, every
-        // SID-equality rule applied to it — `sid != ANONYMOUS_LOGON` is true of a sentinel — so the
-        // preceding `Everyone` DENY was subtracted from it. It survived only because Windows stores
-        // a deny mask generic-mapped: FILE_ALL_ACCESS (0x1F01FF) leaves GENERIC_ALL|GENERIC_WRITE in
-        // WRITE_EQUIVALENT unsubtracted. Two undocumented details in unrelated code, with no test on
-        // either, is not a defence.
+        // `read` mints this shape for an object ACE or a failed `GetAce` — a grant of every right to
+        // a principal it cannot name. While the trustee was a sentinel STRING, every SID-equality
+        // rule applied to it, `sid != ANONYMOUS_LOGON` included, so a preceding `Everyone` DENY was
+        // subtracted from it.
         //
-        // `an_object_grant_is_a_finding_even_though_its_trustee_is_unreadable` cannot see this: its
-        // DACL carries no preceding `Everyone` deny, so it passes whether or not the subtraction
-        // happens. This fixture supplies the deny that makes the two implementations disagree, and
-        // uses the FULL FILE_ALL_ACCESS deny mask on purpose — the mask that made the old code
-        // accidentally right is the mask this test must use to prove the new code is right on
-        // purpose.
-        assert_eq!(
+        // # What that was, and was NOT, measured to be
+        //
+        // Not an exploitable bypass. A deny mask is GENERIC-MAPPED when Windows stores it: writing
+        // `D:P(D;;GA;;;WD)…` and reading it back yields `0x001F01FF`, with GENERIC_ALL and
+        // GENERIC_WRITE gone. Those two bits are in `WRITE_EQUIVALENT`, so a deny that came off disk
+        // could never cover the synthetic `u32::MAX` grant, and the old code reached the right
+        // verdict — by a property of the storage format, in code that knows nothing about this rule.
+        //
+        // Both arms below are therefore asserted, and they are NOT redundant. The first is the shape
+        // a real DACL produces, and it passes under either implementation — it is here to record
+        // that the old code was accidentally safe rather than to imply it was correct. The second
+        // uses the full `WRITE_EQUIVALENT` deny mask, which the generic mapping makes unreachable
+        // from disk but which the TYPE still permits, and it is the only arm that separates the two
+        // implementations. `an_object_grant_is_a_finding_even_though_its_trustee_is_unreadable`
+        // separates neither: its DACL has no preceding `Everyone` deny at all.
+        let unnameable_grant_after = |deny_mask: u32| {
             judge(&Dacl::Present(vec![
-                Ace::deny(EVERYONE, 0x001f_01ff),
+                Ace::deny(EVERYONE, deny_mask),
                 Ace {
                     trustee: Trustee::Unreadable,
                     ..Ace::allow(USERS, u32::MAX)
                 },
                 Ace::allow(SYSTEM, FULL),
-            ])),
+            ]))
+        };
+
+        assert_eq!(
+            unnameable_grant_after(0x001f_01ff),
             DaclVerdict::UnprivilegedWrite {
                 sid: UNREADABLE_TRUSTEE.to_string()
             },
-            "a deny cannot be matched to a trustee nobody can name, so it excuses nothing"
+            "the deny mask a real DACL carries leaves the generic write bits standing anyway"
+        );
+        assert_eq!(
+            unnameable_grant_after(rights::WRITE_EQUIVALENT),
+            DaclVerdict::UnprivilegedWrite {
+                sid: UNREADABLE_TRUSTEE.to_string()
+            },
+            "and even a deny covering every write-equivalent bit excuses nothing here, because it \
+             cannot be matched to a trustee nobody can name"
         );
     }
 

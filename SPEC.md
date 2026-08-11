@@ -537,6 +537,22 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
   unprivileged principal could REWRITE is no more trustworthy than one it could plant, so both legs
   MUST pass. Failing either re-arms the schedule (fail-OPEN toward availability), and the beacon's
   own `set_opted_out` hardens the marker to privileged SIDs only, so a marker it wrote passes both.
+- Registration MUST verify THREE objects, and MUST refuse unless all three pass. Checking the install
+  root alone is insufficient and MUST NOT be relied on: on Windows a directory and a file within it
+  are independent securable objects, and a file's own DACL governs writing that file, so a root
+  restricted to `Administrators` and `SYSTEM` may still contain a binary an unprivileged principal can
+  overwrite in place (measured: such a binary, granting `Users:F`, was overwritten by an unelevated
+  non-administrator process; `SeChangeNotifyPrivilege` is granted to `Everyone` by default, so
+  traverse is not a barrier). The three are:
+  1. the install root — a writer of the directory can replace the binary by renaming;
+  2. the BINARY itself — a writer of the file replaces the image in place;
+  3. the files the install root CREATES — an inheritable ACE (`OBJECT_INHERIT_ACE`, including
+     `INHERIT_ONLY`) grants nothing on the directory yet is carried by every file created there. This
+     leg is required because the binary is re-created by a copy on each update, after registration:
+     measured, `CopyFileEx` does NOT propagate the source's security descriptor, so the destination
+     directory's inheritable ACEs govern the new file and there is no clean first hop.
+  The refusal MUST name WHICH object failed, since the remedy for a directory ACE differs from the
+  remedy for a file ACE.
 - "Admin/SYSTEM-only" is a statement about who can WRITE the directory, not only about who OWNS it.
   On Windows the implementation MUST therefore check the directory's DACL in addition to its owner
   SID: an `Administrators`-owned directory can still carry an ACE granting write-equivalent access
@@ -572,15 +588,25 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
   which is both the canonical hardening `icacls` produces and the published remediation for a
   directory inheriting `Authenticated Users:(M)` from the `C:\` root.
 - The widening MUST stop at `Everyone`, and MUST NOT be applied to a grant whose trustee is
-  `ANONYMOUS LOGON` (`S-1-5-7`). Subtracting a DENY whose trustee is not the granted principal is
-  sound only when that trustee is a SUPERSET of the granted one, since only then is the DENY
-  guaranteed to be reached by every requester. `Everyone` is a superset of every principal EXCEPT
-  `ANONYMOUS LOGON`: since Windows XP SP2 an anonymous token carries `S-1-5-7` WITHOUT `S-1-1-0`
-  unless `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\everyoneincludesanonymous` is set, and it
-  defaults to 0, while any local process may obtain such a token via `ImpersonateAnonymousToken`
-  without privilege. `Authenticated Users` (`S-1-5-11`) is not a superset either, because it
-  excludes `ANONYMOUS LOGON` and `Guest`, so honouring it would excuse a grant those principals
-  still hold.
+  `ANONYMOUS LOGON` (`S-1-5-7`). The sound test is asked of the TOKEN, not of group nesting: a DENY
+  whose trustee is not the granted principal may be subtracted only when every token that could hold
+  the granted SID necessarily also holds the denied one. Since Windows XP SP2 an anonymous token
+  carries `S-1-5-7` WITHOUT `S-1-1-0` unless
+  `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\everyoneincludesanonymous` is set, and it defaults to 0,
+  while any local process may obtain such a token via `ImpersonateAnonymousToken` without privilege.
+  `Authenticated Users` (`S-1-5-11`) fails the same test, because it excludes `ANONYMOUS LOGON` and
+  `Guest`. A new exception MUST be justified by a MEASURED token, never by a plausible one: `NETWORK`
+  (`S-1-5-2`) was proposed and refuted, the anonymous token having `GroupCount = 1`.
+  - This requirement bounds what the DACL algebra may CLAIM; it is not a statement that such a grant
+    is exploitable. Measured, an anonymous token opening a file whose DACL grants it `FILE_ALL_ACCESS`
+    receives `0x001200A9` — read and execute — because it runs at Untrusted integrity and the
+    mandatory label check precedes the DACL, removing every write-class right including `WRITE_OWNER`
+    and `WRITE_DAC`. The requirement stands because a mandatory label is not part of a DACL and
+    because that defence lapses if the object's label drops or `everyoneincludesanonymous` becomes 1.
+- A DENY MUST NOT be subtracted from a grant whose trustee could not be READ, since no trustee-match
+  can be established and an `Everyone` DENY cannot be shown to reach an unknown principal. An
+  implementation SHOULD make this unexpressible in its types rather than rely on comparing against a
+  sentinel value.
 - An ACE the implementation cannot fully parse MUST be treated as GRANTING, never as inert. A
   conditional (callback) ALLOW carries a condition this check does not evaluate, and an object ALLOW
   places its object-type GUIDs between the mask and the trustee so the trustee cannot be read; for a
