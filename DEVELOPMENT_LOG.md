@@ -25,8 +25,9 @@ change diary.
 ## Liveness — the two unbounded reads that were fail-OPEN (#1941)
 
 - **The repo bounded every attacker-adjacent subprocess read EXCEPT the two most important
-  channels.** `probe.rs` bounds the version probe; `loadable.rs` bounds `ldconfig` (deadline +
-  byte cap on a side thread). But the network fetch (`worker/net.rs` — `ureq::get().call()` with no
+  channels.** `probe.rs` bounds the version probe; the shared loadability check bounds `ldconfig`
+  (deadline + byte cap on a side thread — lifted to `dig_release_resolver::loadability` in #2694,
+  formerly the broker's own `loadable.rs`). But the network fetch (`worker/net.rs` — `ureq::get().call()` with no
   timeout) and the broker↔worker IPC (`sandbox.rs` — `read_to_end` / an unbounded `read_all` +
   `WaitForSingleObject(INFINITE)`) were both UNBOUNDED. Because a pass holds the single-instance
   flock for its whole duration, a stall on either is not a mere hang — it is a permanent-wedge,

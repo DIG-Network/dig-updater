@@ -28,7 +28,8 @@ use crate::error::BrokerError;
 /// A legitimate report is two feed JSON documents (delegation + manifest, each capped well under
 /// 10 MiB) plus small per-artifact staged records, so this is generous headroom. Its sole purpose
 /// is to stop a COMPROMISED worker from OOMing the privileged (root/SYSTEM) broker by writing to
-/// stdout without bound (dig_ecosystem#1941) — mirroring `loadable::LDCONFIG_OUTPUT_CAP`.
+/// stdout without bound (dig_ecosystem#1941) — mirroring the shared loadability check's
+/// `LDCONFIG_OUTPUT_CAP` (`dig_release_resolver::loadability`, #2694).
 pub const WORKER_STDOUT_CAP: u64 = 64 * 1024 * 1024;
 
 /// Wall-clock the broker waits for the worker to finish ONE pass before killing it.
@@ -501,7 +502,7 @@ fn communicate(cmd: std::process::Command, input: &[u8]) -> Result<(i32, Vec<u8>
 
 /// The body of [`communicate`], with the wall-clock `budget` and stdout `cap` INJECTED so both the
 /// hang path and the overflow path can be exercised against real child processes under tiny values
-/// (the same injection idiom [`crate::probe::bounded_probe`] and [`crate::loadable`] use).
+/// (the same injection idiom [`crate::probe::bounded_probe`] and [`dig_release_resolver::loadability`] use).
 ///
 /// Two properties this guarantees against an untrusted/compromised worker:
 /// - **it cannot hang the broker forever** — stdout is drained on a side thread so the deadline is
