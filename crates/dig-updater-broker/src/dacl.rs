@@ -123,9 +123,6 @@ const EVERYONE: &str = "S-1-1-0";
 /// `ANONYMOUS LOGON` — a token holding this can omit [`EVERYONE`].
 const ANONYMOUS_LOGON: &str = "S-1-5-7";
 
-/// `NETWORK` — carried by a null session, which is an anonymous token and so can omit [`EVERYONE`].
-const NETWORK: &str = "S-1-5-2";
-
 /// The SIDs a token can hold **without** also holding [`EVERYONE`], and therefore exactly the grants
 /// an `Everyone` DENY may NOT be subtracted from.
 ///
@@ -133,33 +130,44 @@ const NETWORK: &str = "S-1-5-2";
 ///
 /// *Does every token containing the granted SID necessarily also contain `S-1-1-0`?* That is a
 /// property of TOKENS, not of group nesting, and it is the only form of the rule that has held.
-/// Phrasing it as "`Everyone` contains every principal except …" has now been wrong twice: first as
-/// "by definition", which missed anonymous logons entirely, then as the single exception
-/// [`ANONYMOUS_LOGON`], which missed the other SID an anonymous token carries alongside it. Asking
-/// the token question exposes the whole hole at once instead of one SID at a time.
+/// Phrasing it as "`Everyone` contains every principal except …" was wrong as "by definition", which
+/// missed anonymous logons entirely. Asking the token question is what makes the boundary checkable
+/// instead of rhetorical — and what makes a proposed new entry testable rather than plausible.
 ///
 /// Since Windows XP SP2 an anonymous token omits `S-1-1-0` unless
 /// `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\everyoneincludesanonymous` is set, and it defaults to
-/// `0`. Such a token needs no privilege to obtain — locally via `ImpersonateAnonymousToken`, or
-/// remotely as a null session, which is why [`NETWORK`] is here too.
+/// `0`. Such a token needs no privilege to obtain, via `ImpersonateAnonymousToken`.
 ///
-/// Every OTHER principal a DACL realistically grants write to implies an authenticated or local
+/// # Why the list is exactly one entry, measured
+///
+/// `NETWORK` (`S-1-5-2`) was proposed as a second entry, on the theory that a null session carries it
+/// alongside `ANONYMOUS LOGON` without `Everyone`. **Measurement refuted it:** the anonymous token has
+/// `GroupCount = 1`, so there is no second group SID to grant to. Integrity SIDs are never matched
+/// during DACL evaluation either, so they cannot supply one. The entry was NOT added — a carve-out
+/// costs availability (every `Everyone`-deny hardening over a grant to that SID starts being
+/// refused), so it is paid for with a measurement, never with a plausible story.
+///
+/// Every other principal a DACL realistically grants write to implies an authenticated or local
 /// logon, and every such token carries `S-1-1-0`: `BUILTIN\Users`, `Authenticated Users`,
 /// `INTERACTIVE`, `BATCH`, `SERVICE`, `Guests`, app-container package SIDs, service SIDs,
 /// LOCAL/NETWORK SERVICE, SYSTEM, restricted and deny-only tokens, and ordinary account SIDs.
 ///
-/// # Honest limit — this leg is defence in depth, not the only barrier
+/// # Honest limit — this leg is defence in depth, not the barrier
 ///
-/// An anonymous token runs at **Untrusted** integrity, so the mandatory label denies it write to a
-/// default-Medium file BEFORE the DACL is consulted at all. Neither entry here is therefore
-/// demonstrably exploitable on a stock host, and that caveat applies equally to the `S-1-5-7` case
-/// this exception was first written for. They are listed because the algebra must not claim a
-/// subtraction Windows would not perform, and because a mandatory-integrity mitigation is not this
-/// module's to lean on.
+/// The barrier on a stock host is MANDATORY INTEGRITY, not this: an anonymous token runs at
+/// Untrusted, and the label check precedes the DACL. Measured against a file whose DACL grants
+/// `ANONYMOUS LOGON` `FILE_ALL_ACCESS`, the effective access an anonymous token actually receives is
+/// **`0x001200A9`** — read, execute, `READ_CONTROL`, `SYNCHRONIZE` — with every write-class right
+/// removed, `WRITE_OWNER` and `WRITE_DAC` included. So the grant is not exploitable there.
 ///
-/// **A new SID belongs here whenever a token can hold it without `S-1-1-0`** — that is the test to
-/// apply, not "does it look anonymous".
-const SIDS_A_TOKEN_CAN_HOLD_WITHOUT_EVERYONE: &[&str] = &[ANONYMOUS_LOGON, NETWORK];
+/// The carve-out is kept anyway, for two reasons that do not depend on exploitability: this module's
+/// contract is to report what the **DACL** grants, and a mandatory label is not part of a DACL; and
+/// the label defence is conditional in ways a DACL check cannot see — it holds only while the object
+/// keeps a Medium-or-higher label and while `everyoneincludesanonymous` stays `0`.
+///
+/// **A new SID belongs here only when a token is MEASURED holding it without `S-1-1-0`** — that is
+/// the test, not "does it look anonymous".
+const SIDS_A_TOKEN_CAN_HOLD_WITHOUT_EVERYONE: &[&str] = &[ANONYMOUS_LOGON];
 
 /// Whether a DENY to [`EVERYONE`] is guaranteed to be reached by every requester who could exercise
 /// a grant to `granted_sid`, and so may be subtracted from it.
@@ -1126,13 +1134,20 @@ mod tests {
         // The one principal `Everyone` does NOT contain. Since XP SP2, `S-1-1-0` is absent from an
         // anonymous token unless `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\
         // everyoneincludesanonymous` is set, and it defaults to 0 — so Windows never matches the
-        // DENY below, while the ALLOW hands out FILE_ALL_ACCESS. An unprivileged local process
-        // reaches that token with `ImpersonateAnonymousToken`, which needs no privilege, and then
-        // plants the binary the SYSTEM daily task runs elevated.
+        // DENY below, and the deny must not be subtracted from the ALLOW.
         //
-        // Subtracting the deny here would report a real write grant as clean — the direction this
-        // module designates as the dangerous one, reachable with the same single `SetFileSecurityW`
-        // (`WRITE_DAC` only) primitive it already refuses to trust for a trailing DENY.
+        // What the ALLOW actually confers, MEASURED rather than assumed: an anonymous token opening
+        // a file whose DACL grants it `FILE_ALL_ACCESS` receives `0x001200A9` — read, execute,
+        // READ_CONTROL, SYNCHRONIZE — because it runs at Untrusted integrity and the mandatory label
+        // check precedes the DACL, stripping every write-class right including WRITE_OWNER and
+        // WRITE_DAC. An earlier version of this comment claimed FILE_ALL_ACCESS and a plantable
+        // binary; that was wrong, and it is corrected here rather than deleted, because a security
+        // test whose stated threat is overblown is the one nobody re-checks.
+        //
+        // The assertion stands regardless, and not as a formality: this module's contract is to
+        // report what the DACL grants, and a mandatory label is not part of a DACL. The label
+        // defence also holds only while the object keeps a Medium-or-higher label and while
+        // `everyoneincludesanonymous` stays 0 — neither of which a DACL check can observe.
         assert_eq!(
             judge(&Dacl::Present(vec![
                 Ace::deny(EVERYONE, rights::WRITE_EQUIVALENT),
@@ -1143,6 +1158,150 @@ mod tests {
                 sid: ANONYMOUS_LOGON.to_string()
             },
             "an Everyone DENY is not reached by an anonymous token, so it excuses nothing here"
+        );
+    }
+
+    #[test]
+    fn an_everyone_deny_excuses_nothing_for_a_trustee_that_cannot_be_named() {
+        // The discriminator for the `Trustee` type, and the reason it is a type at all.
+        //
+        // `read` mints this exact shape for an object ACE or a failed `GetAce`: a grant of every
+        // right to a principal it cannot name. While the trustee was a sentinel STRING, every
+        // SID-equality rule applied to it — `sid != ANONYMOUS_LOGON` is true of a sentinel — so the
+        // preceding `Everyone` DENY was subtracted from it. It survived only because Windows stores
+        // a deny mask generic-mapped: FILE_ALL_ACCESS (0x1F01FF) leaves GENERIC_ALL|GENERIC_WRITE in
+        // WRITE_EQUIVALENT unsubtracted. Two undocumented details in unrelated code, with no test on
+        // either, is not a defence.
+        //
+        // `an_object_grant_is_a_finding_even_though_its_trustee_is_unreadable` cannot see this: its
+        // DACL carries no preceding `Everyone` deny, so it passes whether or not the subtraction
+        // happens. This fixture supplies the deny that makes the two implementations disagree, and
+        // uses the FULL FILE_ALL_ACCESS deny mask on purpose — the mask that made the old code
+        // accidentally right is the mask this test must use to prove the new code is right on
+        // purpose.
+        assert_eq!(
+            judge(&Dacl::Present(vec![
+                Ace::deny(EVERYONE, 0x001f_01ff),
+                Ace {
+                    trustee: Trustee::Unreadable,
+                    ..Ace::allow(USERS, u32::MAX)
+                },
+                Ace::allow(SYSTEM, FULL),
+            ])),
+            DaclVerdict::UnprivilegedWrite {
+                sid: UNREADABLE_TRUSTEE.to_string()
+            },
+            "a deny cannot be matched to a trustee nobody can name, so it excuses nothing"
+        );
+    }
+
+    #[test]
+    fn an_unnameable_trustee_is_never_privileged() {
+        // The other half of the same property: the privileged allowlist is a set of SIDs, and "we
+        // could not read who this is" is not a member of it. A `Trustee::Unreadable` that answered
+        // the allowlist would skip the grant entirely, which is a false clean rather than a false
+        // refusal — so this is pinned separately from the deny arithmetic above.
+        assert_eq!(
+            judge(&Dacl::Present(vec![Ace {
+                trustee: Trustee::Unreadable,
+                ..Ace::allow(SYSTEM, FULL)
+            }])),
+            DaclVerdict::UnprivilegedWrite {
+                sid: UNREADABLE_TRUSTEE.to_string()
+            },
+            "an unnameable trustee must not inherit a privileged principal's exemption"
+        );
+    }
+
+    #[test]
+    fn a_grant_inherited_only_by_files_is_judged_for_the_files_and_not_for_the_directory() {
+        // CF1/CF2's core distinction, as fixtures: `judge` and `judge_files_created_in` answer
+        // DIFFERENT questions about the SAME DACL, and the install root is the object where the
+        // second one is the one that matters — the binary a SYSTEM task runs is CREATED there.
+        let root = Dacl::Present(vec![
+            Ace::allow(ADMINISTRATORS, FULL),
+            Ace::allow(SYSTEM, FULL),
+            Ace::allow_files_only(USERS, FULL),
+        ]);
+
+        assert_eq!(
+            judge(&root),
+            DaclVerdict::PrivilegedWriteOnly,
+            "the (OI)(IO) ACE grants nothing on the directory itself — this half was already right"
+        );
+        assert_eq!(
+            judge_files_created_in(&root),
+            DaclVerdict::UnprivilegedWrite {
+                sid: USERS.to_string()
+            },
+            "every file created in this directory carries an explicit Users write grant"
+        );
+    }
+
+    #[test]
+    fn a_directory_only_grant_does_not_reach_the_files_created_in_it() {
+        // The converse, so the new question cannot be satisfied by a walk that ignores inheritance
+        // and just repeats `judge`. A non-inheritable grant to `Users` is a finding on the DIRECTORY
+        // and no finding at all on its files.
+        let root = Dacl::Present(vec![Ace::allow(SYSTEM, FULL), Ace::allow(USERS, FULL)]);
+
+        assert_eq!(
+            judge(&root),
+            DaclVerdict::UnprivilegedWrite {
+                sid: USERS.to_string()
+            },
+            "the directory itself is writable by Users"
+        );
+        assert_eq!(
+            judge_files_created_in(&root),
+            DaclVerdict::PrivilegedWriteOnly,
+            "a non-inheritable ACE is not carried by a new file, so the file question is clean"
+        );
+    }
+
+    #[test]
+    fn a_deny_that_only_applies_to_the_directory_does_not_excuse_an_inherited_grant() {
+        // The deny arithmetic must follow the OBJECT being judged. A deny that applies to the
+        // directory alone takes nothing away from a file, so handing the two walks a shared deny set
+        // would let a directory-only deny launder an inherited grant.
+        let root = Dacl::Present(vec![
+            Ace::deny(USERS, rights::WRITE_EQUIVALENT),
+            Ace::allow_files_only(USERS, FULL),
+            Ace::allow(SYSTEM, FULL),
+        ]);
+
+        assert_eq!(
+            judge(&root),
+            DaclVerdict::PrivilegedWriteOnly,
+            "on the directory the deny is reached and the grant is inherit-only"
+        );
+        assert_eq!(
+            judge_files_created_in(&root),
+            DaclVerdict::UnprivilegedWrite {
+                sid: USERS.to_string()
+            },
+            "the deny is not inherited by the file, so it cannot excuse the inherited grant"
+        );
+    }
+
+    #[test]
+    fn an_inherited_deny_still_excuses_an_inherited_grant() {
+        // And the control for the test above: when the deny IS inherited by files and precedes the
+        // grant, the file question must honour it exactly as the object question does — otherwise
+        // this leg refuses the canonical hardened shape and stops the host updating (#2697).
+        let root = Dacl::Present(vec![
+            Ace {
+                object_inherit: true,
+                ..Ace::deny(USERS, rights::WRITE_EQUIVALENT)
+            },
+            Ace::allow_files_only(USERS, FULL),
+            Ace::allow(SYSTEM, FULL),
+        ]);
+
+        assert_eq!(
+            judge_files_created_in(&root),
+            DaclVerdict::PrivilegedWriteOnly,
+            "an inherited deny preceding an inherited grant is reached on the file too"
         );
     }
 
@@ -1228,7 +1387,7 @@ mod tests {
     /// already holds `WRITE_DAC` over them.
     #[cfg(windows)]
     mod real_acls {
-        use super::super::{judge, read, Dacl, DaclVerdict};
+        use super::super::{judge, judge_files_created_in, read, Dacl, DaclVerdict, Trustee};
         use std::path::Path;
 
         /// Replace `path`'s DACL with the one `sddl` describes, protected from inheritance.
@@ -1395,15 +1554,74 @@ mod tests {
                 panic!("the child's DACL must be readable and present");
             };
             assert!(
-                entries.iter().any(|ace| ace.sid == "S-1-5-32-545" && !ace.inherit_only),
+                entries.iter().any(|ace| ace.trustee == Trustee::Sid(USERS.to_string())
+                    && !ace.inherit_only),
                 "the inherited Users grant must arrive as an ACE that applies to the child itself, \
                  got {entries:?}"
             );
             assert_eq!(
                 judge(&Dacl::Present(entries)),
                 DaclVerdict::UnprivilegedWrite {
-                    sid: "S-1-5-32-545".to_string()
+                    sid: USERS.to_string()
                 }
+            );
+        }
+
+        #[test]
+        fn the_binary_a_copy_creates_in_this_root_inherits_a_users_write_grant() {
+            // The ground truth for `judge_files_created_in`, and the measurement that settled how
+            // CF2 had to be fixed rather than argued about.
+            //
+            // The question was whether `CopyFileEx` carries the SOURCE file's descriptor across — if
+            // it did, the first binary installed would be clean and only later writers would matter.
+            // It does NOT: the copy is a NEW file, so the DESTINATION directory's inheritable ACEs
+            // govern it. There is no clean first hop.
+            //
+            // `std::fs::copy` is the exact call `install::copy_verified_bytes` makes, and the
+            // resulting file is the binary the SYSTEM daily task runs. `harden_state_dir` is applied
+            // to config/state/staging/status and never to the install root, so nothing repairs this
+            // afterwards.
+            //
+            // The `Everyone` grant is object-only (no inherit flags) so the test process can create
+            // the file at all; it is deliberately NOT inheritable, which keeps the child's Users
+            // grant attributable to the `(OI)(IO)` ACE under test and nothing else.
+            let (_root, dir) = dir_with_dacl(
+                "inherited-by-files",
+                "D:P(A;;FA;;;WD)(A;OICIIO;FA;;;BU)(A;;FA;;;SY)",
+            );
+
+            let source = dir.join("source.bin");
+            std::fs::write(&source, b"MZ").expect("the Everyone grant permits creating the source");
+            let installed = dir.join("dig-updater.exe");
+            std::fs::copy(&source, &installed).expect("CopyFileEx must succeed");
+
+            let Some(Dacl::Present(entries)) = read(&installed) else {
+                panic!("the copied binary's DACL must be readable and present");
+            };
+            assert!(
+                entries.iter().any(|ace| ace.trustee == Trustee::Sid(USERS.to_string())
+                    && !ace.inherit_only
+                    && ace.mask & super::super::rights::WRITE_EQUIVALENT != 0),
+                "ground truth: the copied binary really does carry an applicable Users write grant, \
+                 got {entries:?}"
+            );
+
+            // And the prediction the production code makes from the PARENT alone, which is the only
+            // thing `schedule install` can check before that copy ever happens.
+            let parent = read(&dir).expect("the root's DACL is readable");
+            assert_eq!(
+                judge_files_created_in(&parent),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: USERS.to_string()
+                },
+                "the root must be judged by what its children will inherit, not only by itself"
+            );
+            assert_eq!(
+                judge(&Dacl::Present(entries)),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: USERS.to_string()
+                },
+                "and judging the created file directly must agree with that prediction"
             );
         }
 
