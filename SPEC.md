@@ -546,6 +546,18 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
   exists to detect. Honouring an unreachable DENY would therefore let a principal who already holds
   full write make the directory report privileged-write-only. The canonical hardened shape (DENY
   first, which Windows itself canonicalizes to) MUST still be accepted.
+- A DENY ACE reduces a principal's effective mask whether its trustee is that principal ITSELF or
+  `Everyone` (`S-1-1-0`), because Windows applies a DENY to any group present in the requester's
+  token. Both bounds above still apply unchanged: such a DENY counts only where it PRECEDES the
+  grant, and only for the bits it actually denies. Matching the deny's trustee to the grant's by
+  string equality alone MUST NOT be done — it refuses `Everyone:(DENY)` over an inherited grant,
+  which is both the canonical hardening `icacls` produces and the published remediation for a
+  directory inheriting `Authenticated Users:(M)` from the `C:\` root.
+- The widening MUST stop at `Everyone`. Subtracting a DENY whose trustee is not the granted
+  principal is sound only when that trustee is a SUPERSET of every principal the grant can reach,
+  since only then is the DENY guaranteed to be reached by every requester. `Everyone` is that
+  superset by definition; `Authenticated Users` (`S-1-5-11`) is NOT, because it excludes
+  `ANONYMOUS LOGON` and `Guest`, so honouring it would excuse a grant those principals still hold.
 - An ACE the implementation cannot fully parse MUST be treated as GRANTING, never as inert. A
   conditional (callback) ALLOW carries a condition this check does not evaluate, and an object ALLOW
   places its object-type GUIDs between the mask and the trustee so the trustee cannot be read; for a

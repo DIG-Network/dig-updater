@@ -28,7 +28,10 @@
 //!   directory an administrator hardened with an explicit deny over an inherited grant is not
 //!   flagged. A DENY that FOLLOWS the grant is not subtracted, because Windows stops at the first
 //!   matching ACE and so never reaches it — honouring it would let one `SetFileSecurityW` call
-//!   silence this check while leaving the directory world-writable;
+//!   silence this check while leaving the directory world-writable. The deny's trustee need not be
+//!   the granted principal: a DENY to `Everyone` is applied by Windows to every requester, so it is
+//!   subtracted too — and no other group is, because only a SUPERSET of every principal can be
+//!   subtracted without excusing access someone still holds (see [`EVERYONE`]);
 //! - an `INHERIT_ONLY` ACE grants nothing on the object itself and is ignored;
 //! - an ACE whose CONDITION cannot be evaluated, or whose TRUSTEE cannot be read, is assumed to
 //!   grant. This is the one place the leniency stops, and it stops there because the alternative
@@ -86,6 +89,18 @@ const INHERIT_ONLY_ACE: u8 = 0x08;
 /// Stands in for the trustee of an ACE whose SID could not be read — never a real SID, so it can
 /// never match [`PRIVILEGED_SIDS`] and can only ever produce a finding.
 const UNREADABLE_TRUSTEE: &str = "<object ACE: trustee unreadable>";
+
+/// `Everyone` / `World` — the ONE group whose DENY may be subtracted from another principal's
+/// grant.
+///
+/// The asymmetry is deliberate and must not be "tidied" into a list of groups. Subtracting a DENY
+/// from a trustee other than the granted one is only sound when the denied group is a SUPERSET of
+/// every principal the grant could reach: Windows applies a DENY to any group in the requester's
+/// token, so a superset deny is reached by *every* requester and cannot subtract more than Windows
+/// itself would. `Everyone` is that superset by definition. `Authenticated Users` (`S-1-5-11`) is
+/// NOT — it excludes `ANONYMOUS LOGON` and `Guest` — so subtracting it would excuse a grant those
+/// principals still hold, which is a real false negative on the check this module exists to be.
+const EVERYONE: &str = "S-1-1-0";
 
 /// The well-known string SIDs whose write access to a privileged install root is EXPECTED, so a
 /// grant to one of them is not a finding.
@@ -226,10 +241,20 @@ pub(crate) fn judge(dacl: &Dacl) -> DaclVerdict {
 /// full write access while making the check report clean. Honouring a DENY only where Windows
 /// honours it closes that bypass while keeping the intended leniency for the canonical hardened
 /// shape, which Windows itself canonicalizes to DENY-first.
+///
+/// A DENY counts when its trustee is the granted principal itself OR [`EVERYONE`], because Windows
+/// applies a DENY to any group in the requester's token — matching on the granted SID alone missed
+/// the commonest hardening there is (deny `Everyone` over an inherited grant) and REFUSED a
+/// directory that was genuinely unwritable. The widening stops at [`EVERYONE`]; see that constant
+/// for why a superset is the only sound generalization and why `Authenticated Users` is not one.
 fn denied_mask_for(preceding: &[Ace], sid: &str) -> u32 {
     preceding
         .iter()
-        .filter(|ace| ace.kind == AceKind::Deny && !ace.inherit_only && ace.sid == sid)
+        .filter(|ace| {
+            ace.kind == AceKind::Deny
+                && !ace.inherit_only
+                && (ace.sid == sid || ace.sid == EVERYONE)
+        })
         .fold(0, |acc, ace| acc | ace.mask)
 }
 
@@ -692,6 +717,17 @@ mod tests {
             },
             "a DENY after the grant is unreachable on Windows and must not excuse it"
         );
+        assert_eq!(
+            judge(&Dacl::Present(vec![
+                Ace::allow(USERS, FULL),
+                Ace::deny(EVERYONE, rights::WRITE_EQUIVALENT),
+            ])),
+            DaclVerdict::UnprivilegedWrite {
+                sid: USERS.to_string()
+            },
+            "position bounds the Everyone widening exactly as it bounds the same-SID case: a \
+             trailing Everyone deny is just as unreachable"
+        );
     }
 
     #[test]
@@ -713,15 +749,66 @@ mod tests {
     }
 
     #[test]
-    fn a_deny_for_a_different_principal_does_not_excuse_the_grant() {
+    fn a_deny_for_an_unrelated_non_superset_principal_does_not_excuse_the_grant() {
+        // Each denied trustee here is a principal a `BUILTIN\Users` member need NOT be — so Windows
+        // may never reach the DENY at all when that member requests access, and subtracting it
+        // would be a false all-clear. `Everyone` is deliberately absent from this list: it IS a
+        // superset of `Users`, Windows DOES apply it, and the case it covers is
+        // `an_everyone_deny_preceding_a_grant_is_honoured_because_everyone_contains_the_grantee`.
+        for denied in [
+            APP_PACKAGES,
+            // Authenticated Users — the near-miss. It looks like a superset and is not: ANONYMOUS
+            // LOGON and Guest are in `Users`-reachable tokens without being authenticated, so
+            // subtracting it would create a real false negative.
+            "S-1-5-11",
+            // INTERACTIVE — absent from a service or network logon token.
+            "S-1-5-4",
+        ] {
+            assert_eq!(
+                judge(&Dacl::Present(vec![
+                    Ace::deny(denied, rights::WRITE_EQUIVALENT),
+                    Ace::allow(USERS, rights::WRITE_DATA),
+                ])),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: USERS.to_string()
+                },
+                "a DENY to {denied} does not necessarily reach a {USERS} member"
+            );
+        }
+    }
+
+    #[test]
+    fn an_everyone_deny_preceding_a_grant_is_honoured_because_everyone_contains_the_grantee() {
+        // The canonical hardening an administrator (or a vulnerability scanner's published
+        // remediation) applies over an inherited grant: deny `Everyone`, leave the grant in place.
+        // Windows evaluates the DENY against every token, so the directory really is unwritable —
+        // and matching the deny's trustee to the grant's by STRING EQUALITY missed it entirely,
+        // refusing `schedule install` on precisely the hosts that hardened themselves.
         assert_eq!(
             judge(&Dacl::Present(vec![
-                Ace::deny(APP_PACKAGES, rights::WRITE_EQUIVALENT),
-                Ace::allow(USERS, rights::WRITE_DATA),
+                Ace::deny(EVERYONE, rights::WRITE_EQUIVALENT),
+                Ace::allow(USERS, FULL),
+                Ace::allow(SYSTEM, FULL),
+            ])),
+            DaclVerdict::PrivilegedWriteOnly,
+            "a preceding Everyone DENY reaches every principal, so it neutralizes the grant"
+        );
+    }
+
+    #[test]
+    fn an_everyone_deny_is_still_bounded_by_mask() {
+        // The widening to `Everyone` inherits the existing mask bound rather than escaping it; the
+        // POSITION bound is pinned beside its same-SID twin in
+        // `a_deny_counts_only_where_windows_would_reach_it`.
+        assert_eq!(
+            judge(&Dacl::Present(vec![
+                Ace::deny(EVERYONE, rights::DELETE),
+                Ace::allow(USERS, rights::DELETE | rights::WRITE_DATA),
             ])),
             DaclVerdict::UnprivilegedWrite {
                 sid: USERS.to_string()
-            }
+            },
+            "a PARTIAL Everyone deny leaves the remaining write-equivalent bits granted"
         );
     }
 
@@ -1160,6 +1247,32 @@ mod tests {
             assert!(
                 sddl_to_descriptor("D:P(AU;;FA;;;BU)").is_err(),
                 "an audit ACE must be unrepresentable in a DACL"
+            );
+        }
+
+        #[test]
+        fn an_everyone_deny_really_does_make_a_users_granting_directory_unwritable() {
+            // The NEGATIVE ground truth, and the one the fixture battery cannot supply: only the
+            // OS can say whether `Everyone:(DENY)` actually reaches a `BUILTIN\Users` member. It
+            // does — so a verdict of `UnprivilegedWrite` here would refuse a directory that is
+            // genuinely hardened, and a refused `schedule install` means the host stops receiving
+            // security updates entirely.
+            //
+            // The DENY covers the write-equivalent mask in FULL on purpose. Denying only
+            // `WD,AD,DC` while leaving `Users:(F)` in place would still leave that principal
+            // `WRITE_DAC`, i.e. the right to lift the deny — that directory is NOT hardened and
+            // this module is right to flag it.
+            let (_root, dir) =
+                dir_with_dacl("everyone-deny", "D:P(D;;FA;;;WD)(A;;FA;;;BU)(A;;FA;;;SY)");
+
+            assert!(
+                !a_file_can_be_planted(&dir),
+                "ground truth: the Everyone DENY really does make this directory unwritable"
+            );
+            assert_eq!(
+                judge(&read(&dir).expect("the DACL is readable")),
+                DaclVerdict::PrivilegedWriteOnly,
+                "refusing a genuinely hardened directory would stop the host updating at all"
             );
         }
 
