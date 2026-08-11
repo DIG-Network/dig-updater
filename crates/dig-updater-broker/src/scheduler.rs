@@ -213,7 +213,7 @@ fn refuse_unprivileged_exe_dir(
                 "that BINARY is not restricted to privileged identities, even though its directory \
                  is — {BINARY_IS_ITS_OWN_OBJECT}"
             ),
-            "a later writer of it could overwrite the image of",
+            "a later writer of it could overwrite the image",
         ));
     }
     if !creates_privileged_files_only(dir) {
@@ -221,7 +221,7 @@ fn refuse_unprivileged_exe_dir(
             dir,
             "that directory hands every file created in it write-equivalent access for a \
              non-privileged principal, through an inheritable ACE",
-            "the next update would re-create, and hand away, the binary of",
+            "the next update would re-create, and hand away, the binary",
         ));
     }
     Ok(())
@@ -315,6 +315,15 @@ const REMEDY: &str = if cfg!(windows) {
 /// remedy for a directory ACE is not the remedy for a file ACE. `cause` completes "…: <cause> …" and
 /// `consequence` completes "…so <consequence> this SYSTEM/root daily task runs…", so each reads as
 /// one sentence rather than as a template.
+///
+/// **Every `consequence` MUST end in the noun phrase that `this SYSTEM/root daily task runs` then
+/// modifies as a reduced relative clause** — "…overwrite the image" + "this … task runs". Ending it
+/// in a preposition instead ("…the image *of*") re-reads the fixed clause as a second verb phrase
+/// and the sentence collapses into "the image of this SYSTEM/root daily task runs". Two of the three
+/// variants shipped that way, because a template is exactly the shape where the seam is invisible in
+/// the source and only appears once rendered — so
+/// [`tests::the_refusal_reads_as_prose_an_operator_can_act_on`] asserts the joined phrase across the
+/// seam, per variant, and rejects the dangling-preposition class outright.
 ///
 /// The diagnosis and the remedy are platform-selected ([`BINARY_IS_ITS_OWN_OBJECT`],
 /// [`HOW_TO_SEE_THE_PRINCIPAL`], [`REMEDY`]): this guard runs on all three operating systems, so a
@@ -1254,12 +1263,18 @@ mod tests {
         // is visible to `cargo fmt`, and neither changes behaviour, so only an assertion on the
         // RENDERED text catches them.
         // All THREE refusal variants, because they share one builder and a template is exactly the
-        // shape where two read well and the third comes out mangled.
+        // shape where two read well and the third comes out mangled. That is not hypothetical: two
+        // of the three DID ship mangled ("could overwrite the image of this SYSTEM/root daily task
+        // runs") past an earlier version of this very test, which asserted only that certain words
+        // were ABSENT. Absence assertions cannot see a seam, so each variant now carries the exact
+        // phrase it must render ACROSS the seam between `consequence` and the fixed clause.
+        const TASK_CLAUSE: &str = "this SYSTEM/root daily task runs";
         let exe = exe_with_parent();
         let variants = [
             (
                 "the directory",
                 refuse_unprivileged_exe_dir(&exe, |_object| false, |_dir| true),
+                "in place of the one",
             ),
             (
                 "the binary",
@@ -1268,14 +1283,16 @@ mod tests {
                     |object| object == Path::new("/opt/dig/bin"),
                     |_dir| true,
                 ),
+                "overwrite the image",
             ),
             (
                 "the inheritable ACE",
                 refuse_unprivileged_exe_dir(&exe, |_object| true, |_dir| false),
+                "hand away, the binary",
             ),
         ];
 
-        for (which, refusal) in variants {
+        for (which, refusal, joins_as) in variants {
             let err = refusal
                 .expect_err("each variant under test must refuse")
                 .to_string();
@@ -1293,6 +1310,30 @@ mod tests {
                 assert!(
                     !err.contains(doubled),
                     "{which}: the message repeats {doubled:?} across a continuation seam: {err}"
+                );
+            }
+            // The seam. `consequence` must hand the fixed clause a NOUN PHRASE to modify, so the
+            // two render as one sentence. This is the assertion the previous version lacked: it is
+            // stated over the joined text, so a `consequence` that ends in a dangling preposition
+            // cannot satisfy it no matter which words are absent from the message.
+            let joined = format!("{joins_as} {TASK_CLAUSE}");
+            assert!(
+                err.contains(&joined),
+                "{which}: the consequence must join the fixed clause into one sentence, reading \
+                 {joined:?}; a trailing preposition on the consequence breaks it: {err}"
+            );
+            // …and the class, not just these three instances. Any preposition immediately before
+            // the fixed clause re-reads it as a verb phrase ("the image OF this … task runs"),
+            // which is precisely the defect above. A future fourth variant gets this for free.
+            for dangling in [
+                " of ", " to ", " for ", " with ", " in ", " on ", " from ", " by ", " into ",
+                " at ",
+            ] {
+                let broken = format!("{dangling}{TASK_CLAUSE}");
+                assert!(
+                    !err.contains(&broken),
+                    "{which}: {dangling:?} immediately before the fixed clause makes it read as a \
+                     verb phrase rather than a relative clause: {err}"
                 );
             }
             // The remedy has to name BOTH objects in every variant: the operator cannot tell from a
