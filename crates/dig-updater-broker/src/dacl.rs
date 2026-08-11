@@ -345,10 +345,9 @@ mod imp {
     /// A security descriptor is MUTABLE, so two reads answer about two different objects-in-time.
     /// Reading the owner and then the DACL let an attacker holding `WRITE_DAC` — the very right a
     /// flagged `FILE_ALL_ACCESS` grant contains — pass the owner leg and then deny `READ_CONTROL`
-    /// before the DACL leg, turning the deliberate "unreadable DACL accepts on the owner check
-    /// alone" leniency into a bypass of the whole check. That is the same single-`SetFileSecurityW`
-    /// precondition this module already refuses to trust for a trailing DENY. One call yields one
-    /// consistent snapshot, and costs one syscall instead of two.
+    /// before the DACL leg. There is no mid-state where the owner was read and the DACL was not;
+    /// `READ_CONTROL` governs both, so a descriptor that cannot be read refuses outright. One call
+    /// yields one consistent snapshot, and costs one syscall instead of two.
     pub fn read_snapshot(path: &Path) -> Option<Snapshot> {
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
@@ -416,8 +415,10 @@ mod imp {
     /// Walk every ACE in `acl` into owned [`Ace`] data.
     ///
     /// The walk always completes. An entry it cannot decode becomes a maximally-pessimistic GRANT
-    /// ([`unreadable_grant`]) rather than aborting the read, because the caller reads a failed read
-    /// as "no descriptor" and accepts on the owner check alone — see the arms below.
+    /// ([`unreadable_grant`]) rather than aborting the read; aborting would return `None`, which
+    /// the caller propagates as `false` — but only where `READ_CONTROL` failed before anything was
+    /// read. Mid-walk, after the owner has been accepted, nothing upstream refuses on `None`'s
+    /// behalf. See the arms below.
     ///
     /// # Safety
     ///
@@ -440,10 +441,10 @@ mod imp {
             // malformed ACL whose header over-counts is handled by the failure arm.
             if unsafe { GetAce(acl, index, &mut raw) }.is_err() || raw.is_null() {
                 // The entry we could not read is exactly the one that might carry the permissive
-                // grant, so it counts as GRANTING and the walk CONTINUES. Aborting to `None` would
-                // report "no descriptor", which the caller accepts on the owner check alone — a
-                // fail-OPEN reachable after the owner read has already succeeded, so nothing
-                // upstream refuses on its behalf.
+                // grant, so it counts as GRANTING and the walk CONTINUES. Aborting to `None` here,
+                // after the owner has already been accepted, would leave nothing upstream to refuse
+                // on its behalf — `None` is only safe at the descriptor level, before any read
+                // succeeds, where `READ_CONTROL` failure causes both legs to refuse together.
                 out.push(unreadable_grant(false));
                 continue;
             }
@@ -590,13 +591,12 @@ mod imp {
 
         #[test]
         fn an_ace_that_cannot_be_read_is_a_finding_not_an_accept() {
-            // Aborting the walk on an unreadable ACE returned `None`, and `None` means "no
-            // descriptor" — which `secure` deliberately ACCEPTS on the owner check alone. That
-            // leniency is defensible only where it fires BEFORE anything is read (`READ_CONTROL`
-            // governs the owner read too, so the owner leg refuses first); mid-walk, nothing
-            // upstream refuses on its behalf. An ACE we cannot decode is exactly the ACE that might
-            // carry the permissive grant, so it must count as GRANTING — the policy the object-ACE
-            // and conditional-ACE arms already apply.
+            // Aborting the walk on an unreadable ACE returned `None`, and `None` propagates to
+            // `false` — but only safely BEFORE anything is read (`READ_CONTROL` governs the owner
+            // too, so the owner leg refuses first). Mid-walk, after the owner has been accepted,
+            // nothing upstream refuses on `None`'s behalf. An ACE we cannot decode is exactly the
+            // ACE that might carry the permissive grant, so it must count as GRANTING — the same
+            // policy the object-ACE and conditional-ACE arms already apply.
             let mut acl = AlignedAcl(ACL {
                 AclRevision: 2,
                 Sbz1: 0,

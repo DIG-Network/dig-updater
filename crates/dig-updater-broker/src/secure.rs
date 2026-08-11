@@ -162,7 +162,11 @@ pub fn claim_privileged_ownership(path: &Path) -> Result<(), BrokerError> {
 ///   can still carry a write ACE for `Users`, and on the schedule install root that means an
 ///   attacker plants a binary the daily SYSTEM task later runs elevated. An unprivileged user's
 ///   planted file is owned by that user, so it fails the owner check regardless of its DACL.
-///   A DACL that could NOT be read does not reject — see [`crate::dacl`] on failure direction.
+///   A security descriptor that could NOT be read answers `false` — nothing has been proven
+///   privileged, so the path is not honored. `READ_CONTROL` governs the owner and the DACL
+///   alike: there is no state where the owner is readable and the DACL is not, so there is no
+///   leniency for a partially-readable descriptor. An individual ACE that cannot be decoded is
+///   counted as granting (a finding), not as an absence of evidence. See [`crate::dacl`].
 /// - **Unix:** `uid == 0` (root-owned) AND no group/other write bit (`mode & 0o022 == 0`), read
 ///   from the symlink's own metadata (never following a symlink an attacker might plant).
 #[must_use]
