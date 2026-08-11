@@ -855,6 +855,16 @@ mod tests {
         /// Whether an UNPRIVILEGED principal can actually create a file here — the ground truth the
         /// verdict is being compared against. The test process is a member of `BUILTIN\Users`, so
         /// its own success or failure IS the answer for a `BU`-granting DACL.
+        ///
+        /// **The probe answers for the CURRENT process, so a fixture must not grant any group this
+        /// process belongs to other than the trustee under test.** In particular it must not grant
+        /// `BA`: CI runs elevated (the GitHub Windows runner is a local Administrator that is also
+        /// in `BUILTIN\Users`), so an `(A;;FA;;;BA)` ACE satisfies this probe no matter what the
+        /// ACE under test does — turning every ground truth below into a measurement of the
+        /// runner's own privilege. That is not hypothetical: it made
+        /// `a_grant_whose_condition_is_false_is_still_a_finding` fail on CI while passing on an
+        /// unelevated developer machine, and it silently hollowed out the positive cases, which
+        /// were passing on the `BA` grant rather than on the grant they claim to exercise.
         fn a_file_can_be_planted(dir: &Path) -> bool {
             std::fs::write(dir.join("planted.exe"), b"MZ").is_ok()
         }
@@ -887,7 +897,7 @@ mod tests {
             let dir = root.path().join("deny-then-allow");
             std::fs::create_dir(&dir).expect("create");
             // The order Windows itself canonicalizes to: the DENY is reached first and wins.
-            set_dacl(&dir, "D:P(D;;FA;;;BU)(A;;FA;;;BU)(A;;FA;;;SY)(A;;FA;;;BA)");
+            set_dacl(&dir, "D:P(D;;FA;;;BU)(A;;FA;;;BU)(A;;FA;;;SY)");
 
             assert!(
                 !a_file_can_be_planted(&dir),
@@ -952,14 +962,47 @@ mod tests {
         /// `Authenticated Users`.
         const AUTHENTICATED_USERS: &str = "S-1-5-11";
 
-        /// Build a directory with `sddl` as its protected DACL, returning the temp root (which must
-        /// outlive the directory) and the directory itself.
-        fn dir_with_dacl(name: &str, sddl: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        /// A directory carrying a deliberately hostile DACL, which reopens itself on the way out.
+        ///
+        /// Several fixtures leave the directory unwritable even by the process that made it, so
+        /// [`tempfile::TempDir`]'s recursive delete would fail and silently litter the temp
+        /// directory. The test process OWNS the directory and an owner implicitly holds
+        /// `WRITE_DAC`, so it can always put a permissive DACL back — which is what makes cleanup
+        /// reliable rather than best-effort.
+        struct Fixture {
+            root: tempfile::TempDir,
+            dir: std::path::PathBuf,
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // Everyone full control, so the recursive delete below can proceed.
+                set_dacl(&self.dir, "D:P(A;;FA;;;WD)");
+                let _ = &self.root;
+            }
+        }
+
+        /// Build a directory with `sddl` as its protected DACL.
+        ///
+        /// `sddl` MUST NOT grant `BA` — see [`a_file_can_be_planted`] for why an Administrators
+        /// grant destroys the ground truth these fixtures exist to provide.
+        fn dir_with_dacl(name: &str, sddl: &str) -> (Fixture, std::path::PathBuf) {
+            assert!(
+                !sddl.contains(";BA)"),
+                "a fixture must not grant BA: it would satisfy the ground-truth probe on an \
+                 elevated runner regardless of the ACE under test"
+            );
             let root = tempfile::tempdir().expect("temp dir");
             let dir = root.path().join(name);
             std::fs::create_dir(&dir).expect("create");
             set_dacl(&dir, sddl);
-            (root, dir)
+            (
+                Fixture {
+                    root,
+                    dir: dir.clone(),
+                },
+                dir,
+            )
         }
 
         #[test]
@@ -971,7 +1014,7 @@ mod tests {
             // leaving the directory world-writable.
             let (_root, dir) = dir_with_dacl(
                 "callback-allow",
-                "D:P(XA;;FA;;;BU;(Member_of{SID(WD)}))(A;;FA;;;SY)(A;;FA;;;BA)",
+                "D:P(XA;;FA;;;BU;(Member_of{SID(WD)}))(A;;FA;;;SY)",
             );
 
             assert!(
@@ -992,7 +1035,7 @@ mod tests {
             // condition, so the fix cannot be a special case for one SID.
             let (_root, dir) = dir_with_dacl(
                 "callback-allow-au",
-                "D:P(XA;;FA;;;AU;(Member_of{SID(AU)}))(A;;FA;;;SY)(A;;FA;;;BA)",
+                "D:P(XA;;FA;;;AU;(Member_of{SID(AU)}))(A;;FA;;;SY)",
             );
 
             assert!(
@@ -1019,10 +1062,7 @@ mod tests {
                 DaclVerdict::UnprivilegedWrite { .. }
             ));
 
-            set_dacl(
-                &dir,
-                "D:P(XA;;FA;;;WD;(Member_of{SID(BU)}))(A;;FA;;;SY)(A;;FA;;;BA)",
-            );
+            set_dacl(&dir, "D:P(XA;;FA;;;WD;(Member_of{SID(BU)}))(A;;FA;;;SY)");
             assert!(
                 a_file_can_be_planted(&dir),
                 "ground truth: the rewrite changed the verdict, not the writability"
@@ -1046,7 +1086,7 @@ mod tests {
             // on real install roots, so the availability cost is nil (see the control tests).
             let (_root, dir) = dir_with_dacl(
                 "condition-false",
-                "D:P(XA;;FA;;;BU;(@USER.ex==1))(A;;FA;;;SY)(A;;FA;;;BA)",
+                "D:P(XA;;FA;;;BU;(@USER.ex==1))(A;;FA;;;SY)",
             );
 
             assert!(
@@ -1070,7 +1110,7 @@ mod tests {
             // FINDING and not an excuse: an unreadable trustee could be anyone.
             let (_root, dir) = dir_with_dacl(
                 "object-allow",
-                "D:P(OA;;FA;;bf967aba-0de6-11d0-a285-00aa003049e2;BU)(A;;FA;;;SY)(A;;FA;;;BA)",
+                "D:P(OA;;FA;;bf967aba-0de6-11d0-a285-00aa003049e2;BU)(A;;FA;;;SY)",
             );
 
             assert!(
@@ -1095,10 +1135,7 @@ mod tests {
             let (_root, dir) = dir_with_dacl("delete-child", "D:P(A;;FA;;;BU)");
             let binary = dir.join("dig-updater.exe");
             std::fs::write(&binary, b"MZ").expect("seed the binary before locking the directory");
-            set_dacl(
-                &dir,
-                "D:P(A;;0x40;;;BU)(A;;0x1200a9;;;BU)(A;;FA;;;SY)(A;;FA;;;BA)",
-            );
+            set_dacl(&dir, "D:P(A;;0x40;;;BU)(A;;0x1200a9;;;BU)(A;;FA;;;SY)");
 
             assert!(
                 std::fs::remove_file(&binary).is_ok(),
