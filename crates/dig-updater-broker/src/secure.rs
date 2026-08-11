@@ -9,8 +9,10 @@
 //! (Windows) / root, mode `0700` (Unix), and — before a pass installs anything — [`acl_self_check`]
 //! VERIFIES it, repairing a directory the broker owns or ABORTING fail-closed otherwise.
 //!
-//! This module contains NO `unsafe` — Unix uses the safe `PermissionsExt`; Windows shells out to
-//! the built-in `icacls`.
+//! Applying permissions needs NO `unsafe` — Unix uses the safe `PermissionsExt`; Windows shells
+//! out to the built-in `icacls`. READING them back does: the owner SID needs
+//! `GetNamedSecurityInfoW` ([`windows_owner_is_privileged`]) and the DACL needs it plus `GetAce`
+//! ([`crate::dacl`]), neither of which has a safe wrapper.
 
 use std::path::{Path, PathBuf};
 
@@ -151,8 +153,13 @@ pub fn claim_privileged_ownership(path: &Path) -> Result<(), BrokerError> {
 /// provably owned by a privileged identity answers `true`.
 ///
 /// - **Windows:** the owner SID is the Administrators (`S-1-5-32-544`) or Local System
-///   (`S-1-5-18`) well-known SID. An unprivileged user's planted file is owned by that user, so it
-///   fails — even if the user hardened its DACL, since ownership (not the DACL) is checked.
+///   (`S-1-5-18`) well-known SID, AND — when the DACL is readable — no non-privileged principal
+///   holds write-equivalent access to it ([`crate::dacl`], dig_ecosystem#2571). Ownership alone
+///   answers "who owns this", which is not "who can write this": an Administrators-owned directory
+///   can still carry a write ACE for `Users`, and on the schedule install root that means an
+///   attacker plants a binary the daily SYSTEM task later runs elevated. An unprivileged user's
+///   planted file is owned by that user, so it fails the owner check regardless of its DACL.
+///   A DACL that could NOT be read does not reject — see [`crate::dacl`] on failure direction.
 /// - **Unix:** `uid == 0` (root-owned) AND no group/other write bit (`mode & 0o022 == 0`), read
 ///   from the symlink's own metadata (never following a symlink an attacker might plant).
 #[must_use]
@@ -167,7 +174,7 @@ pub fn path_is_privileged_owned(path: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        windows_owner_is_privileged(path).unwrap_or(false)
+        windows_owner_is_privileged(path).unwrap_or(false) && windows_dacl_is_privileged(path)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -236,6 +243,48 @@ fn windows_owner_is_privileged(path: &Path) -> Option<bool> {
         let _ = LocalFree(Some(HLOCAL(security_descriptor.0)));
     }
     Some(privileged)
+}
+
+/// Whether `path`'s DACL withholds write-equivalent access from every non-privileged principal.
+///
+/// The three outcomes are deliberately NOT collapsed (dig_ecosystem#2571):
+///
+/// - the DACL is readable and privileged-write-only → `true`;
+/// - the DACL is readable and grants an unprivileged principal write → `false`, the finding;
+/// - the DACL could NOT be read → `true`, with a warning. This is an ABSENCE of evidence, never
+///   evidence of cleanliness, and treating it as a refusal would fail in the expensive direction:
+///   a refused `schedule install` means no daily wake, so the machine stops receiving security
+///   updates entirely — strictly worse than the elevated-misconfiguration residual this closes.
+///   The owner check still applies in that case, exactly as it did before this check existed.
+#[cfg(windows)]
+fn windows_dacl_is_privileged(path: &Path) -> bool {
+    use crate::dacl::{judge, DaclVerdict};
+
+    // The path can originate outside this process, so it is neutralized before it reaches a
+    // terminal — the same discipline every other diagnostic in this crate follows.
+    let shown = crate::display::without_control_chars(&path.display().to_string());
+
+    let Some(dacl) = crate::dacl::read(path) else {
+        eprintln!(
+            "dig-updater: warning: could not read the DACL of {shown}; accepting it on the owner \
+             check alone"
+        );
+        return true;
+    };
+    match judge(&dacl) {
+        DaclVerdict::PrivilegedWriteOnly => true,
+        DaclVerdict::UnprivilegedWrite { sid } => {
+            eprintln!(
+                "dig-updater: warning: {shown} is privileged-owned but its DACL grants \
+                 write-equivalent access to {sid}, which could replace what a privileged consumer \
+                 later runs"
+            );
+            false
+        }
+        // `read` never yields this; matched so a future reader that does cannot silently be
+        // treated as a clean DACL.
+        DaclVerdict::Unreadable => true,
+    }
 }
 
 /// Restrict `path` so ONLY the broker can WRITE it, but ANYONE can READ it — the mirror-image

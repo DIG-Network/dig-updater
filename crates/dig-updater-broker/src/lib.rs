@@ -50,6 +50,11 @@
 //! other module — and every other crate — is safe.
 
 pub mod config;
+// The DACL decision is deliberately compiled on every platform, not just Windows, so its matrix is
+// exercised by Linux/macOS CI from fabricated ACL fixtures; only its Win32 reader is Windows-only.
+// That leaves the pure half unused off-Windows, which is the point rather than an oversight.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod dacl;
 pub mod display;
 pub mod elevation;
 mod error;
