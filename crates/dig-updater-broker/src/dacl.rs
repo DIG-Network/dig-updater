@@ -291,25 +291,51 @@ fn is_administrator_account(sid: &str) -> bool {
 }
 
 #[cfg(windows)]
+pub(crate) use imp::read_snapshot;
+
+#[cfg(all(windows, test))]
 pub(crate) use imp::read;
 
-/// Reading the real DACL off a path — the one impure, Windows-only part of this module.
+/// Reading the real owner and DACL off a path — the one impure, Windows-only part of this module.
 #[cfg(windows)]
 mod imp {
     use super::{Ace, AceKind, Dacl};
     use std::path::Path;
     use windows::Win32::Security::ACL;
 
-    /// Read `path`'s DACL, or `None` if the security descriptor could not be read.
+    /// Everything one security-descriptor read says about who may write a path.
     ///
-    /// `None` means the check has NO evidence — the caller must not read it as "clean" (module
-    /// docs). Every other outcome, including a present-but-empty DACL, is evidence.
-    pub fn read(path: &Path) -> Option<Dacl> {
+    /// Owner and DACL travel together because they are read together — see [`read_snapshot`].
+    pub struct Snapshot {
+        /// Whether the owner SID is `BUILTIN\Administrators` or `Local System`.
+        pub owner_is_privileged: bool,
+        /// The DACL, or `None` if the ACL could not be WALKED. That is distinct from the
+        /// descriptor being unreadable (which is `None` from [`read_snapshot`] itself) and from a
+        /// DACL that walked cleanly and held no entries.
+        pub dacl: Option<Dacl>,
+    }
+
+    /// Read `path`'s owner and DACL in ONE `GetNamedSecurityInfoW` call, or `None` if the security
+    /// descriptor could not be read at all (including the path not existing).
+    ///
+    /// # Why one call and not two
+    ///
+    /// A security descriptor is MUTABLE, so two reads answer about two different objects-in-time.
+    /// Reading the owner and then the DACL let an attacker holding `WRITE_DAC` — the very right a
+    /// flagged `FILE_ALL_ACCESS` grant contains — pass the owner leg and then deny `READ_CONTROL`
+    /// before the DACL leg, turning the deliberate "unreadable DACL accepts on the owner check
+    /// alone" leniency into a bypass of the whole check. That is the same single-`SetFileSecurityW`
+    /// precondition this module already refuses to trust for a trailing DENY. One call yields one
+    /// consistent snapshot, and costs one syscall instead of two.
+    pub fn read_snapshot(path: &Path) -> Option<Snapshot> {
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
         use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-        use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+        use windows::Win32::Security::{
+            IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        };
 
         let wide: Vec<u16> = path
             .as_os_str()
@@ -317,16 +343,17 @@ mod imp {
             .chain(std::iter::once(0))
             .collect();
 
+        let mut owner = PSID::default();
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: `GetNamedSecurityInfoW` writes `dacl` (a pointer INTO the descriptor it
-        // allocates) and `descriptor` (LocalAlloc'd, freed below). On failure it touches neither.
+        // SAFETY: `GetNamedSecurityInfoW` writes `owner` and `dacl` (pointers INTO the descriptor
+        // it allocates) and `descriptor` (LocalAlloc'd, freed below). On failure it touches none.
         let status = unsafe {
             GetNamedSecurityInfoW(
                 PCWSTR(wide.as_ptr()),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                Some(&mut owner),
                 None,
                 Some(&mut dacl),
                 None,
@@ -336,6 +363,11 @@ mod imp {
         if status != ERROR_SUCCESS {
             return None;
         }
+        // SAFETY: on success `owner` is a valid SID pointer within the returned descriptor.
+        let owner_is_privileged = unsafe {
+            IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
+                || IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
+        };
         // SAFETY: on success `dacl` is either NULL (no DACL) or a valid ACL inside `descriptor`,
         // which outlives the read because it is freed only after `entries` returns owned data.
         let parsed = if dacl.is_null() {
@@ -347,7 +379,16 @@ mod imp {
         unsafe {
             let _ = LocalFree(Some(HLOCAL(descriptor.0)));
         }
-        parsed
+        Some(Snapshot {
+            owner_is_privileged,
+            dacl: parsed,
+        })
+    }
+
+    /// Just the DACL half of [`read_snapshot`] — the shape the `judge` fixtures read against.
+    #[cfg(test)]
+    pub fn read(path: &Path) -> Option<Dacl> {
+        read_snapshot(path)?.dacl
     }
 
     /// Walk every ACE in `acl` into owned [`Ace`] data. `None` if the ACL could not be walked —

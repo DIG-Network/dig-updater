@@ -10,9 +10,10 @@
 //! VERIFIES it, repairing a directory the broker owns or ABORTING fail-closed otherwise.
 //!
 //! Applying permissions needs NO `unsafe` — Unix uses the safe `PermissionsExt`; Windows shells
-//! out to the built-in `icacls`. READING them back does: the owner SID needs
-//! `GetNamedSecurityInfoW` ([`windows_owner_is_privileged`]) and the DACL needs it plus `GetAce`
-//! ([`crate::dacl`]), neither of which has a safe wrapper.
+//! out to the built-in `icacls`. READING them back does: owner and DACL come from ONE
+//! `GetNamedSecurityInfoW` call plus `GetAce` ([`crate::dacl::read_snapshot`], reached here via
+//! [`windows_path_is_privileged`]), neither of which has a safe wrapper. They are read TOGETHER
+//! because a security descriptor is mutable, so two reads can describe two different states.
 
 use std::path::{Path, PathBuf};
 
@@ -174,7 +175,7 @@ pub fn path_is_privileged_owned(path: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        windows_owner_is_privileged(path).unwrap_or(false) && windows_dacl_is_privileged(path)
+        windows_path_is_privileged(path)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -186,88 +187,46 @@ pub fn path_is_privileged_owned(path: &Path) -> bool {
     }
 }
 
-/// Read `path`'s owner SID and report whether it is the Administrators or Local System well-known
-/// SID. `None` on ANY failure (including the file not existing) so the caller fails open.
+/// Whether `path` is BOTH owned by a privileged identity AND withholds write-equivalent access
+/// from every non-privileged principal — read from ONE security-descriptor snapshot.
 ///
-/// This is the third and final `unsafe` site in the workspace (beside `sandbox.rs`'s privilege-drop
-/// and `lock.rs`'s named-mutex DACL): reading a file's owner needs `GetNamedSecurityInfoW`, which
-/// has no safe wrapper. The `unsafe` is confined to the two documented FFI calls + the `LocalFree`
-/// of the descriptor they allocate.
-#[cfg(windows)]
-fn windows_owner_is_privileged(path: &Path) -> Option<bool> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
-    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows::Win32::Security::{
-        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID,
-    };
-
-    // A wide, NUL-terminated copy of the path for the -W API.
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let mut owner = PSID::default();
-    let mut security_descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `GetNamedSecurityInfoW` writes `owner` (a pointer INTO the descriptor it allocates)
-    // and `security_descriptor` (LocalAlloc'd, freed with `LocalFree` below). On failure it touches
-    // neither, and we never dereference `owner`.
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            Some(&mut owner),
-            None,
-            None,
-            None,
-            &mut security_descriptor,
-        )
-    };
-    if status != ERROR_SUCCESS {
-        // Includes "file not found" — treated as "not privileged-owned" => not opted out.
-        return Some(false);
-    }
-    // SAFETY: on success `owner` is a valid SID pointer within the returned descriptor.
-    let privileged = unsafe {
-        IsWellKnownSid(owner, WinBuiltinAdministratorsSid).as_bool()
-            || IsWellKnownSid(owner, WinLocalSystemSid).as_bool()
-    };
-    // SAFETY: `security_descriptor` is exactly the allocation `GetNamedSecurityInfoW` returned,
-    // freed once (LocalAlloc semantics, per the API contract).
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(security_descriptor.0)));
-    }
-    Some(privileged)
-}
-
-/// Whether `path`'s DACL withholds write-equivalent access from every non-privileged principal.
+/// The two questions are answered from a single [`crate::dacl::read_snapshot`] because a security
+/// descriptor is mutable: asking twice asks about two different objects-in-time, and an attacker
+/// holding `WRITE_DAC` could pass the owner leg and then make the DACL unreadable to collect the
+/// deliberate accept-on-owner-alone leniency below. See that function for the full reasoning.
 ///
 /// The three outcomes are deliberately NOT collapsed (dig_ecosystem#2571):
 ///
 /// - the DACL is readable and privileged-write-only → `true`;
 /// - the DACL is readable and grants an unprivileged principal write → `false`, the finding;
-/// - the DACL could NOT be read → `true`, with a warning. This is an ABSENCE of evidence, never
-///   evidence of cleanliness, and treating it as a refusal would fail in the expensive direction:
-///   a refused `schedule install` means no daily wake, so the machine stops receiving security
-///   updates entirely — strictly worse than the elevated-misconfiguration residual this closes.
-///   The owner check still applies in that case, exactly as it did before this check existed.
+/// - the DACL could NOT be walked → the owner check stands ALONE, with a warning. This is an
+///   ABSENCE of evidence, never evidence of cleanliness, and treating it as a refusal would fail in
+///   the expensive direction: a refused `schedule install` means no daily wake, so the machine stops
+///   receiving security updates entirely — strictly worse than the elevated-misconfiguration
+///   residual this closes.
+///
+/// A descriptor that could not be read AT ALL — which includes the path not existing — answers
+/// `false`: nothing has been proven privileged, so no marker is honored.
+///
+/// This is the third and final `unsafe` site in the workspace (beside `sandbox.rs`'s privilege-drop
+/// and `lock.rs`'s named-mutex DACL), and it lives entirely behind [`crate::dacl`].
 #[cfg(windows)]
-fn windows_dacl_is_privileged(path: &Path) -> bool {
+fn windows_path_is_privileged(path: &Path) -> bool {
     use crate::dacl::{judge, DaclVerdict};
 
     // The path can originate outside this process, so it is neutralized before it reaches a
     // terminal — the same discipline every other diagnostic in this crate follows.
     let shown = crate::display::without_control_chars(&path.display().to_string());
 
-    let Some(dacl) = crate::dacl::read(path) else {
+    let Some(snapshot) = crate::dacl::read_snapshot(path) else {
+        return false;
+    };
+    if !snapshot.owner_is_privileged {
+        return false;
+    }
+    let Some(dacl) = snapshot.dacl else {
         eprintln!(
-            "dig-updater: warning: could not read the DACL of {shown}; accepting it on the owner \
-             check alone"
+            "dig-updater: warning: could not read the DACL of {shown}; accepting it on the owner              check alone"
         );
         return true;
     };
@@ -275,9 +234,7 @@ fn windows_dacl_is_privileged(path: &Path) -> bool {
         DaclVerdict::PrivilegedWriteOnly => true,
         DaclVerdict::UnprivilegedWrite { sid } => {
             eprintln!(
-                "dig-updater: warning: {shown} is privileged-owned but its DACL grants \
-                 write-equivalent access to {sid}, which could replace what a privileged consumer \
-                 later runs"
+                "dig-updater: warning: {shown} is privileged-owned but its DACL grants                  write-equivalent access to {sid}, which could replace what a privileged consumer                  later runs"
             );
             false
         }
