@@ -1927,5 +1927,45 @@ mod tests {
                 DaclVerdict::PrivilegedWriteOnly
             );
         }
+
+        #[test]
+        fn a_stock_system_directory_hands_its_children_to_privileged_principals_only() {
+            // The accept-direction control for the SECOND predicate. `judge` and
+            // `judge_files_created_in` ask different questions of the same DACL, and until now only
+            // the first had a real-host control — every inheritance test above this point runs on a
+            // fabricated or a deliberately hostile fixture, so nothing pinned the shape an ordinary
+            // machine actually presents.
+            //
+            // That is the expensive gap rather than a tidy one. `judge_files_created_in` is the leg
+            // that can NEWLY refuse `schedule install`, and a refused install means the host stops
+            // receiving updates at all — strictly worse than the over-permissive read it replaced.
+            // An over-refusal in this family already took all three CI legs red once.
+            //
+            // `C:\Windows\System32` and not the real install root, because `C:\Program Files\DIG`
+            // exists only on a machine with dig-updater installed, never on a CI runner. Measured
+            // on a stock Windows 11 host, System32's inheritable (OI) set is SYSTEM, Administrators
+            // and CREATOR OWNER at full control — all three in `PRIVILEGED_SIDS`, the last via
+            // `S-1-3-0` — plus `Users` and the two APPLICATION PACKAGE groups at `(GR,GE)`, which
+            // generic-maps to read+execute and so carries no `WRITE_EQUIVALENT` bit. The verdict is
+            // therefore clean for a reason, not by luck.
+            //
+            // It is also NOT a duplicate of the `judge` control beside it, which is the thing worth
+            // knowing about this pair. Deleting `S-1-3-0` from `PRIVILEGED_SIDS` turns THIS test red
+            // with `UnprivilegedWrite { sid: "S-1-3-0" }` and leaves that one green — because
+            // System32's `CREATOR OWNER` ACE is `(OI)(CI)(IO)`, inherit-only, so it does not apply
+            // to the directory and `judge` never looks at it. This is the only test in the suite
+            // that can see that edit, which is the measured form of the claim in `PRIVILEGED_SIDS`
+            // that the entry cannot simply be removed: removing it refuses a stock hardened OS
+            // directory outright. Narrowing it to the resolved owner is dig_ecosystem#2740.
+            let system32 = Path::new("C:\\Windows\\System32");
+            assert_eq!(
+                judge_files_created_in(&read(system32).expect("System32's DACL is readable")),
+                DaclVerdict::PrivilegedWriteOnly,
+                "a stock hardened OS directory must not fail the inheritance leg. If this is red, \
+                 REPORT the offending ACE — do not relax `judge_files_created_in` and do not widen \
+                 `PRIVILEGED_SIDS` to make it green, because either would blunt the check on every \
+                 host to fix it on this one"
+            );
+        }
     }
 }
