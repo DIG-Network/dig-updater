@@ -463,8 +463,13 @@ mod imp {
                 ACCESS_DENIED_OBJECT_ACE_TYPE | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE => {
                     AceKind::Other
                 }
-                // What remains is audit/alarm, which lives in the SACL and cannot appear in a DACL
-                // at all — plus any type a future Windows adds. Both grant nothing here.
+                // What remains is audit/alarm — which lives in the SACL, and which SDDL refuses to
+                // place in a `D:` section — plus any type this parser does not know. An UNKNOWN
+                // type genuinely CAN reach us: hand-patching a valid ACE's type byte to `0x7F` and
+                // writing it with `SetFileSecurityW` was ACCEPTED by Windows, so the comfortable
+                // premise that only known types arrive is false. Scoring it as granting nothing is
+                // nevertheless correct, and measured rather than assumed: the kernel grants nothing
+                // on an ACE type it does not recognise either.
                 _ => AceKind::Other,
             };
             if kind == AceKind::Other {
@@ -1074,12 +1079,9 @@ mod tests {
 
         #[test]
         fn a_trailing_deny_does_not_hide_a_world_writable_directory() {
-            let root = tempfile::tempdir().expect("temp dir");
-            let dir = root.path().join("allow-then-deny");
-            std::fs::create_dir(&dir).expect("create");
             // Non-canonical on purpose: Windows stops at the leading ALLOW, so `BUILTIN\Users`
             // really does hold full control here.
-            set_dacl(&dir, "D:P(A;;FA;;;BU)(D;;FA;;;BU)");
+            let (_fixture, dir) = dir_with_dacl("allow-then-deny", "D:P(A;;FA;;;BU)(D;;FA;;;BU)");
 
             assert!(
                 a_file_can_be_planted(&dir),
@@ -1096,11 +1098,12 @@ mod tests {
 
         #[test]
         fn the_canonical_hardened_shape_is_still_accepted() {
-            let root = tempfile::tempdir().expect("temp dir");
-            let dir = root.path().join("deny-then-allow");
-            std::fs::create_dir(&dir).expect("create");
-            // The order Windows itself canonicalizes to: the DENY is reached first and wins.
-            set_dacl(&dir, "D:P(D;;FA;;;BU)(A;;FA;;;BU)(A;;FA;;;SY)");
+            // The order Windows itself canonicalizes to: the DENY is reached first and wins. It
+            // denies the test process `DELETE` too, so this MUST go through `dir_with_dacl`: its
+            // drop guard reopens the directory, without which the recursive cleanup fails and the
+            // run litters the temp directory on every run.
+            let (_fixture, dir) =
+                dir_with_dacl("deny-then-allow", "D:P(D;;FA;;;BU)(A;;FA;;;BU)(A;;FA;;;SY)");
 
             assert!(
                 !a_file_can_be_planted(&dir),
@@ -1187,14 +1190,18 @@ mod tests {
 
         /// Build a directory with `sddl` as its protected DACL.
         ///
-        /// `sddl` MUST NOT grant `BA` — see [`a_file_can_be_planted`] for why an Administrators
-        /// grant destroys the ground truth these fixtures exist to provide.
+        /// `sddl` MUST NOT grant Administrators — see [`a_file_can_be_planted`] for why such a
+        /// grant destroys the ground truth these fixtures exist to provide. BOTH spellings are
+        /// rejected: the `BA` alias and the literal SID it abbreviates, because the guard is
+        /// textual and a fixture written the long way round would slip past a check for one alone.
         fn dir_with_dacl(name: &str, sddl: &str) -> (Fixture, std::path::PathBuf) {
-            assert!(
-                !sddl.contains(";BA)"),
-                "a fixture must not grant BA: it would satisfy the ground-truth probe on an \
-                 elevated runner regardless of the ACE under test"
-            );
+            for administrators in [";BA)", ";S-1-5-32-544)"] {
+                assert!(
+                    !sddl.contains(administrators),
+                    "a fixture must not grant Administrators ({administrators}): it would satisfy \
+                     the ground-truth probe on an elevated runner regardless of the ACE under test"
+                );
+            }
             let root = tempfile::tempdir().expect("temp dir");
             let dir = root.path().join(name);
             std::fs::create_dir(&dir).expect("create");

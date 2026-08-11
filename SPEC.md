@@ -530,6 +530,13 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
 - The sentinel MUST live in the Admin/SYSTEM-only state dir (never the dry-check-relocatable one) so
   a non-privileged process cannot FORGE it to suppress auto-updates — an update-suppression /
   stale-pin vector. Its mere presence is the entire signal; its contents carry no trust.
+- The sentinel is subject to the SAME two-part privileged-path test as the install root below: it is
+  honored only when it is privileged-OWNED *and* its DACL withholds write-equivalent access from
+  every non-privileged principal. Ownership remains the un-forgeability anchor — a hardened-looking
+  DACL is not one, since a planted file's creator-owner keeps `WRITE_DAC` — but a marker an
+  unprivileged principal could REWRITE is no more trustworthy than one it could plant, so both legs
+  MUST pass. Failing either re-arms the schedule (fail-OPEN toward availability), and the beacon's
+  own `set_opted_out` hardens the marker to privileged SIDs only, so a marker it wrote passes both.
 - "Admin/SYSTEM-only" is a statement about who can WRITE the directory, not only about who OWNS it.
   On Windows the implementation MUST therefore check the directory's DACL in addition to its owner
   SID: an `Administrators`-owned directory can still carry an ACE granting write-equivalent access

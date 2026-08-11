@@ -150,8 +150,10 @@ pub fn claim_privileged_ownership(path: &Path) -> Result<(), BrokerError> {
 /// check the opt-out sentinel ([`crate::optout`]) gates on.
 ///
 /// A non-existent path, or ANY inability to determine ownership, answers `false` — so the caller
-/// stays FAIL-OPEN (a marker that can't be proven privileged is NOT honored). Only a marker
-/// provably owned by a privileged identity answers `true`.
+/// stays FAIL-OPEN (a marker that can't be proven privileged is NOT honored). Only a path provably
+/// owned by a privileged identity AND withholding write-equivalent access from every non-privileged
+/// principal answers `true` — owning a directory is not the same as being the only one able to
+/// write it.
 ///
 /// - **Windows:** the owner SID is the Administrators (`S-1-5-32-544`) or Local System
 ///   (`S-1-5-18`) well-known SID, AND — when the DACL is readable — no non-privileged principal

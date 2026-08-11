@@ -153,16 +153,18 @@ fn install_with(
 /// The daily task runs `exe` as SYSTEM/root forever with no further prompt. If the directory holding
 /// `exe` is user-writable (a portable / user-directory install), one UAC/sudo approval becomes a
 /// PERMANENT elevated foothold: whoever can later write that directory replaces the binary, and the
-/// task runs the replacement elevated. So registration is allowed ONLY from a privileged-owned install
-/// root — the ownership of the DIRECTORY, checked via the injected `is_privileged` (production:
-/// [`crate::secure::path_is_privileged_owned`]).
+/// task runs the replacement elevated. So registration is allowed ONLY from an install root that is
+/// restricted to privileged identities, checked via the injected `is_privileged` (production:
+/// [`crate::secure::path_is_privileged_owned`], which tests BOTH the directory's owner AND its DACL
+/// — an Administrators-owned directory carrying a write ACE for `Users` is just as replaceable).
 ///
 /// `is_privileged` is injected so the decision is deterministically testable without depending on the
 /// test runner's uid or filesystem ownership.
 ///
 /// # Errors
 ///
-/// [`BrokerError::Io`] if `exe` has no parent directory, or if that directory is not privileged-owned.
+/// [`BrokerError::Io`] if `exe` has no parent directory, or if that directory is not restricted to
+/// privileged identities.
 fn refuse_unprivileged_exe_dir(
     exe: &Path,
     is_privileged: impl Fn(&Path) -> bool,
@@ -177,9 +179,9 @@ fn refuse_unprivileged_exe_dir(
     if !is_privileged(dir) {
         return Err(BrokerError::Io(format!(
             "refusing to register a SYSTEM/root daily schedule for a binary in {}: that directory is \
-             not owned by a privileged identity, so a later writer of it could replace the binary \
+             is not restricted to privileged identities — either it is not owned by one, or its DACL grants \n             write-equivalent access to one that is not (any preceding warning names the offending \n             SID) — so a later writer of it could replace the binary \
              this SYSTEM/root daily task runs — turning one elevation approval into a permanent \
-             elevated foothold; register only from a privileged-owned install root",
+             elevated foothold; take privileged ownership of the directory AND remove any write grant to a non-privileged \n             principal, or register only from an install root that already is both",
             dir.display()
         )));
     }
