@@ -21,8 +21,8 @@
 //! hardening closes (the residual needs an *elevated* misconfiguration to exist in the first
 //! place). So the leniency is deliberate and asymmetric:
 //!
-//! - a DACL we could **not read** is [`DaclVerdict::Unreadable`] and does NOT reject — the owner
-//!   check stands alone, exactly as it did before this module existed;
+//! - a DACL we could **not read** is `None` from [`read`], never a [`DaclVerdict`], and does NOT
+//!   reject — the owner check stands alone, exactly as it did before this module existed;
 //! - a DACL we **could** read and which is permissive DOES reject;
 //! - a DENY ACE is subtracted from the same principal's allowed mask, so a directory an
 //!   administrator hardened with an explicit deny over an inherited grant is not flagged;
@@ -160,9 +160,6 @@ pub(crate) enum DaclVerdict {
         /// The offending trustee, for the refusal message.
         sid: String,
     },
-    /// The security descriptor could not be read. Distinct from every other verdict on purpose:
-    /// it is an ABSENCE of evidence, never evidence of cleanliness (see the module docs).
-    Unreadable,
 }
 
 /// Judge a DACL: does any non-privileged principal hold write-equivalent access to this object?
@@ -217,6 +214,7 @@ pub(crate) use imp::read;
 mod imp {
     use super::{Ace, AceKind, Dacl};
     use std::path::Path;
+    use windows::Win32::Security::ACL;
 
     /// Read `path`'s DACL, or `None` if the security descriptor could not be read.
     ///
@@ -227,9 +225,7 @@ mod imp {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
         use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-        use windows::Win32::Security::{
-            ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        };
+        use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
 
         let wide: Vec<u16> = path
             .as_os_str()
@@ -277,12 +273,13 @@ mod imp {
     ///
     /// `acl` must be a valid, non-NULL `ACL` that outlives the call.
     unsafe fn entries(acl: *mut ACL) -> Option<Vec<Ace>> {
-        use windows::Win32::Security::{
-            GetAce, ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, ACE_HEADER,
+        use windows::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE, ACE_HEADER};
+        use windows::Win32::System::SystemServices::{
+            ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
         };
 
         // SAFETY: the caller guarantees `acl` is a valid ACL.
-        let count = unsafe { (*acl).AceCount } as u32;
+        let count = u32::from(unsafe { (*acl).AceCount });
         let mut out = Vec::with_capacity(count as usize);
         for index in 0..count {
             let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -296,20 +293,37 @@ mod imp {
             // field for every ACE type.
             let header = unsafe { *raw.cast::<ACE_HEADER>() };
             let kind = match u32::from(header.AceType) {
-                t if t == ACCESS_ALLOWED_ACE_TYPE.0 => AceKind::Allow,
-                t if t == ACCESS_DENIED_ACE_TYPE.0 => AceKind::Deny,
+                ACCESS_ALLOWED_ACE_TYPE => AceKind::Allow,
+                ACCESS_DENIED_ACE_TYPE => AceKind::Deny,
                 _ => AceKind::Other,
             };
-            // Both ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE lay out `{header, mask, sid_start}`
-            // identically, so one cast reads either. Audit/callback ACEs share the prefix too, and
-            // their mask is never consulted because `kind` is `Other`.
-            // SAFETY: as above — the ACE is at least as large as this prefix.
-            let ace = unsafe { &*raw.cast::<ACCESS_ALLOWED_ACE>() };
-            let sid = unsafe { sid_string(std::ptr::addr_of!(ace.SidStart).cast()) }?;
+            // Only the two basic types are parsed past the header, and that restriction is load
+            // bearing rather than an optimization: the OBJECT and CALLBACK_OBJECT variants carry
+            // extra `Flags`/GUID fields BEFORE their trailing SID, so reading them at the basic
+            // layout's offset would yield a SID from the wrong bytes — which could resolve to a
+            // privileged principal and silently excuse a permissive grant. Every unparsed type is
+            // an audit/alarm/object ACE, none of which can produce a finding.
+            if kind == AceKind::Other {
+                out.push(Ace {
+                    kind,
+                    sid: String::new(),
+                    mask: 0,
+                    inherit_only: header.AceFlags & super::INHERIT_ONLY_ACE != 0,
+                });
+                continue;
+            }
+            // ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE lay out `{header, mask, sid_start}`
+            // identically, so one layout reads either.
+            // SAFETY: as above — the ACE is at least as large as this prefix, and the offsets are
+            // taken from the struct itself rather than assumed.
+            let mask = unsafe { (*raw.cast::<ACCESS_ALLOWED_ACE>()).Mask };
+            let sid_offset = core::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            // SAFETY: `SidStart` is the first byte of the ACE's trailing SID, in bounds of the ACE.
+            let sid = unsafe { sid_string(raw.byte_add(sid_offset)) }?;
             out.push(Ace {
                 kind,
                 sid,
-                mask: ace.Mask.0,
+                mask,
                 inherit_only: header.AceFlags & super::INHERIT_ONLY_ACE != 0,
             });
         }
@@ -371,7 +385,10 @@ mod tests {
 
     #[test]
     fn a_stock_install_root_is_accepted() {
-        assert_eq!(judge(&stock_program_files()), DaclVerdict::PrivilegedWriteOnly);
+        assert_eq!(
+            judge(&stock_program_files()),
+            DaclVerdict::PrivilegedWriteOnly
+        );
     }
 
     #[test]
@@ -440,6 +457,45 @@ mod tests {
     }
 
     #[test]
+    fn every_unprivileged_well_known_group_is_a_finding() {
+        // The allowlist is an ALLOWlist, so this pins the groups an attacker could actually be a
+        // member of. It fails the moment one of them is added to `PRIVILEGED_SIDS` — which is the
+        // single edit that would silently reopen the hole this module exists to close.
+        for sid in [
+            // Everyone / World.
+            "S-1-1-0",
+            // Authenticated Users.
+            "S-1-5-11",
+            // BUILTIN\Users.
+            USERS,
+            // INTERACTIVE — every principal logged on at the console.
+            "S-1-5-4",
+            // A concrete unprivileged local account.
+            "S-1-5-21-1111111111-2222222222-3333333333-1001",
+        ] {
+            assert_eq!(
+                judge(&Dacl::Present(vec![Ace::allow(sid, FULL)])),
+                DaclVerdict::UnprivilegedWrite {
+                    sid: sid.to_string()
+                },
+                "{sid} must not hold write access to a privileged install root"
+            );
+        }
+    }
+
+    #[test]
+    fn file_all_access_for_an_unprivileged_group_is_a_finding() {
+        // The composite mask a real misconfiguration carries, as opposed to the single bits above:
+        // a check written against one named bit rather than `& WRITE_EQUIVALENT` could miss it.
+        assert_eq!(
+            judge(&Dacl::Present(vec![Ace::allow(USERS, FULL)])),
+            DaclVerdict::UnprivilegedWrite {
+                sid: USERS.to_string()
+            }
+        );
+    }
+
+    #[test]
     fn a_deny_ace_neutralizes_the_matching_grant() {
         // An administrator who hardened an inherited `Users:(W)` with an explicit deny has a SAFE
         // directory; flagging it would refuse to install on a machine that is more locked down
@@ -464,6 +520,46 @@ mod tests {
             ])),
             DaclVerdict::UnprivilegedWrite {
                 sid: USERS.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_deny_is_subtracted_whichever_side_of_the_grant_it_sits() {
+        // Windows evaluates ACEs in order, so a DENY placed AFTER an ALLOW does not actually take
+        // away what the ALLOW already granted. This check subtracts it anyway, and does so on
+        // purpose: the strict reading would flag a directory whose administrator plainly INTENDED
+        // to deny, and a false refusal here stops the machine updating at all. Producing such a
+        // DACL already requires the write access this check is looking for.
+        let denied_first = judge(&Dacl::Present(vec![
+            Ace::deny(USERS, rights::WRITE_EQUIVALENT),
+            Ace::allow(USERS, FULL),
+        ]));
+        let allowed_first = judge(&Dacl::Present(vec![
+            Ace::allow(USERS, FULL),
+            Ace::deny(USERS, rights::WRITE_EQUIVALENT),
+        ]));
+        assert_eq!(denied_first, DaclVerdict::PrivilegedWriteOnly);
+        assert_eq!(
+            allowed_first, denied_first,
+            "ACE order must not change the verdict"
+        );
+    }
+
+    #[test]
+    fn a_grant_after_a_clean_prefix_is_still_found() {
+        // Enumeration must not stop at the first non-finding ACE, nor at the first DENY: the
+        // permissive grant is at the END here, behind entries that each look fine alone.
+        let mut aces = match stock_program_files() {
+            Dacl::Present(aces) => aces,
+            Dacl::Absent => unreachable!(),
+        };
+        aces.push(Ace::deny(APP_PACKAGES, rights::WRITE_EQUIVALENT));
+        aces.push(Ace::allow("S-1-5-11", rights::WRITE_DAC));
+        assert_eq!(
+            judge(&Dacl::Present(aces)),
+            DaclVerdict::UnprivilegedWrite {
+                sid: "S-1-5-11".to_string()
             }
         );
     }

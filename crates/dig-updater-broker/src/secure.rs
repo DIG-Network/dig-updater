@@ -281,9 +281,6 @@ fn windows_dacl_is_privileged(path: &Path) -> bool {
             );
             false
         }
-        // `read` never yields this; matched so a future reader that does cannot silently be
-        // treated as a clean DACL.
-        DaclVerdict::Unreadable => true,
     }
 }
 

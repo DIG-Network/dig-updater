@@ -530,6 +530,14 @@ file (`schedule-optout`) inside the Admin/SYSTEM-only state directory (§13.1):
 - The sentinel MUST live in the Admin/SYSTEM-only state dir (never the dry-check-relocatable one) so
   a non-privileged process cannot FORGE it to suppress auto-updates — an update-suppression /
   stale-pin vector. Its mere presence is the entire signal; its contents carry no trust.
+- "Admin/SYSTEM-only" is a statement about who can WRITE the directory, not only about who OWNS it.
+  On Windows the implementation MUST therefore check the directory's DACL in addition to its owner
+  SID: an `Administrators`-owned directory can still carry an ACE granting write-equivalent access
+  (`FILE_WRITE_DATA`, `FILE_APPEND_DATA`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`, `GENERIC_WRITE`,
+  `GENERIC_ALL`) to an unprivileged principal such as `Users`, and a NULL DACL grants every
+  principal full control while enumerating as no entries at all. A DACL that could not be read is an
+  absence of evidence and MUST NOT be reported as a clean one; it leaves the owner check standing
+  alone rather than rejecting, because a false refusal here stops the host updating entirely.
 
 The always-on driver kicks `schedule ensure` but NEVER touches the OS scheduler directly and NEVER
 decides opt-out — the beacon remains the sole authority over the schedule artifact and honors the
