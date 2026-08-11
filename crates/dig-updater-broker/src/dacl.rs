@@ -197,7 +197,11 @@ fn an_everyone_deny_is_reached_by(granted_sid: &str) -> bool {
 /// owner is `BUILTIN\Administrators`, and the daily task creates the binary as SYSTEM — and turns
 /// live only where the "Default owner for objects created by members of the Administrators group"
 /// policy is set to Object creator. The durable answer is to judge the binary that EXISTS after an
-/// update writes it, which the caller's second leg already does (dig_ecosystem#2740).
+/// update writes it — and NO leg does that today. The caller's second leg judges a binary that
+/// exists, but only the one present at REGISTRATION time: `ensure` re-runs the guard solely on
+/// [`crate::scheduler::EnsureAction::Reregistered`], which it reaches only when the schedule is
+/// absent, so an update that replaces the image under an already-registered schedule is never
+/// re-judged. Closing that residue is dig_ecosystem#2740.
 ///
 /// Every other principal —
 /// including `Users`, `Authenticated Users`, `Everyone`, `LOCAL SERVICE` and `NETWORK SERVICE` —

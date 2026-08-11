@@ -322,8 +322,8 @@ const REMEDY: &str = if cfg!(windows) {
 /// and the sentence collapses into "the image of this SYSTEM/root daily task runs". Two of the three
 /// variants shipped that way, because a template is exactly the shape where the seam is invisible in
 /// the source and only appears once rendered — so
-/// [`tests::the_refusal_reads_as_prose_an_operator_can_act_on`] asserts the joined phrase across the
-/// seam, per variant, and rejects the dangling-preposition class outright.
+/// `the_refusal_reads_as_prose_an_operator_can_act_on` asserts the joined phrase across the seam,
+/// per variant, and rejects the dangling-preposition class outright.
 ///
 /// The diagnosis and the remedy are platform-selected ([`BINARY_IS_ITS_OWN_OBJECT`],
 /// [`HOW_TO_SEE_THE_PRINCIPAL`], [`REMEDY`]): this guard runs on all three operating systems, so a
