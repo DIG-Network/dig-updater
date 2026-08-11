@@ -125,6 +125,7 @@ pub fn install(exe: &Path, state_dir: &Path) -> Result<(), BrokerError> {
         exe,
         state_dir,
         crate::secure::path_is_privileged_owned,
+        crate::secure::dir_creates_privileged_files_only,
         imp::install,
     )
 }
@@ -139,9 +140,10 @@ fn install_with(
     exe: &Path,
     state_dir: &Path,
     is_privileged: impl Fn(&Path) -> bool,
+    creates_privileged_files_only: impl Fn(&Path) -> bool,
     register: impl FnOnce(&Path) -> Result<(), BrokerError>,
 ) -> Result<(), BrokerError> {
-    refuse_unprivileged_exe_dir(exe, is_privileged)?;
+    refuse_unprivileged_exe_dir(exe, is_privileged, creates_privileged_files_only)?;
     register(exe)?;
     crate::optout::clear_opted_out(state_dir)
 }
@@ -150,24 +152,42 @@ fn install_with(
 /// privileged-owned (dig_ecosystem#2334, the §565 "privileged artifact whose path is user-controlled"
 /// class).
 ///
-/// The daily task runs `exe` as SYSTEM/root forever with no further prompt. If the directory holding
-/// `exe` is user-writable (a portable / user-directory install), one UAC/sudo approval becomes a
-/// PERMANENT elevated foothold: whoever can later write that directory replaces the binary, and the
-/// task runs the replacement elevated. So registration is allowed ONLY from an install root that is
-/// restricted to privileged identities, checked via the injected `is_privileged` (production:
-/// [`crate::secure::path_is_privileged_owned`], which tests BOTH the directory's owner AND its DACL
-/// — an Administrators-owned directory carrying a write ACE for `Users` is just as replaceable).
+/// The daily task runs `exe` as SYSTEM/root forever with no further prompt, so one UAC/sudo approval
+/// becomes a PERMANENT elevated foothold for anyone who can later write the image it runs.
 ///
-/// `is_privileged` is injected so the decision is deterministically testable without depending on the
-/// test runner's uid or filesystem ownership.
+/// # Three objects, because replacing a binary needs write on the FILE
+///
+/// On Windows a directory and the file inside it are INDEPENDENT securable objects, and the file's
+/// own DACL governs opening the file. This guard originally checked only the parent directory, on the
+/// premise that "whoever can later write that directory replaces the binary" — which is false, and
+/// measured to be false: with the install root DACLed to Administrators + SYSTEM only and
+/// `dig-updater.exe` inside it carrying `Users:F`, an unelevated non-administrator process OPENED AND
+/// OVERWROTE the image. `SeChangeNotifyPrivilege` is granted to Everyone by default, so traverse is
+/// not the obstacle; the child's DACL is what decides.
+///
+/// So all three questions are asked, and every one of them has to pass:
+///
+/// 1. **the parent directory** — a writer of the directory can rename the binary aside and put its
+///    own there, without ever writing the original file;
+/// 2. **`exe` itself** — a writer of the file replaces the image in place (the leg that was missing);
+/// 3. **the files the parent CREATES** (`creates_privileged_files_only`) — the binary is re-created by
+///    a copy on EVERY update, long after this guard has run, so an inheritable grant on the root
+///    hands the next installed binary away even when both checks above pass today
+///    ([`crate::secure::dir_creates_privileged_files_only`]).
+///
+/// Both predicates are injected so the decision is deterministically testable without depending on
+/// the test runner's uid or filesystem ownership. In production they are
+/// [`crate::secure::path_is_privileged_owned`] — which tests BOTH an object's owner AND its DACL —
+/// and [`crate::secure::dir_creates_privileged_files_only`].
 ///
 /// # Errors
 ///
-/// [`BrokerError::Io`] if `exe` has no parent directory, or if that directory is not restricted to
-/// privileged identities.
+/// [`BrokerError::Io`] if `exe` has no parent directory, or if any of the three objects above is not
+/// restricted to privileged identities.
 fn refuse_unprivileged_exe_dir(
     exe: &Path,
     is_privileged: impl Fn(&Path) -> bool,
+    creates_privileged_files_only: impl Fn(&Path) -> bool,
 ) -> Result<(), BrokerError> {
     let dir = exe.parent().ok_or_else(|| {
         BrokerError::Io(format!(
@@ -177,18 +197,48 @@ fn refuse_unprivileged_exe_dir(
         ))
     })?;
     if !is_privileged(dir) {
-        return Err(BrokerError::Io(format!(
-            "refusing to register a SYSTEM/root daily schedule for a binary in {}: that directory \
-             is not restricted to privileged identities — either it is not owned by one, or its \
-             DACL grants write-equivalent access to one that is not (any preceding warning names \
-             the offending SID). Either way a later writer of it could replace the binary this \
-             SYSTEM/root daily task runs, turning one elevation approval into a permanent elevated \
-             foothold. Take privileged ownership of the directory AND remove any write grant to a \
-             non-privileged principal, or register only from an install root that already is both",
-            dir.display()
-        )));
+        return Err(refusal(
+            dir,
+            "that directory is not restricted to privileged identities — either it is not owned by \
+             one, or its DACL grants write-equivalent access to one that is not",
+            "a later writer of it could put its own binary there in place of the one",
+        ));
+    }
+    if !is_privileged(exe) {
+        return Err(refusal(
+            exe,
+            "that BINARY is not restricted to privileged identities, even though its directory is \
+             — on Windows a file and its directory are independent objects, and the file's own DACL \
+             is what governs writing it",
+            "a later writer of it could overwrite the image of",
+        ));
+    }
+    if !creates_privileged_files_only(dir) {
+        return Err(refusal(
+            dir,
+            "that directory hands every file created in it write-equivalent access for a \
+             non-privileged principal, through an inheritable ACE",
+            "the next update would re-create, and hand away, the binary of",
+        ));
     }
     Ok(())
+}
+
+/// The one refusal message, parameterised by WHICH object failed and WHAT that lets an attacker do.
+///
+/// Three near-identical strings would drift, and the operator needs the specific object named: the
+/// remedy for a directory ACE is not the remedy for a file ACE. `cause` completes "…: <cause> …" and
+/// `consequence` completes "…so <consequence> this SYSTEM/root daily task runs…", so each reads as
+/// one sentence rather than as a template.
+fn refusal(object: &Path, cause: &str, consequence: &str) -> BrokerError {
+    BrokerError::Io(format!(
+        "refusing to register a SYSTEM/root daily schedule for {}: {cause} (any preceding warning \
+         names the offending SID), so {consequence} this SYSTEM/root daily task runs, turning one \
+         elevation approval into a permanent elevated foothold. Take privileged ownership AND \
+         remove every write grant to a non-privileged principal, on BOTH the install root and the \
+         binary in it, or register only from an install root that already is both",
+        object.display()
+    ))
 }
 
 /// Remove the daily scheduler artifact and RECORD a deliberate opt-out. Idempotent: removing an
@@ -290,6 +340,7 @@ pub fn ensure(exe: &Path, state_dir: &Path) -> Result<EnsureAction, BrokerError>
         state_dir,
         || Ok(imp::status()?.presence),
         crate::secure::path_is_privileged_owned,
+        crate::secure::dir_creates_privileged_files_only,
         imp::install,
     )
 }
@@ -306,6 +357,7 @@ fn ensure_with(
     state_dir: &Path,
     presence: impl FnOnce() -> Result<SchedulePresence, BrokerError>,
     is_privileged: impl Fn(&Path) -> bool,
+    creates_privileged_files_only: impl Fn(&Path) -> bool,
     register: impl FnOnce(&Path) -> Result<(), BrokerError>,
 ) -> Result<EnsureAction, BrokerError> {
     if crate::optout::is_opted_out(state_dir) {
@@ -313,7 +365,7 @@ fn ensure_with(
     }
     let action = ensure_decision(presence()?);
     if action == EnsureAction::Reregistered {
-        refuse_unprivileged_exe_dir(exe, is_privileged)?;
+        refuse_unprivileged_exe_dir(exe, is_privileged, creates_privileged_files_only)?;
         register(exe)?;
     }
     Ok(action)
@@ -1010,7 +1062,7 @@ mod tests {
         // one elevation approval becomes a permanent foothold. The guard must REFUSE and name the
         // exact directory so the operator can see which install root was rejected.
         let exe = exe_with_parent();
-        let err = refuse_unprivileged_exe_dir(&exe, |_dir| false)
+        let err = refuse_unprivileged_exe_dir(&exe, |_object| false, |_dir| true)
             .expect_err("a non-privileged-owned exe directory must be refused");
         let msg = err.to_string();
         assert!(
@@ -1024,26 +1076,83 @@ mod tests {
     }
 
     #[test]
-    fn refuse_unprivileged_exe_dir_checks_the_directory_not_the_binary() {
-        // The property being guarded is DIRECTORY ownership — a later writer of the dir swaps the
-        // binary. The predicate must be handed the parent dir, never the exe itself (a fix that
-        // checked the binary's own path would satisfy an outcome-only test but miss the real threat).
+    fn the_guard_checks_the_binary_as_well_as_its_directory() {
+        // This test replaces `refuse_unprivileged_exe_dir_checks_the_directory_not_the_binary`,
+        // which asserted the OPPOSITE — that the predicate is handed the parent dir "never the exe
+        // itself" — and called a fix that checked the binary "a miss of the real threat". That was
+        // backwards, and it is the most valuable line in this diff to correct: a test pinning wrong
+        // behaviour is the artefact someone cites to argue no fix is needed.
+        //
+        // The premise it encoded ("a later writer of the DIR swaps the binary, so the dir is the
+        // object") is false on Windows, where a file and its directory are independent securable
+        // objects. MEASURED: an install root DACLed to Administrators + SYSTEM only, holding an
+        // `app.exe` whose own DACL granted `Users:F`, was OVERWRITTEN by an unelevated
+        // non-administrator process. The old guard called that root clean.
         let exe = exe_with_parent();
         let seen = RefCell::new(Vec::new());
-        let _ = refuse_unprivileged_exe_dir(&exe, |dir| {
-            seen.borrow_mut().push(dir.to_path_buf());
-            true
-        });
+
+        let _ = refuse_unprivileged_exe_dir(
+            &exe,
+            |object| {
+                seen.borrow_mut().push(object.to_path_buf());
+                true
+            },
+            |_dir| true,
+        );
+
         assert_eq!(
             seen.borrow().as_slice(),
-            &[PathBuf::from("/opt/dig/bin")],
-            "the guard must check the exe's PARENT directory, not the exe path"
+            &[
+                PathBuf::from("/opt/dig/bin"),
+                PathBuf::from("/opt/dig/bin/dig-updater")
+            ],
+            "the guard must judge BOTH the parent directory and the binary itself, in that order"
+        );
+    }
+
+    #[test]
+    fn a_binary_an_unprivileged_principal_can_overwrite_is_refused_even_inside_a_clean_root() {
+        // The outcome half of the test above, and the one that would have caught the missing leg
+        // without inspecting which paths were probed: the directory answers privileged, the BINARY
+        // does not, and registration must still refuse.
+        let exe = exe_with_parent();
+        let err = refuse_unprivileged_exe_dir(
+            &exe,
+            |object| object == Path::new("/opt/dig/bin"),
+            |_dir| true,
+        )
+        .expect_err("a writable binary inside a clean root must still be refused")
+        .to_string();
+
+        assert!(
+            err.contains("/opt/dig/bin/dig-updater"),
+            "the refusal must name the BINARY, not just its directory: {err}"
+        );
+        assert!(
+            err.contains("BINARY"),
+            "the refusal must say which object failed, so the operator fixes the right one: {err}"
+        );
+    }
+
+    #[test]
+    fn a_root_whose_inheritable_ace_hands_away_every_new_binary_is_refused() {
+        // The third object: both paths pass TODAY, and every file created in the root inherits a
+        // write grant for a non-privileged principal. The binary is re-created by a copy on every
+        // update, long after this guard has run, so passing here would license exactly the shape
+        // `dacl::judge_files_created_in` exists to catch.
+        let err = refuse_unprivileged_exe_dir(&exe_with_parent(), |_object| true, |_dir| false)
+            .expect_err("a root that hands away the files created in it must be refused")
+            .to_string();
+
+        assert!(
+            err.contains("inheritable ACE"),
+            "the refusal must name the inheritable ACE as the cause: {err}"
         );
     }
 
     #[test]
     fn refuse_unprivileged_exe_dir_allows_a_privileged_owned_dir() {
-        refuse_unprivileged_exe_dir(&exe_with_parent(), |_dir| true)
+        refuse_unprivileged_exe_dir(&exe_with_parent(), |_object| true, |_dir| true)
             .expect("a privileged-owned install root must be allowed");
     }
 
@@ -1056,34 +1165,70 @@ mod tests {
         // mid-sentence when a `\n` escape was written where a line-continuation belonged. Neither
         // is visible to `cargo fmt`, and neither changes behaviour, so only an assertion on the
         // RENDERED text catches them.
-        let err = refuse_unprivileged_exe_dir(&exe_with_parent(), |_dir| false)
-            .expect_err("a non-privileged directory must be refused")
-            .to_string();
+        // All THREE refusal variants, because they share one builder and a template is exactly the
+        // shape where two read well and the third comes out mangled.
+        let exe = exe_with_parent();
+        let variants = [
+            (
+                "the directory",
+                refuse_unprivileged_exe_dir(&exe, |_object| false, |_dir| true),
+            ),
+            (
+                "the binary",
+                refuse_unprivileged_exe_dir(
+                    &exe,
+                    |object| object == Path::new("/opt/dig/bin"),
+                    |_dir| true,
+                ),
+            ),
+            (
+                "the inheritable ACE",
+                refuse_unprivileged_exe_dir(&exe, |_object| true, |_dir| false),
+            ),
+        ];
 
-        assert!(
-            !err.contains("  "),
-            "the message must not carry a run of spaces from a broken line continuation: {err}"
-        );
-        assert!(
-            !err.contains('\n'),
-            "the message must be one flowing line, not hard-wrapped source: {err}"
-        );
-        for doubled in ["is is", "the the", "a a ", "of of"] {
+        for (which, refusal) in variants {
+            let err = refusal
+                .expect_err("each variant under test must refuse")
+                .to_string();
+
             assert!(
-                !err.contains(doubled),
-                "the message repeats {doubled:?} across a continuation seam: {err}"
+                !err.contains("  "),
+                "{which}: the message must not carry a run of spaces from a broken line \
+                 continuation: {err}"
             );
-        }
-        // Both causes and both remedies, because the caller cannot tell them apart (the predicate
-        // is a bool) and acting on the wrong one changes nothing.
-        for expected in [
-            "not owned by one",
-            "dacl grants",
-            "take privileged ownership",
-        ] {
             assert!(
-                err.to_lowercase().contains(expected),
-                "the message must name {expected:?} so the operator knows what to fix: {err}"
+                !err.contains('\n'),
+                "{which}: the message must be one flowing line, not hard-wrapped source: {err}"
+            );
+            for doubled in ["is is", "the the", "a a ", "of of"] {
+                assert!(
+                    !err.contains(doubled),
+                    "{which}: the message repeats {doubled:?} across a continuation seam: {err}"
+                );
+            }
+            // The remedy has to name BOTH objects in every variant: the operator cannot tell from a
+            // bool predicate which one is at fault, and fixing only the named one leaves the guard
+            // refusing for the other reason on the next run.
+            for expected in ["take privileged ownership", "install root and the binary"] {
+                assert!(
+                    err.to_lowercase().contains(expected),
+                    "{which}: the message must name {expected:?} so the operator knows what to fix: \
+                     {err}"
+                );
+            }
+        }
+
+        // And the directory variant keeps naming both of ITS causes, which are indistinguishable to
+        // the caller: an owner that is not privileged, or a DACL that grants one that is not.
+        let dir_refusal = refuse_unprivileged_exe_dir(&exe, |_object| false, |_dir| true)
+            .expect_err("a non-privileged directory must be refused")
+            .to_string()
+            .to_lowercase();
+        for expected in ["not owned by one", "dacl grants"] {
+            assert!(
+                dir_refusal.contains(expected),
+                "the directory refusal must name {expected:?}: {dir_refusal}"
             );
         }
     }
@@ -1091,7 +1236,7 @@ mod tests {
     #[test]
     fn refuse_unprivileged_exe_dir_errors_legibly_when_exe_has_no_parent() {
         // A root path has no parent directory to verify — refuse legibly rather than panic/unwrap.
-        let err = refuse_unprivileged_exe_dir(Path::new("/"), |_dir| true)
+        let err = refuse_unprivileged_exe_dir(Path::new("/"), |_object| true, |_dir| true)
             .expect_err("a parentless exe path cannot be verified and must be refused");
         assert!(
             err.to_string().contains("parent"),
@@ -1108,7 +1253,8 @@ mod tests {
         let err = install_with(
             &exe_with_parent(),
             state.path(),
-            |_dir| false,
+            |_object| false,
+            |_dir| true,
             |_exe| {
                 *registered.borrow_mut() = true;
                 Ok(())
@@ -1129,6 +1275,7 @@ mod tests {
         install_with(
             &exe_with_parent(),
             state.path(),
+            |_object| true,
             |_dir| true,
             |_exe| {
                 *registered.borrow_mut() = true;
@@ -1153,7 +1300,8 @@ mod tests {
             &exe_with_parent(),
             state.path(),
             || Ok(SchedulePresence::Absent),
-            |_dir| false,
+            |_object| false,
+            |_dir| true,
             |_exe| {
                 *registered.borrow_mut() = true;
                 Ok(())
@@ -1175,6 +1323,7 @@ mod tests {
             &exe_with_parent(),
             state.path(),
             || Ok(SchedulePresence::Absent),
+            |_object| true,
             |_dir| true,
             |_exe| {
                 *registered.borrow_mut() = true;
@@ -1200,6 +1349,10 @@ mod tests {
             &exe_with_parent(),
             state.path(),
             || Ok(SchedulePresence::Registered),
+            |_object| {
+                *guard_consulted.borrow_mut() = true;
+                false
+            },
             |_dir| {
                 *guard_consulted.borrow_mut() = true;
                 false
@@ -1224,13 +1377,23 @@ mod tests {
         let exe = dir.path().join("dig-updater");
         std::fs::write(&exe, b"binary").expect("write a fake exe");
 
-        let dir_is_privileged = crate::secure::path_is_privileged_owned(dir.path());
-        let guard = refuse_unprivileged_exe_dir(&exe, crate::secure::path_is_privileged_owned);
+        // The expectation is the CONJUNCTION over all three objects the guard now judges, not the
+        // directory's verdict alone as it was while the guard checked only the directory. Left as it
+        // was, this test would have contradicted the CF1 fix on an elevated runner: the tempdir
+        // answers privileged and the freshly-written exe need not.
+        let every_object_is_privileged = crate::secure::path_is_privileged_owned(dir.path())
+            && crate::secure::path_is_privileged_owned(&exe)
+            && crate::secure::dir_creates_privileged_files_only(dir.path());
+        let guard = refuse_unprivileged_exe_dir(
+            &exe,
+            crate::secure::path_is_privileged_owned,
+            crate::secure::dir_creates_privileged_files_only,
+        );
         assert_eq!(
             guard.is_ok(),
-            dir_is_privileged,
-            "the guard must allow iff the production predicate deems the exe's directory \
-             privileged-owned"
+            every_object_is_privileged,
+            "the guard must allow iff the production predicates deem the directory, the binary AND \
+             the files that directory creates all privileged"
         );
     }
 
