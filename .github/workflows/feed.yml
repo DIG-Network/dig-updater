@@ -89,6 +89,11 @@ on:
     paths:
       - "feed-config.json"
   workflow_dispatch:
+    inputs:
+      audit_freshness:
+        description: "Also audit the SERVED feed against each repo's release (see the audit-freshness job)"
+        type: boolean
+        default: false
 
 concurrency:
   group: feed
@@ -181,14 +186,25 @@ jobs:
   #
   # NOTE ON A TRANSIENT RED: in the minutes between a release publishing and the feed it triggered
   # finishing its re-sign, the feed genuinely IS serving the older version, and this will say so.
-  # That report is true, not a false alarm; re-run the job once the feed run completes.
+  # That report is true, not a false alarm; re-run the audit once the feed run completes.
   audit-freshness:
     name: Audit feed freshness
-    # The daily audit cron + manual dispatch. NOT the 6-hourly signing heartbeat (this is not part of
-    # the signing cadence), and NOT pull_request — a PR cannot change what the live feed serves, and
-    # a PR that ADDS a component would red for a component the feed has not carried yet.
+    # The daily audit cron, plus a manual dispatch that OPTS IN via the `audit_freshness` input.
+    #
+    # Opt-in rather than always-on for manual runs, because the commonest reason to dispatch this
+    # workflow by hand is precisely that the feed IS stale and you want it re-signed. This job reads
+    # the LIVE feed and does not depend on `sign-verify-publish`, so on such a run it would read the
+    # not-yet-refreshed feed and red the run that was fixing the problem — training everyone to
+    # ignore a red here, which is exactly how the alarm this ticket added would stop being read.
+    #
+    # It stays independent of the signing job on purpose (see the guard test): coupling it with
+    # `needs:` would put a read-only audit on the signing path, where a GitHub blip that reds it
+    # could interfere with signing or serving the live feed.
+    #
+    # NOT the 6-hourly signing heartbeat, and NOT pull_request — a PR cannot change what the live
+    # feed serves, and a PR that ADDS a component would red for one the feed has not carried yet.
     if: >-
-      github.event_name == 'workflow_dispatch'
+      (github.event_name == 'workflow_dispatch' && inputs.audit_freshness)
       || (github.event_name == 'schedule' && github.event.schedule == '17 4 * * *')
     runs-on: ubuntu-latest
     permissions:
