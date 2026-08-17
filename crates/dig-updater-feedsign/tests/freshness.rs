@@ -284,3 +284,38 @@ fn a_malformed_served_manifest_is_rejected() {
         "a malformed served manifest must be an error, never an empty-but-usable feed view"
     );
 }
+
+/// A real combined state — part of GitHub unreachable while another component is genuinely stale.
+/// The report must keep the two KINDS distinct rather than collapsing them into one count, because
+/// they demand different responses: one means fix the feed, the other means the audit does not know.
+#[test]
+fn diverged_and_unchecked_components_are_reported_as_different_kinds() {
+    let config = FeedConfig::from_json(
+        r#"{
+            "schema": 2, "root_version": 1,
+            "manifest_ttl_secs": 43200, "delegation_ttl_secs": 2592000,
+            "channels": { "stable": 0, "nightly": 0 },
+            "components": [
+                { "name": "widget", "repo": "DIG-Network/widget", "asset_prefix": "widget" },
+                { "name": "gadget", "repo": "DIG-Network/gadget", "asset_prefix": "widget" }
+            ]
+        }"#,
+    )
+    .expect("the two-component config must parse");
+
+    // `widget` resolves and is a release behind; `gadget` cannot be reached at all.
+    let audit = audit_freshness(
+        &config,
+        &FakeSource::new(&[("DIG-Network/widget", "1.2.3")]),
+        &served(&[("widget", "1.2.2"), ("gadget", "4.5.6")]),
+        Channel::Stable,
+    );
+    let report = audit.render();
+
+    assert!(!audit.is_clean(), "neither state is healthy:\n{report}");
+    assert!(
+        report.contains("DIVERGED") && report.contains("UNCHECKED"),
+        "the report must distinguish a proven divergence from a component it could not check — \
+         collapsing them would hide that part of the answer is simply unknown:\n{report}"
+    );
+}
