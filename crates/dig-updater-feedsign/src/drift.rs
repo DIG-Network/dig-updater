@@ -58,7 +58,7 @@
 //!   dispatch of dig_ecosystem#2125) leaves `releases/latest` on the old version, so the feed agrees
 //!   with it and this check is honestly green. That is a different HOP of the same predicate —
 //!   *declared* version vs *released* version — and it can only be checked in the releasing repo,
-//!   which is why it is not here. See the crate docs and dig_ecosystem#3047.
+//!   which is why it is not here. See the crate docs and dig_ecosystem#3104.
 
 use crate::channel::Channel;
 use crate::config::FeedConfig;
