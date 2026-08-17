@@ -1168,6 +1168,12 @@ reproducible. The two channels are independent: signing/publishing one never gat
 the nightly leg failing (e.g. a component without a rolling `nightly` release yet) can never stall
 the stable feed.
 
+The 6-hour cadence bounds FRESHNESS (a client is never left without an unexpired manifest); it does
+NOT bound LATENCY. A component released just after a run is absent from the served feed until the
+next one — up to six hours in which the feed is validly signed, unexpired, and simply describes an
+older world. Nothing in the signing pipeline can observe that, because every workflow involved has
+already succeeded. Closing that window is `feed-drift.yml`'s job (§10.9).
+
 ### 10.3 What the manifest states — per-channel selection
 
 For every configured component the signer resolves that channel's GitHub release, selects the
@@ -1337,6 +1343,39 @@ the beacon's own native packages, the installer's registration of the beacon ser
 `dig-node` updater RPC proxy are follow-up tickets (§12).
 
 ---
+
+### 10.9 Drift — the served feed vs the releases it claims to describe (normative)
+
+The feed MUST serve, for every configured component, the version that component's channel release
+currently supplies. A served feed that disagrees is BEHIND, and is an outage of the update system
+even though it is validly signed and unexpired: beacons cannot install a release the manifest does
+not mention.
+
+`feedsign drift` checks that predicate, per component and per channel:
+
+> the version this component's channel release supplies  ==  the version the live feed serves
+
+The released side is resolved by the SAME `resolve_all` the signer drives, so the check cannot
+disagree with what a regenerated feed would contain. The served side is the `version` field of the
+manifest fetched from `{feed_base}/{channel}/manifest.json` (§10.1). It reads no signing key and
+downloads no artifact, which is what allows it to run on a short interval unprivileged.
+
+It MUST fail closed. A component whose release cannot be resolved is reported `unknown` and counts
+AGAINST the verdict — never skipped — because skipping it would let one unreachable release mask
+every other component's staleness. An unreadable or malformed served manifest is an error, never an
+empty drift list.
+
+It distinguishes what a regeneration would FIX (`regenerable`): a version mismatch or a missing
+component is a stale published document, which a fresh signing pass replaces; an `unknown` is not,
+because the signer would fail on it identically. An automated responder MUST key on `regenerable`
+before dispatching, or a fault regeneration cannot clear would queue Feed runs behind the `feed`
+concurrency group indefinitely.
+
+This is distinct from `feedsign doctor` (dig_ecosystem#2115), which validates a feed's
+INPUTS — whether each component's declared assets resolve. Doctor is green during a drift outage,
+because the releases are fine and only the published document is stale. Doctor checks what would go
+into a feed; drift checks what beacons are actually being served.
+
 
 ## 11. Security properties (summary of invariants)
 
@@ -1882,6 +1921,7 @@ tags/releases.
 | `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the STABLE GitHub Release for a `vX.Y.Z` tag (`make_latest: true`, branch-agnostic). |
 | `build-binaries.yml` | `workflow_call` | The reusable cross-OS build both channels invoke. |
 | `feed.yml` | `schedule` (every 6h) + dispatch | UNRELATED to this repo's release — signs the update FEED the beacon reads for OTHER components (§10). |
+| `feed-drift.yml` | `schedule` (every 15m) + dispatch | Compares the LIVE served feed against each component's release and dispatches `feed.yml` when it is behind — bounding how long a released version stays invisible (§10.9). Holds no signing key. |
 
 ### 14.7 Release-branch cut + `release/*` protection
 

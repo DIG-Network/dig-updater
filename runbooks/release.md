@@ -5,6 +5,22 @@ ecosystem's **reference release-branch system** (epic #1049); the normative cont
 §14. It is distinct from the signed **feed** (`feed.yml`, `SPEC.md` §10), which is how the beacon
 reads updates for OTHER components — see `SPEC.md` §10 for the feed.
 
+> **If a release is not showing up for clients**, the feed is probably stale rather than broken. The
+> feed regenerates on a 6-hour cron, so a component released just after a run is invisible until the
+> next one. `feed-drift.yml` now detects that within ~15 minutes and dispatches `feed.yml` itself, so
+> the usual answer is to wait for it. To check by hand:
+>
+> ```sh
+> cargo run -p dig-updater-feedsign -- drift --channel stable        # human-readable
+> cargo run -p dig-updater-feedsign -- drift --channel stable --json # `.regenerable` drives the responder
+> ```
+>
+> It exits non-zero when the served feed disagrees with the releases, needs no signing key, and names
+> both versions per component. To force a regeneration:
+> `gh api --method POST /repos/DIG-Network/dig-updater/actions/workflows/feed.yml/dispatches -f ref=main`
+> (REST, not `gh workflow run` — the CLI path goes through GraphQL, which is the first thing to fail
+> during a GitHub incident).
+
 ## The two version streams (read this first)
 
 There are TWO independent version streams, and they never collide:
