@@ -3,7 +3,7 @@
 //! The `dig-updater-feedsign` CI binary: assemble + sign the beacon feed, write it out, print a
 //! secret-free summary.
 //!
-//! ## Three modes
+//! ## Four modes
 //!
 //! - **`doctor`** (subcommand, or `--doctor`) — validate `feed-config.json` against each component's
 //!   LIVE releases for a channel WITHOUT any signing key (dig_ecosystem#2115), printing a
@@ -17,6 +17,12 @@
 //!   only a subset of channels is a NON-failing informational note (the exemption stays load-bearing
 //!   for the channels that lack it). Reads `--config`/`GITHUB_TOKEN` only; always sweeps both
 //!   channels. A PR/scheduled drift guard.
+//! - **`drift`** (subcommand, or `--drift`) — compare the versions a channel's releases supply
+//!   against the versions the LIVE feed at `--feed-base` actually serves (dig_ecosystem#3046),
+//!   WITHOUT any signing key, exiting non-zero when the published feed is behind (or ahead of) the
+//!   releases. Doctor validates a feed's INPUTS; drift validates the OUTPUT beacons are served — a
+//!   feed can be six hours stale with a fully green doctor, which is the outage this catches. Reads
+//!   `--config`/`--channel`/`--feed-base`/`GITHUB_TOKEN` only.
 //! - **default (sign)** — the full assemble + sign pass below (requires `BEACON_SIGNING_KEY`).
 //!
 //! Inputs (CLI flag falls back to environment):
@@ -28,6 +34,7 @@
 //! | channel            | `--channel`         | `FEEDSIGN_CHANNEL`          | `stable`           |
 //! | transparency dir   | `--transparency-out`| `FEEDSIGN_TRANSPARENCY_OUT` | (optional)         |
 //! | generated unix ts  | `--generated`       | `FEEDSIGN_GENERATED`        | (required)         |
+//! | live feed base     | `--feed-base`       | `FEEDSIGN_FEED_BASE`        | `https://updates.dig.net/v1` |
 //! | signing key (PEM/…)| —                   | `BEACON_SIGNING_KEY`        | (required)         |
 //! | GitHub token       | —                   | `GITHUB_TOKEN`              | (optional)         |
 //!
@@ -50,9 +57,13 @@
 use std::process::ExitCode;
 
 use dig_updater_feedsign::{
-    assert_pinned_root, audit_exemptions, produce_feed, signing_key_from_secret, Channel,
-    DoctorReport, FeedConfig, FeedsignError, GithubSource,
+    assert_pinned_root, audit_exemptions, check_drift, manifest_url_for, produce_feed,
+    signing_key_from_secret, Channel, DoctorReport, FeedConfig, FeedsignError, GithubSource,
 };
+
+/// The production feed base — the `/v1` root under which each channel publishes its
+/// `{channel}/manifest.json` (SPEC §10). Overridable so tests and staging can point elsewhere.
+const DEFAULT_FEED_BASE: &str = "https://updates.dig.net/v1";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -78,6 +89,19 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("dig-updater-feedsign audit-exemptions: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `drift` (dig_ecosystem#3046) compares the LIVE served feed against the channel's releases. Like
+    // doctor it needs NO signing key — which is the point: it runs on a short interval in an
+    // unprivileged workflow, so the frequent poller never has the key in scope.
+    if is_drift(&args) {
+        return match run_drift(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("dig-updater-feedsign drift: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -122,6 +146,49 @@ fn run_doctor(args: &[String]) -> Result<ExitCode, FeedsignError> {
     let report = DoctorReport::run(&config, &source, channel);
     print!("{}", report.render());
     Ok(if report.is_healthy() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Whether this invocation selects drift mode: the `drift` subcommand as the first argument, or a
+/// `--drift` flag anywhere.
+fn is_drift(args: &[String]) -> bool {
+    args.first().is_some_and(|a| a == "drift") || args.iter().any(|a| a == "--drift")
+}
+
+/// The drift pass: resolve every component's `--channel` release, fetch the manifest the live feed
+/// serves at `--feed-base`, print the comparison, and return [`ExitCode::FAILURE`] when the served
+/// feed does not provably match the releases.
+///
+/// A FAILURE here is not a broken feed — it is a feed that has not been regenerated since the last
+/// release. The workflow's response is to dispatch the Feed workflow, not to page anyone.
+fn run_drift(args: &[String]) -> Result<ExitCode, FeedsignError> {
+    let config_path = input(args, "--config", "FEEDSIGN_CONFIG")
+        .unwrap_or_else(|| "feed-config.json".to_string());
+    let channel = match input(args, "--channel", "FEEDSIGN_CHANNEL") {
+        Some(token) => Channel::from_token(&token)?,
+        None => Channel::Stable,
+    };
+    let feed_base = input(args, "--feed-base", "FEEDSIGN_FEED_BASE")
+        .unwrap_or_else(|| DEFAULT_FEED_BASE.to_string());
+
+    let config_text = std::fs::read_to_string(&config_path)
+        .map_err(|e| FeedsignError::Config(format!("{config_path}: {e}")))?;
+    let config = FeedConfig::from_json(&config_text)?;
+
+    let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+    let source = GithubSource::github(token);
+
+    let report = check_drift(
+        &config,
+        &source,
+        channel,
+        &manifest_url_for(&feed_base, channel),
+    )?;
+    print!("{}", report.render());
+    Ok(if report.is_current() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

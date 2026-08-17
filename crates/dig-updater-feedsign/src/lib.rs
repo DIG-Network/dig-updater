@@ -42,6 +42,7 @@ mod assemble;
 mod channel;
 mod config;
 mod doctor;
+mod drift;
 mod error;
 mod resolve;
 mod sign;
@@ -59,6 +60,7 @@ pub use assemble::{assemble_delegation, assemble_manifest};
 pub use channel::Channel;
 pub use config::{AssetKind, ChannelFloors, ComponentConfig, FeedConfig, PlatformKey};
 pub use doctor::{ComponentExemptions, DoctorReport, ExemptionAudit};
+pub use drift::{check_drift, compare as compare_drift, manifest_url_for, Drift, DriftReport};
 pub use error::FeedsignError;
 pub use resolve::{
     expected_asset_name, expected_asset_names, resolve_version_from_assets, select_artifacts,
