@@ -187,7 +187,13 @@ fn run_drift(args: &[String]) -> Result<ExitCode, FeedsignError> {
         channel,
         &manifest_url_for(&feed_base, channel),
     )?;
-    print!("{}", report.render());
+    // `--json` (§6.2) is what an automated responder reads: it keys on `regenerable` to decide
+    // whether dispatching the Feed workflow would actually fix what was found.
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", report.render());
+    }
     Ok(if report.is_current() {
         ExitCode::SUCCESS
     } else {

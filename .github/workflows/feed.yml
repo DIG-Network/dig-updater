@@ -60,6 +60,19 @@ on:
     paths:
       - "feed-config.json"
   workflow_dispatch:
+  # A releasing repo can PUSH a regeneration the moment it publishes, instead of waiting for the
+  # 6-hour cron or the 15-minute `feed-drift.yml` poll to notice (dig_ecosystem#3046):
+  #
+  #   gh api --method POST /repos/DIG-Network/dig-updater/dispatches \
+  #     -f event_type=release-published
+  #
+  # NOT YET WIRED UP, and deliberately so: a dispatch from dig-node / dig-app / digstore / dig-dns
+  # into THIS repo needs a cross-repo token, which `GITHUB_TOKEN` is not — it takes a PAT secret in
+  # each releasing repo, which only @mt-dev can add. Declaring the trigger now costs nothing and
+  # means adopting the push path later is a change in the RELEASING repo alone, with nothing to
+  # change here. Until then `feed-drift.yml` closes the window without any secret at all.
+  repository_dispatch:
+    types: [release-published]
 
 concurrency:
   group: feed

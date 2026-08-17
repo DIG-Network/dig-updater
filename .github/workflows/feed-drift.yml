@@ -1,0 +1,218 @@
+# FEED DRIFT — is the feed we SERVE still describing the releases that exist? (dig_ecosystem#3046)
+#
+# The Feed workflow regenerates on a 6-hour cron. A component that releases at 00:05 is therefore
+# invisible to every beacon until 06:00, and NOTHING TURNS RED in the meantime: the releasing repo's
+# workflow succeeded, the Feed workflow succeeded at its last scheduled tick, and the manifest served
+# to users simply describes an older world. The gap was measured three times in a single day — after
+# dig-node 0.122.1, after dig-app 12.16.0 / dig-node 0.124.0, and after dig-app 12.17.0 — each time
+# needing a hand-run `gh workflow run feed.yml`, and each time the served manifest's `generated`
+# timestamp PREDATED the release it was missing.
+#
+# This workflow closes that window from 6 hours to ~15 minutes, and makes the state observable:
+#
+#   1. resolve every configured component's release for a channel (the SAME resolution the signer
+#      performs — `feedsign drift` reuses `resolve_all`, so it cannot disagree about what a
+#      regenerated feed would contain),
+#   2. fetch the manifest the live feed actually serves for that channel,
+#   3. compare, per component, released version vs served version, and
+#   4. when the published feed is behind, DISPATCH the Feed workflow to regenerate it.
+#
+# WHY POLL RATHER THAN HAVE EACH RELEASE PUSH: a `repository_dispatch` from dig-node / dig-app /
+# digstore / dig-dns into THIS repo needs a cross-repo token, which `GITHUB_TOKEN` is not — it would
+# take a new PAT secret in five repositories, which only @mt-dev can add. `feed.yml` now accepts a
+# `repository_dispatch` of type `release-published`, so that push path is READY the moment such a
+# token exists; until then this poll needs no secret at all and is the whole fix on its own. Pushing
+# would make the window ~1 minute instead of ~15; both are enormously better than 6 hours.
+#
+# WHY NOT JUST RUN feed.yml EVERY 15 MINUTES: a Feed run downloads every artifact of every component
+# and signs with the production key. This check downloads nothing, signs nothing, and holds no
+# secret — so the cheap keyless poll detects, and the expensive keyed job runs only when needed.
+#
+# WHY A CLEAN RUN IS GREEN EVEN WHEN IT SELF-HEALED: reddening on every release would make this
+# workflow noisy exactly when it is working as designed, and a noisy alarm is an ignored one. It
+# fails only for what it could NOT fix — see the verdict step.
+
+name: Feed drift
+
+on:
+  schedule:
+    # Every 15 minutes. The bound this puts on "a release is invisible" is the cron interval plus one
+    # Feed run, against the 6 hours it replaces. GitHub may delay scheduled runs under load, which
+    # widens the window but never reopens it — a delayed check still detects the same drift.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  # Never stack drift checks: a delayed run finishing after the next one started would compare stale
+  # state and could dispatch a redundant regeneration.
+  group: feed-drift
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # To dispatch `feed.yml` when the served feed is behind. This is the ONLY write this workflow has —
+  # it holds no signing key, and `feedsign drift` structurally cannot sign (it never reads
+  # BEACON_SIGNING_KEY).
+  actions: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  drift:
+    name: is the live feed current?
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Debug profile deliberately: this binary makes six HTTP calls and compares strings, so the
+      # release-profile build time would dominate a 15-minute cadence for no benefit.
+      - name: Build feedsign
+        run: cargo build --locked -p dig-updater-feedsign
+
+      # Both published channels are checked. Neither is allowed to fail silently — `continue-on-error`
+      # keeps a stale STABLE feed from hiding a stale NIGHTLY one (and vice versa), so the verdict
+      # step sees both. Measured 2026-08-17: both channels were current, so neither is expected to be
+      # chronically red.
+      #
+      # `|| true` on BOTH invocations is load-bearing, not defensive noise: `drift` exits NON-ZERO
+      # precisely when it finds drift, and the default `bash -e` shell would abort the step at the
+      # first invocation — before the `--json` report the responder reads was ever written. The
+      # verdict step would then see a missing report, and this workflow would detect the outage and
+      # never regenerate. The verdict is taken from the JSON, never from these exit codes.
+      - name: Check the stable feed
+        id: stable
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./target/debug/dig-updater-feedsign drift --channel stable | tee stable.txt || true
+          ./target/debug/dig-updater-feedsign drift --channel stable --json > stable.json || true
+
+      - name: Check the nightly feed
+        id: nightly
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./target/debug/dig-updater-feedsign drift --channel nightly | tee nightly.txt || true
+          ./target/debug/dig-updater-feedsign drift --channel nightly --json > nightly.json || true
+
+      # Decide what was found. `regenerable` is true only for a stale published document (a version
+      # mismatch or a missing component) — the thing a fresh signing pass actually replaces. A
+      # component whose RELEASE cannot be resolved reports as `unknown`: not current, but NOT
+      # regenerable, because the signer would fail on it identically. Dispatching on that every 15
+      # minutes would queue Feed runs behind its `feed` concurrency group indefinitely.
+      - name: Read the verdicts
+        id: verdict
+        run: |
+          set -euo pipefail
+          read_flag() {
+            # A missing/unparseable report means the check itself errored (unreadable feed, bad
+            # config). Treat that as "not current, not regenerable" — never as a clean bill.
+            if [ -s "$1" ] && jq -e . "$1" >/dev/null 2>&1; then
+              jq -r "$2" "$1"
+            else
+              echo "$3"
+            fi
+          }
+          stable_current=$(read_flag stable.json '.current' 'false')
+          nightly_current=$(read_flag nightly.json '.current' 'false')
+          stable_regen=$(read_flag stable.json '.regenerable' 'false')
+          nightly_regen=$(read_flag nightly.json '.regenerable' 'false')
+
+          # Plain `if`, not `&&`/`||` chains: under `set -e` an AND-list whose assignment never runs
+          # leaves the list non-zero, which is a trap not worth carrying for two saved lines.
+          if [ "$stable_current" = "true" ] && [ "$nightly_current" = "true" ]; then
+            current=true
+          else
+            current=false
+          fi
+          if [ "$stable_regen" = "true" ] || [ "$nightly_regen" = "true" ]; then
+            regenerable=true
+          else
+            regenerable=false
+          fi
+
+          {
+            echo "current=$current"
+            echo "regenerable=$regenerable"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo '### Feed drift'
+            echo '```'
+            cat stable.txt 2>/dev/null || echo 'the stable check did not produce a report'
+            echo
+            cat nightly.txt 2>/dev/null || echo 'the nightly check did not produce a report'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Regenerate — but only when a regeneration would plausibly help AND is not already happening.
+      #
+      # Two suppressions, both there to stop a 15-minute cadence turning a fault into a run storm:
+      #   (a) a Feed run already queued or in progress — the fix is already on its way;
+      #   (b) the most recent COMPLETED Feed run failed — asking a workflow that just failed to try
+      #       again every 15 minutes produces ~96 red runs a day and fixes nothing. When this
+      #       suppression fires the verdict step below goes RED, so the condition stays visible; the
+      #       Feed workflow's own redness is the signal that owns it.
+      #
+      # REST, not `gh workflow run`: the CLI path resolves the workflow over GraphQL, which is the
+      # first thing to go during a GitHub incident. The REST dispatch endpoint keeps working.
+      - name: Regenerate the feed
+        id: dispatch
+        if: steps.verdict.outputs.regenerable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          active=$(gh api "/repos/$REPO/actions/workflows/feed.yml/runs?status=in_progress&per_page=1" --jq '.total_count')
+          queued=$(gh api "/repos/$REPO/actions/workflows/feed.yml/runs?status=queued&per_page=1" --jq '.total_count')
+          if [ "$active" != "0" ] || [ "$queued" != "0" ]; then
+            echo "::notice::a Feed run is already in flight ($active in progress, $queued queued) — not dispatching another."
+            echo "outcome=already-running" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          last=$(gh api "/repos/$REPO/actions/workflows/feed.yml/runs?status=completed&per_page=1" --jq '.workflow_runs[0].conclusion // "none"')
+          if [ "$last" = "failure" ]; then
+            echo "::error::the feed is behind its releases, but the last Feed run FAILED — not dispatching into a known-broken workflow. Fix the Feed run first."
+            echo "outcome=suppressed-last-run-failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh api --method POST "/repos/$REPO/actions/workflows/feed.yml/dispatches" -f ref=main
+          echo "::notice::the feed was behind its releases; dispatched feed.yml to regenerate it."
+          echo "outcome=dispatched" >> "$GITHUB_OUTPUT"
+
+      # The run's status. GREEN when the feed is current, and green when it was behind and a
+      # regeneration was successfully set in motion — that is this workflow doing its job, and
+      # reddening on every release would train everyone to ignore it. RED for what it could not fix:
+      # a drift no regeneration addresses (an unresolvable release — `feedsign doctor` diagnoses
+      # those), a dispatch suppressed because the Feed workflow is already failing, or a check that
+      # could not read the feed at all.
+      - name: Verdict
+        env:
+          CURRENT: ${{ steps.verdict.outputs.current }}
+          REGENERABLE: ${{ steps.verdict.outputs.regenerable }}
+          DISPATCH: ${{ steps.dispatch.outputs.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$CURRENT" = "true" ]; then
+            echo "the live feed is current with every configured component's release."
+            exit 0
+          fi
+          if [ "$REGENERABLE" = "true" ] && { [ "$DISPATCH" = "dispatched" ] || [ "$DISPATCH" = "already-running" ]; }; then
+            echo "the feed was behind its releases; a regeneration is under way ($DISPATCH)."
+            exit 0
+          fi
+          echo "::error::the live feed does not match the releases and this run could not fix it (regenerable=$REGENERABLE, dispatch=${DISPATCH:-none}). See the reports above; \`feedsign doctor\` diagnoses an unresolvable component."
+          exit 1

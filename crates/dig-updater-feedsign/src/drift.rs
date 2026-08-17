@@ -201,6 +201,68 @@ impl DriftReport {
         self.drifts.is_empty()
     }
 
+    /// Whether regenerating the feed would plausibly FIX what was found.
+    ///
+    /// True when at least one drift is a [`Drift::Mismatch`] or [`Drift::Absent`] — a stale
+    /// published document, which is exactly what a fresh signing pass replaces.
+    ///
+    /// False when the only findings are [`Drift::Unknown`]: a release that cannot be resolved will
+    /// not resolve any better for the signer, so a regeneration would fail the same way. This
+    /// distinction is what keeps an automated responder from dispatching the Feed workflow every
+    /// polling interval against a fault regeneration cannot clear — the runs would queue behind the
+    /// `feed` concurrency group and pile up indefinitely.
+    #[must_use]
+    pub fn is_regenerable(&self) -> bool {
+        self.drifts
+            .iter()
+            .any(|d| matches!(d, Drift::Mismatch { .. } | Drift::Absent { .. }))
+    }
+
+    /// The machine-readable report (§6.2): the verdict, whether a regeneration would fix it, and
+    /// every drift with both sides named. Stable field names — an automated responder keys on
+    /// `regenerable` to decide whether to dispatch the Feed workflow.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let drifts: Vec<serde_json::Value> = self
+            .drifts
+            .iter()
+            .map(|drift| match drift {
+                Drift::Mismatch {
+                    component,
+                    released,
+                    in_feed,
+                } => serde_json::json!({
+                    "kind": "mismatch",
+                    "component": component,
+                    "released": released,
+                    "in_feed": in_feed,
+                }),
+                Drift::Absent {
+                    component,
+                    released,
+                } => serde_json::json!({
+                    "kind": "absent",
+                    "component": component,
+                    "released": released,
+                }),
+                Drift::Unknown { component, reason } => serde_json::json!({
+                    "kind": "unknown",
+                    "component": component,
+                    "reason": reason,
+                }),
+            })
+            .collect();
+        serde_json::json!({
+            "channel": self.channel.as_str(),
+            "manifest_url": self.manifest_url,
+            "generated": self.generated,
+            "current": self.is_current(),
+            "regenerable": self.is_regenerable(),
+            "drifts": drifts,
+        })
+        .to_string()
+    }
+
     /// A legible, secret-free report — the verdict, one line per component, then each drift.
     #[must_use]
     pub fn render(&self) -> String {
@@ -500,6 +562,101 @@ mod tests {
             !report.is_current(),
             "an uncomparable component must not read as current"
         );
+    }
+
+    /// A stale published document is exactly what a fresh signing pass replaces, so the responder
+    /// should dispatch.
+    #[test]
+    fn a_stale_feed_is_regenerable() {
+        let report = report_with(vec![Drift::Mismatch {
+            component: "dig-app".into(),
+            released: "12.17.0".into(),
+            in_feed: "12.16.0".into(),
+        }]);
+        assert!(report.is_regenerable());
+        let absent = report_with(vec![Drift::Absent {
+            component: "dig-app".into(),
+            released: "12.17.0".into(),
+        }]);
+        assert!(absent.is_regenerable());
+    }
+
+    /// THE QUEUE-BOMB GUARD. A release that cannot be resolved will not resolve any better for the
+    /// signer, so dispatching on it every polling interval would pile runs up behind the `feed`
+    /// concurrency group forever. It must be reported (not current) but NOT acted on.
+    #[test]
+    fn an_unresolvable_component_alone_is_not_regenerable() {
+        let report = report_with(vec![Drift::Unknown {
+            component: "dig-node".into(),
+            reason: "503".into(),
+        }]);
+        assert!(
+            !report.is_current(),
+            "it must still be reported as not current"
+        );
+        assert!(
+            !report.is_regenerable(),
+            "regeneration cannot fix an unresolvable release; dispatching on it queue-bombs the \
+             Feed workflow"
+        );
+    }
+
+    /// A genuinely stale component beside an unresolvable one still warrants the dispatch — the
+    /// staleness is real and regeneration fixes that half.
+    #[test]
+    fn a_stale_component_beside_an_unresolvable_one_is_still_regenerable() {
+        let report = report_with(vec![
+            Drift::Unknown {
+                component: "dig-node".into(),
+                reason: "503".into(),
+            },
+            Drift::Mismatch {
+                component: "dig-app".into(),
+                released: "12.17.0".into(),
+                in_feed: "12.16.0".into(),
+            },
+        ]);
+        assert!(report.is_regenerable());
+    }
+
+    #[test]
+    fn a_current_feed_is_not_regenerable() {
+        assert!(!report_with(vec![]).is_regenerable());
+    }
+
+    #[test]
+    fn the_json_report_names_both_sides_and_the_responder_signal() {
+        let report = report_with(vec![Drift::Mismatch {
+            component: "dig-app".into(),
+            released: "12.17.0".into(),
+            in_feed: "12.16.0".into(),
+        }]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&report.to_json()).expect("the report is valid JSON");
+        assert_eq!(parsed["current"], serde_json::json!(false));
+        assert_eq!(parsed["regenerable"], serde_json::json!(true));
+        assert_eq!(parsed["channel"], serde_json::json!("stable"));
+        assert_eq!(parsed["generated"], serde_json::json!(1_762_000_000u64));
+        assert_eq!(parsed["drifts"][0]["kind"], serde_json::json!("mismatch"));
+        assert_eq!(
+            parsed["drifts"][0]["released"],
+            serde_json::json!("12.17.0")
+        );
+        assert_eq!(parsed["drifts"][0]["in_feed"], serde_json::json!("12.16.0"));
+    }
+
+    /// The responder keys on `regenerable`; an `unknown`-only report must carry it as false in the
+    /// JSON too, not merely in the Rust API.
+    #[test]
+    fn the_json_report_withholds_the_responder_signal_for_unknown_only() {
+        let report = report_with(vec![Drift::Unknown {
+            component: "dig-node".into(),
+            reason: "503".into(),
+        }]);
+        let parsed: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(parsed["current"], serde_json::json!(false));
+        assert_eq!(parsed["regenerable"], serde_json::json!(false));
+        assert_eq!(parsed["drifts"][0]["kind"], serde_json::json!("unknown"));
     }
 
     #[test]
