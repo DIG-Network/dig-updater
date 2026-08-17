@@ -408,3 +408,50 @@ fn the_freshness_audit_stays_off_the_signing_path() {
          never be able to disturb signing/serving the live feed:\n{job}"
     );
 }
+
+/// Extract a job's `if:` expression, folded to a single line.
+///
+/// The `if:` is written as a `>-` folded block, so the condition spans several indented lines that
+/// must be rejoined before the alternatives can be read off it.
+fn job_if_expression(workflow: &str, job: &str) -> String {
+    let block = job_block(workflow, job);
+    let mut lines = block.lines().skip_while(|l| l.trim_start() != "if: >-");
+    lines.next().expect("the job must declare an `if:` guard");
+    lines
+        .take_while(|l| l.starts_with("      ") && !l.trim_start().starts_with('#'))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// #3046: the daily audit cron must reach the audit WITHOUT anyone opting in.
+///
+/// The manual-dispatch leg is deliberately opt-in (`inputs.audit_freshness`), because the usual
+/// reason to dispatch feed.yml by hand is that the feed IS stale — auditing there would red the run
+/// that was fixing the problem. That concession is safe only while some path still audits on its
+/// own. Conjoin the same input onto the cron leg, or drop the cron leg, and the audit becomes a
+/// thing that runs exclusively when a human already suspects the fault it exists to discover: a
+/// detector that reports nothing is indistinguishable from a feed that is never stale.
+///
+/// `the_served_vs_released_freshness_audit_exists` cannot see this — the job would still be
+/// present and would still run the audit binary. What is lost is the only UNPROMPTED trigger, which
+/// lives in the guard, so the guard is what this reads.
+#[test]
+fn the_daily_audit_cron_reaches_the_audit_without_anyone_opting_in() {
+    let guard = job_if_expression(&feed_workflow(), "audit-freshness");
+
+    // Each `||` alternative is an independent way in. At least one must be the audit cron with no
+    // opt-in attached to it; testing the whole expression for both substrings would pass on the
+    // broken form too, since the input and the cron would both still appear — just conjoined.
+    let unprompted = guard.split("||").find(|alternative| {
+        alternative.contains("17 4 * * *") && !alternative.contains("audit_freshness")
+    });
+
+    assert!(
+        unprompted.is_some(),
+        "the daily audit cron must trigger the freshness audit on its own, with no \
+         `audit_freshness` opt-in conjoined to it — otherwise the audit only ever runs when \
+         someone already suspects staleness, and stays silent in every outage it was built to \
+         catch:\n{guard}"
+    );
+}
