@@ -159,9 +159,9 @@ impl FreshnessAudit {
                         detail: e.to_string(),
                     },
                     Ok((_, released)) => match served.version_of(&component.name) {
-                        Some(served) if served == released => Freshness::Current {
-                            version: released,
-                        },
+                        Some(served) if served == released => {
+                            Freshness::Current { version: released }
+                        }
                         served => Freshness::Diverged {
                             released,
                             served: served.map(str::to_string),
@@ -215,9 +215,9 @@ impl FreshnessAudit {
         let diverged = self.count(|f| matches!(f, Freshness::Diverged { .. }));
         let unknown = self.count(|f| matches!(f, Freshness::Unknown { .. }));
         out.push_str(&match (diverged, unknown) {
-            (0, 0) => format!(
-                "every component's {channel} feed entry matches its released version.\n"
-            ),
+            (0, 0) => {
+                format!("every component's {channel} feed entry matches its released version.\n")
+            }
             (0, u) => format!(
                 "{u} component(s) COULD NOT BE CHECKED — this audit does not know whether the \
                  {channel} feed is current.\n"

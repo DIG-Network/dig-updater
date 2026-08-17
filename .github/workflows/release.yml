@@ -86,3 +86,40 @@ jobs:
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      # WAKE THE FEED (dig_ecosystem#3046). Publishing the release is NOT shipping: users install
+      # from the signed feed at updates.dig.net, and until this dispatch existed the feed only
+      # refreshed on a 6-hourly cron — so a release stayed invisible for up to six hours while every
+      # check above stayed green. dig-updater is itself a component of that feed, so its own release
+      # must wake it exactly as a sibling component's release does.
+      #
+      # `RELEASE_TOKEN`, NOT `github.token` — THIS IS LOAD-BEARING. GitHub deliberately does not
+      # start a workflow run from an event sent with the automatic `GITHUB_TOKEN` (its recursion
+      # guard). A dispatch sent with it returns 204 and silently starts NOTHING, which would
+      # reproduce this ticket's own defect class — a release step that reports success while doing
+      # nothing — in the very code meant to close it. The same reason the runbook already requires
+      # `RELEASE_TOKEN` for pushing tags that trigger downstream workflows.
+      #
+      # Fail-soft: the release itself is complete and correct by this point, so a dispatch hiccup
+      # must not red it. The cost of a missed dispatch is bounded — the 6-hourly cron still refreshes
+      # the feed, and the daily `audit-freshness` job reds if it somehow does not.
+      # The secret is tested in the script, not in an `if:` — the `secrets` context is not dependable
+      # in step conditionals, and this workflow already treats a missing RELEASE_TOKEN as a warned
+      # no-op elsewhere. The version comes from the tag this job is gated on (`github.ref_type ==
+      # 'tag'`), so it needs no output from an upstream job.
+      - name: Notify the feed that a new version was released
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::RELEASE_TOKEN is not set — the feed was NOT signalled, so this release stays invisible to the updater until the next 6-hourly feed cron (dig_ecosystem#3046)."
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f event_type=component-released \
+            -f "client_payload[component]=dig-updater" \
+            -f "client_payload[version]=${version}"
+          echo "Signalled the feed: dig-updater ${version} released."

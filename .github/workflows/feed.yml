@@ -155,6 +155,71 @@ jobs:
           ./target/release/dig-updater-feedsign audit-exemptions \
             --config feed-config.json
 
+  # THE SERVED-vs-RELEASED FRESHNESS AUDIT (dig_ecosystem#3046).
+  #
+  # Users install from the FEED. The GitHub Release is not what they install from, and the two can
+  # disagree — at which point every check the ecosystem runs still passes (tag live, marked latest,
+  # every asset present and correctly digested) while no user can obtain the build. A release-watcher
+  # verifying the release, which is the right thing to verify, reports GREEN throughout.
+  #
+  # This job asks the one question none of those asked: does the version the feed SERVES match the
+  # version each repo RELEASED. It is the backstop for a whole defect class — a release step that
+  # silently does not run, invisible because nothing turns red — and it catches that class no matter
+  # WHICH step failed to fire, because it compares the two ENDS and ignores the pipeline between
+  # them. The `repository_dispatch` trigger above is the FIX (a release wakes the feed); this is the
+  # detector for when that fix, or any future replacement of it, quietly stops working.
+  #
+  # STABLE ONLY, deliberately. The nightly leg is expected to be incomplete during the #592 fan-out
+  # window (not every component publishes a rolling `nightly`), so auditing it would produce a
+  # permanently-red job — and an alarm that is always red is an alarm nobody reads, which is the
+  # failure mode this whole ticket is about. Stable is what users install by default and is where the
+  # incident occurred.
+  #
+  # It shares the daily audit cron rather than adding one, needs NO signing secret (read-only public
+  # release metadata + the public manifest), and sits DELIBERATELY OFF the signing path, so a red
+  # here can never interfere with signing or serving the live feed.
+  #
+  # NOTE ON A TRANSIENT RED: in the minutes between a release publishing and the feed it triggered
+  # finishing its re-sign, the feed genuinely IS serving the older version, and this will say so.
+  # That report is true, not a false alarm; re-run the job once the feed run completes.
+  audit-freshness:
+    name: Audit feed freshness
+    # The daily audit cron + manual dispatch. NOT the 6-hourly signing heartbeat (this is not part of
+    # the signing cadence), and NOT pull_request — a PR cannot change what the live feed serves, and
+    # a PR that ADDS a component would red for a component the feed has not carried yet.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'schedule' && github.event.schedule == '17 4 * * *')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build feedsign (release)
+        run: cargo build --release --locked -p dig-updater-feedsign
+
+      # Reads the live manifest from the beacon's OWN primary origin — the bytes real clients
+      # receive, not a re-derivation of them. Exits non-zero on any disagreement AND on any component
+      # it could not check, so an unreachable release never reads as a fresh feed.
+      - name: Audit the served stable feed against each repo's release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./target/release/dig-updater-feedsign audit-freshness \
+            --config feed-config.json \
+            --channel stable
+
   sign-verify-publish:
     name: ${{ matrix.channel }} — sign, verify, publish
     # H1 (#540): the signing capability is bound to REVIEWED main code. A workflow_dispatch (or any

@@ -340,3 +340,71 @@ fn feed_triggers_are_all_default_branch_events_so_the_main_guard_cannot_silently
         );
     }
 }
+
+/// The `jobs:` entry named `name`, from its 2-space `  name:` key to the next job key.
+fn job_block(workflow: &str, name: &str) -> String {
+    let start = format!("  {name}:");
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in workflow.lines() {
+        if line.starts_with(&start) {
+            inside = true;
+            continue;
+        }
+        // The next 2-space job key ends this block (deeper keys and comments continue it).
+        if inside
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && !line.trim_start().starts_with('#')
+            && line.trim_end().ends_with(':')
+        {
+            break;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "feed.yml must declare a job named {name:?}"
+    );
+    out.join("\n")
+}
+
+/// #3046: the served-vs-released freshness audit must exist. It is the detector for the whole
+/// "a release step silently did not run" class — it compares the two ENDS (what the feed serves vs
+/// what each repo released) and so catches the failure no matter which step in between stopped
+/// firing, including a future replacement of the `repository_dispatch` trigger.
+#[test]
+fn the_served_vs_released_freshness_audit_exists() {
+    let job = job_block(&feed_workflow(), "audit-freshness");
+    assert!(
+        job.contains("audit-freshness \\") || job.contains("feedsign audit-freshness"),
+        "the audit-freshness job must actually RUN the freshness audit:\n{job}"
+    );
+}
+
+/// The audit must stay OFF the signing path, in both directions.
+///
+/// It must not carry the signing environment (it needs no secret and must never be a way to reach
+/// one), and it must not run on the 6-hourly signing heartbeat — a read-only audit that a GitHub
+/// blip can red must never be able to interfere with signing or serving the live feed. This mirrors
+/// the same separation `audit-exemptions` already holds.
+#[test]
+fn the_freshness_audit_stays_off_the_signing_path() {
+    let job = job_block(&feed_workflow(), "audit-freshness");
+    assert!(
+        !job.contains("feed-signing"),
+        "the freshness audit needs no signing secret and must not reference the signing \
+         environment:\n{job}"
+    );
+    assert!(
+        !job.contains("BEACON_SIGNING_KEY"),
+        "the freshness audit must never touch the signing key:\n{job}"
+    );
+    assert!(
+        !job.contains("'0 */6 * * *'"),
+        "the freshness audit must NOT run on the 6-hourly signing heartbeat — a red audit must \
+         never be able to disturb signing/serving the live feed:\n{job}"
+    );
+}

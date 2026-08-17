@@ -93,9 +93,7 @@ fn served(components: &[(&str, &str)]) -> ServedFeed {
     let entries = components
         .iter()
         .map(|(name, version)| {
-            format!(
-                r#"{{"name":"{name}","version":"{version}","build":1,"artifacts":[]}}"#
-            )
+            format!(r#"{{"name":"{name}","version":"{version}","build":1,"artifacts":[]}}"#)
         })
         .collect::<Vec<_>>()
         .join(",");

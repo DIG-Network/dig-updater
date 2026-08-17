@@ -3,7 +3,7 @@
 //! The `dig-updater-feedsign` CI binary: assemble + sign the beacon feed, write it out, print a
 //! secret-free summary.
 //!
-//! ## Three modes
+//! ## Four modes
 //!
 //! - **`doctor`** (subcommand, or `--doctor`) — validate `feed-config.json` against each component's
 //!   LIVE releases for a channel WITHOUT any signing key (dig_ecosystem#2115), printing a
@@ -17,6 +17,12 @@
 //!   only a subset of channels is a NON-failing informational note (the exemption stays load-bearing
 //!   for the channels that lack it). Reads `--config`/`GITHUB_TOKEN` only; always sweeps both
 //!   channels. A PR/scheduled drift guard.
+//! - **`audit-freshness`** (subcommand, or `--audit-freshness`) — compare what the LIVE feed serves
+//!   against what each component's repo RELEASED, for one channel (dig_ecosystem#3046), exiting
+//!   non-zero on any disagreement OR on any component it could not check. Users install from the
+//!   feed, not from the GitHub Release, so this is the only check that asks whether a release
+//!   actually reached them — every other check passes while the two disagree. Needs no signing key;
+//!   reads `--config`/`--channel`/`--feed-base`/`GITHUB_TOKEN`.
 //! - **default (sign)** — the full assemble + sign pass below (requires `BEACON_SIGNING_KEY`).
 //!
 //! Inputs (CLI flag falls back to environment):
@@ -30,6 +36,7 @@
 //! | generated unix ts  | `--generated`       | `FEEDSIGN_GENERATED`        | (required)         |
 //! | signing key (PEM/…)| —                   | `BEACON_SIGNING_KEY`        | (required)         |
 //! | GitHub token       | —                   | `GITHUB_TOKEN`              | (optional)         |
+//! | served feed base   | `--feed-base`       | `FEEDSIGN_FEED_BASE`        | `https://updates.dig.net` |
 //!
 //! `--channel stable|nightly` selects which of the two independent feeds to produce (SPEC §10.1);
 //! the workflow runs the signer once per channel. It defaults to `stable` (the legacy behavior —
@@ -50,9 +57,13 @@
 use std::process::ExitCode;
 
 use dig_updater_feedsign::{
-    assert_pinned_root, audit_exemptions, produce_feed, signing_key_from_secret, Channel,
-    DoctorReport, FeedConfig, FeedsignError, GithubSource,
+    assert_pinned_root, audit_exemptions, audit_freshness, produce_feed, signing_key_from_secret,
+    Channel, DoctorReport, FeedConfig, FeedsignError, GithubSource, ReleaseSource, ServedFeed,
 };
+
+/// Where the served feed is read from when `--feed-base` is not given — the beacon's own primary
+/// origin, so the audit checks the bytes real clients receive.
+const DEFAULT_FEED_BASE: &str = "https://updates.dig.net";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -78,6 +89,20 @@ fn main() -> ExitCode {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("dig-updater-feedsign audit-exemptions: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `audit-freshness` (dig_ecosystem#3046) compares the LIVE feed against each repo's release and
+    // exits non-zero on any disagreement or un-checkable component. Read-only and secret-free, so
+    // it dispatches before the signing pass. A transport failure reading the feed is an ERROR, never
+    // a pass — the whole point is to refuse to report fresh from a check that did not happen.
+    if is_audit_freshness(&args) {
+        return match run_audit_freshness(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("dig-updater-feedsign audit-freshness: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -151,6 +176,59 @@ fn run_audit_exemptions(args: &[String]) -> Result<ExitCode, FeedsignError> {
     let source = GithubSource::github(token);
 
     let audit = audit_exemptions(&config, &source);
+    print!("{}", audit.render());
+    Ok(if audit.is_clean() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Whether this invocation selects freshness-audit mode: the `audit-freshness` subcommand as the
+/// first argument, or an `--audit-freshness` flag anywhere.
+fn is_audit_freshness(args: &[String]) -> bool {
+    args.first().is_some_and(|a| a == "audit-freshness")
+        || args.iter().any(|a| a == "--audit-freshness")
+}
+
+/// The served-vs-released freshness audit (dig_ecosystem#3046): read the live feed for `--channel`,
+/// compare each configured component's served version against the version its repo released, print
+/// the report, and return [`ExitCode::FAILURE`] on any disagreement or un-checkable component.
+///
+/// The manifest is read as DATA (no signature check) purely to learn which version is on offer;
+/// authenticity is the beacon's pinned-key concern, not this audit's. Any failure to READ it
+/// propagates as an error rather than an empty feed view, so a fetch that never happened can never
+/// be mistaken for a feed that serves nothing — or for one that is fine.
+fn run_audit_freshness(args: &[String]) -> Result<ExitCode, FeedsignError> {
+    let config_path = input(args, "--config", "FEEDSIGN_CONFIG")
+        .unwrap_or_else(|| "feed-config.json".to_string());
+    let channel = match input(args, "--channel", "FEEDSIGN_CHANNEL") {
+        Some(token) => Channel::from_token(&token)?,
+        None => Channel::Stable,
+    };
+    let feed_base = input(args, "--feed-base", "FEEDSIGN_FEED_BASE")
+        .unwrap_or_else(|| DEFAULT_FEED_BASE.to_string());
+
+    let config_text = std::fs::read_to_string(&config_path)
+        .map_err(|e| FeedsignError::Config(format!("{config_path}: {e}")))?;
+    let config = FeedConfig::from_json(&config_text)?;
+
+    let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+    let source = GithubSource::github(token);
+
+    // The exact URL a beacon fetches for this channel, so the audit judges the bytes real clients
+    // receive rather than a re-derivation of them.
+    let manifest_url = format!(
+        "{}/v1/{}/manifest.json",
+        feed_base.trim_end_matches('/'),
+        channel.as_str()
+    );
+    let bytes = source.download(&manifest_url)?;
+    let json = String::from_utf8(bytes)
+        .map_err(|e| FeedsignError::Config(format!("{manifest_url}: not UTF-8: {e}")))?;
+    let served = ServedFeed::from_manifest_json(&json)?;
+
+    let audit = audit_freshness(&config, &source, &served, channel);
     print!("{}", audit.render());
     Ok(if audit.is_clean() {
         ExitCode::SUCCESS
