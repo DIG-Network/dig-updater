@@ -1168,6 +1168,42 @@ reproducible. The two channels are independent: signing/publishing one never gat
 the nightly leg failing (e.g. a component without a rolling `nightly` release yet) can never stall
 the stable feed.
 
+A component release MUST also trigger a re-sign, rather than waiting for the next scheduled run.
+The cron is the BACKSTOP; the trigger is the mechanism. A releasing repo signals the feed on a
+successful publish with a `repository_dispatch` of type `component-released`, and `feed.yml`
+declares that trigger. Without it a released version is not installable until the next cron — up to
+six hours during which the release, and every check on it, is green while no user can obtain the
+build.
+
+The trigger MUST be `repository_dispatch`, and the signal MUST be sent with a PAT
+(`RELEASE_TOKEN`), for two independent reasons that both produce a SILENT no-op:
+
+- `repository_dispatch` always runs on the default branch, so the signing job's
+  `github.ref == 'refs/heads/main'` binding (§10.5) is satisfied by construction. A `release` event
+  or a tag push carries the TAG ref, which would start a run in which every job evaluates that guard
+  to false and skips, while the run still reports `completed`.
+- GitHub does not start a workflow run from an event sent with the automatic `GITHUB_TOKEN`. Such a
+  dispatch is accepted (HTTP 204) and starts nothing, so the sending step reports success and the
+  feed never wakes.
+
+### 10.2a Served-vs-released freshness audit (normative)
+
+CI MUST audit, at least daily, whether the version each channel's live feed SERVES matches the
+version each component's repo RELEASED, and MUST fail when they disagree or when the comparison
+could not be performed. `dig-updater-feedsign audit-freshness` implements it, read-only and
+secret-free, deliberately off the signing path.
+
+This exists because the feed and the release can disagree while every other check passes: the tag
+exists, it is marked latest, its assets are all present and correctly digested, and only the thing
+users install FROM is stale. It is the general detector for a release step that silently does not
+run — it compares the two ENDS and is therefore indifferent to which step in the pipeline between
+them stopped firing.
+
+The audit MUST NOT report a healthy result from a comparison it did not make. A component whose
+release cannot be resolved, and a component absent from the served manifest, are each findings, not
+skips. It reads the manifest as DATA and makes no trust claim about it; authenticity remains the
+beacon's pinned-key verification (§9) and the signing keystone (§10.6).
+
 ### 10.3 What the manifest states — per-channel selection
 
 For every configured component the signer resolves that channel's GitHub release, selects the
