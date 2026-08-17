@@ -54,6 +54,35 @@ on:
     # SEPARATE cron from the signing heartbeat so a GitHub blip that reds the read-only audit can
     # never interfere with signing the live feed.
     - cron: "17 4 * * *"
+  # A COMPONENT RELEASE WAKES THE FEED (dig_ecosystem#3046). The cron above is the BACKSTOP, not the
+  # mechanism: until this trigger existed, a freshly released version stayed invisible to every
+  # beacon for up to six hours while the GitHub Release itself looked perfectly green — tag live,
+  # marked latest, all assets present. Only the thing users actually install FROM was stale, so a
+  # release-watcher verifying the release (the right thing to verify) reported GREEN while no user
+  # could get the build. The coupling is invisible from the releasing repo, which is why the natural
+  # place to look for the bug is the wrong one.
+  #
+  # A releasing component repo signals this on a successful publish:
+  #
+  #   gh api repos/DIG-Network/dig-updater/dispatches \
+  #     -f event_type=component-released \
+  #     -F 'client_payload[component]=dig-node' -F 'client_payload[version]=1.2.3'
+  #
+  # WHY `repository_dispatch` AND NOT `release:`/`push: tags:` — this is load-bearing, see the
+  # `sign-verify-publish` guard below. A `repository_dispatch` always runs on the DEFAULT branch, so
+  # `github.ref` is `refs/heads/main` and the H1 signing guard passes by construction. For a
+  # `release` event (or a tag push) `github.ref` is the TAG ref, so the guard would evaluate FALSE:
+  # the run would start, every job would silently skip, and the run would still report `completed` —
+  # re-creating the exact "release step that silently does not run" defect this trigger closes.
+  # `crates/dig-updater-broker/tests/feed_workflow_shape.rs` pins that.
+  #
+  # The payload is informational only (it lands in the run's event, useful when reading history).
+  # NOTHING here is trusted: the feed still resolves every component from its own release source and
+  # still passes the pinned-key keystone before publishing, so a dispatch can at worst cause an
+  # EXTRA, fully-verified re-sign of the same content — never a signed feed of someone's choosing.
+  repository_dispatch:
+    types:
+      - component-released
   # PR gate: an edit to feed-config.json (adding/removing an exemption) re-runs the drift audit, so
   # an over-broad exemption is caught on the PR that introduces or preserves it — never merged blind.
   pull_request:

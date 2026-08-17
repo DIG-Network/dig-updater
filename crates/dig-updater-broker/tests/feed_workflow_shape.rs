@@ -236,3 +236,107 @@ fn primary_publish_stays_downstream_of_keystone_verify() {
         "the S3 primary publish must run AFTER the {KEYSTONE_STEP:?} keystone, never before it"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #3046: a RELEASE must reach the feed. The feed is what users install from; the GitHub Release
+// is not. Before this, the only triggers were a 6-hour cron and a manual dispatch, so a freshly
+// released version stayed invisible to every beacon for up to 6 hours while the release itself
+// looked perfectly green — the coupling was invisible from the releasing repo, so a
+// release-watcher verifying the (correct) release reported GREEN while no user could get the
+// build. The guards below pin the trigger AND the reason it is spelled the way it is.
+// ---------------------------------------------------------------------------------------------
+
+/// The `repository_dispatch` event type a releasing component repo sends to wake the feed.
+const RELEASE_DISPATCH_TYPE: &str = "component-released";
+
+/// The workflow's trigger DIRECTIVES — the lines from `on:` up to the next top-level (column-0)
+/// key, with comment lines removed.
+///
+/// Trigger reasoning must look ONLY here: a `push`/`release` mention in a step script elsewhere in
+/// the file says nothing about what starts this workflow. Comments are dropped for the same reason
+/// one level down — the `on:` block documents WHY `repository_dispatch` is used instead of
+/// `release:`, and prose naming a forbidden trigger must not read as a declaration of it.
+fn on_block(workflow: &str) -> String {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in workflow.lines() {
+        if line.starts_with("on:") {
+            inside = true;
+            continue;
+        }
+        // A new column-0 key ends the block; blank/indented/comment lines continue it.
+        if inside && !line.is_empty() && !line.starts_with([' ', '\t', '#']) {
+            break;
+        }
+        if inside && !line.trim_start().starts_with('#') {
+            out.push(line);
+        }
+    }
+    out.join("\n")
+}
+
+/// #3046: a release must be able to TRIGGER the feed rather than waiting up to 6 hours for the
+/// cron to notice it. The releasing repo signals the feed with a `repository_dispatch`.
+#[test]
+fn a_release_can_trigger_the_feed() {
+    let on = on_block(&feed_workflow());
+    assert!(
+        on.contains("repository_dispatch:"),
+        "feed.yml must accept a `repository_dispatch` so a component release can wake the feed \
+         immediately (#3046) instead of being invisible until the next 6-hour cron. on:\n{on}"
+    );
+    assert!(
+        on.contains(RELEASE_DISPATCH_TYPE),
+        "the repository_dispatch trigger must accept the {RELEASE_DISPATCH_TYPE:?} event type \
+         that releasing repos send. on:\n{on}"
+    );
+}
+
+/// The cron MUST survive as the backstop. Replacing it with the dispatch would make the feed
+/// depend entirely on every releasing repo remembering to signal — and a component repo that
+/// never adopts the dispatch would then go stale forever rather than for six hours.
+#[test]
+fn the_cron_backstop_survives_the_release_trigger() {
+    let on = on_block(&feed_workflow());
+    assert!(
+        on.contains("schedule:") && on.contains("cron:"),
+        "the periodic cron must remain as the BACKSTOP behind the release trigger (#3046): a \
+         repo that never sends the dispatch must still get a feed refresh. on:\n{on}"
+    );
+}
+
+/// THE TRAP THIS TICKET IS ABOUT, pinned so it cannot be re-introduced.
+///
+/// The signing job is bound to reviewed main code by `if: github.ref == 'refs/heads/main'` (H1,
+/// #540) — that guard must not be relaxed to let a release trigger through. The consequence is a
+/// hard constraint on WHICH trigger events are usable: `github.ref` is the TAG ref for a `release`
+/// event and for a `push:` on `tags:`, so either of those would satisfy the `on:` clause, start a
+/// run, and then have every job silently evaluate the guard to false — a workflow that reports
+/// `completed` having done nothing. That is precisely the "release step that silently does not
+/// run" class this ticket exists to close, so adding one here would replace the bug with itself.
+///
+/// `repository_dispatch` (and `schedule`, and a `workflow_dispatch` selected against main) always
+/// runs on the DEFAULT branch, so it satisfies the guard by construction.
+#[test]
+fn feed_triggers_are_all_default_branch_events_so_the_main_guard_cannot_silently_skip() {
+    let wf = feed_workflow();
+    let on = on_block(&wf);
+
+    // Spelled as the bare expression, not `if: …`: the guard lives inside a folded `if: >-` block
+    // alongside the schedule clause, so anchoring on the `if:` prefix would pin formatting rather
+    // than the invariant.
+    assert!(
+        wf.contains("github.ref == 'refs/heads/main'"),
+        "the signing job must stay bound to reviewed main code (H1, #540) — a release trigger \
+         must not be bought by relaxing this guard"
+    );
+    for tag_ref_event in ["release:", "tags:"] {
+        assert!(
+            !on.contains(tag_ref_event),
+            "feed.yml declares a `{tag_ref_event}` trigger, whose `github.ref` is the TAG ref — \
+             the `github.ref == 'refs/heads/main'` guard would evaluate false and EVERY job would \
+             be skipped while the run still reported `completed` (#3046's own defect class). Use \
+             `repository_dispatch`, which always runs on the default branch. on:\n{on}"
+        );
+    }
+}
