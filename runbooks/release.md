@@ -137,6 +137,34 @@ builds `main` HEAD, publishes/refreshes today's `nightly-YYYYMMDD` pre-release, 
 
 ## Verify a release went live
 
+> **A published release is not an installable release.** Users install from the signed FEED at
+> `updates.dig.net`, never from the GitHub Release. Those two can disagree, and when they do
+> **everything you would naturally check is green** — the tag exists, it is marked latest, all its
+> assets are present and correctly digested — while no user can obtain the build. This has been
+> misdiagnosed before, because the release looks perfect and the coupling is invisible from the
+> releasing repo. **Check the feed, not just the release.**
+
+- **The feed (check this FIRST — it is what users install from):**
+
+  ```bash
+  curl -fsS https://updates.dig.net/v1/stable/manifest.json \
+    | jq -r '"generated: \(.manifest.generated|todate)", (.manifest.components[]|"\(.name)\t\(.version)")'
+  ```
+
+  The component's version here must be the version you just released. If it is not, the release did
+  not reach users. Since dig_ecosystem#3046 a release wakes the feed automatically
+  (`repository_dispatch: component-released` from `release.yml`), so this normally lags by only the
+  few minutes the feed run takes. If it is still behind after that, the trigger did not fire —
+  check `release.yml`'s "Notify the feed" step and whether `RELEASE_TOKEN` is set, then re-run
+  `feed.yml` by hand:
+
+  ```bash
+  gh workflow run feed.yml --repo DIG-Network/dig-updater --ref main
+  ```
+
+  The daily `audit-freshness` job in `feed.yml` asks this same question and REDs on a mismatch, so a
+  trigger that quietly stops working surfaces within a day rather than never.
+
 - **Stable:** `gh release view vX.Y.Z --repo DIG-Network/dig-updater` — 4 OS/arch pairs × 2 binaries
   (8 assets), `prerelease: false`, marked latest. Watch the build: `gh run watch <id>`.
 - **Nightly:** `gh release view nightly --repo DIG-Network/dig-updater` (rolling) or
@@ -148,7 +176,8 @@ builds `main` HEAD, publishes/refreshes today's `nightly-YYYYMMDD` pre-release, 
 |---|---|---|
 | `cut-release-branch.yml` | `workflow_dispatch` (on main) | Opens a stable line: branch `release/X.Y` off main + prep commit + "next dev cycle" PR. |
 | `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (from `release/*`, changelog + tag) + nightly (from main HEAD, build + pre-release + prune). |
-| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag (`make_latest: true`). |
+| `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag (`make_latest: true`), then signals `feed.yml` so the release becomes installable (#3046). |
+| `feed.yml` | 6h cron + `repository_dispatch: component-released` + daily audit cron + dispatch | Signs + publishes the per-channel feeds users install FROM; audits exemption drift and served-vs-released freshness. |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build (both channels call it). |
 | `ci.yml` / `commitlint.yml` / `ensure-version-increment.yml` | PR + push to `main` **and** `release/**` | The full pre-merge gate set — runs on release-branch PRs too (hotfix/stabilize). |
 

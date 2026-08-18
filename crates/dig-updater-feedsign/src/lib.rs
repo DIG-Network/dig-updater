@@ -43,6 +43,7 @@ mod channel;
 mod config;
 mod doctor;
 mod error;
+mod freshness;
 mod resolve;
 mod sign;
 mod source;
@@ -60,6 +61,7 @@ pub use channel::Channel;
 pub use config::{AssetKind, ChannelFloors, ComponentConfig, FeedConfig, PlatformKey};
 pub use doctor::{ComponentExemptions, DoctorReport, ExemptionAudit};
 pub use error::FeedsignError;
+pub use freshness::{ComponentFreshness, Freshness, FreshnessAudit, ServedFeed};
 pub use resolve::{
     expected_asset_name, expected_asset_names, resolve_version_from_assets, select_artifacts,
     GithubRelease, ResolvedArtifact,
@@ -216,6 +218,22 @@ pub(crate) fn resolve_release_and_version(
 #[must_use]
 pub fn audit_exemptions(config: &FeedConfig, source: &dyn ReleaseSource) -> ExemptionAudit {
     ExemptionAudit::run(config, source)
+}
+
+/// Audit what the live feed SERVES against what each component's repo RELEASED, for one channel —
+/// the served-vs-released check of dig_ecosystem#3046.
+///
+/// Users install from the feed, not from the GitHub Release, so this is the only check that asks
+/// whether a release actually reached them. It is secret-free (public release metadata + the public
+/// manifest) and makes no trust claim about `served`; see [`freshness`] for the full rationale.
+#[must_use]
+pub fn audit_freshness(
+    config: &FeedConfig,
+    source: &dyn ReleaseSource,
+    served: &ServedFeed,
+    channel: Channel,
+) -> FreshnessAudit {
+    FreshnessAudit::run(config, source, served, channel)
 }
 
 /// Assemble and sign one `channel`'s feed for one run (SPEC §10.1).

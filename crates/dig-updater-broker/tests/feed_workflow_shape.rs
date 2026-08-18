@@ -236,3 +236,222 @@ fn primary_publish_stays_downstream_of_keystone_verify() {
         "the S3 primary publish must run AFTER the {KEYSTONE_STEP:?} keystone, never before it"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #3046: a RELEASE must reach the feed. The feed is what users install from; the GitHub Release
+// is not. Before this, the only triggers were a 6-hour cron and a manual dispatch, so a freshly
+// released version stayed invisible to every beacon for up to 6 hours while the release itself
+// looked perfectly green — the coupling was invisible from the releasing repo, so a
+// release-watcher verifying the (correct) release reported GREEN while no user could get the
+// build. The guards below pin the trigger AND the reason it is spelled the way it is.
+// ---------------------------------------------------------------------------------------------
+
+/// The `repository_dispatch` event type a releasing component repo sends to wake the feed.
+const RELEASE_DISPATCH_TYPE: &str = "component-released";
+
+/// The workflow's trigger DIRECTIVES — the lines from `on:` up to the next top-level (column-0)
+/// key, with comment lines removed.
+///
+/// Trigger reasoning must look ONLY here: a `push`/`release` mention in a step script elsewhere in
+/// the file says nothing about what starts this workflow. Comments are dropped for the same reason
+/// one level down — the `on:` block documents WHY `repository_dispatch` is used instead of
+/// `release:`, and prose naming a forbidden trigger must not read as a declaration of it.
+fn on_block(workflow: &str) -> String {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in workflow.lines() {
+        if line.starts_with("on:") {
+            inside = true;
+            continue;
+        }
+        // A new column-0 key ends the block; blank/indented/comment lines continue it.
+        if inside && !line.is_empty() && !line.starts_with([' ', '\t', '#']) {
+            break;
+        }
+        if inside && !line.trim_start().starts_with('#') {
+            out.push(line);
+        }
+    }
+    out.join("\n")
+}
+
+/// #3046: a release must be able to TRIGGER the feed rather than waiting up to 6 hours for the
+/// cron to notice it. The releasing repo signals the feed with a `repository_dispatch`.
+#[test]
+fn a_release_can_trigger_the_feed() {
+    let on = on_block(&feed_workflow());
+    assert!(
+        on.contains("repository_dispatch:"),
+        "feed.yml must accept a `repository_dispatch` so a component release can wake the feed \
+         immediately (#3046) instead of being invisible until the next 6-hour cron. on:\n{on}"
+    );
+    assert!(
+        on.contains(RELEASE_DISPATCH_TYPE),
+        "the repository_dispatch trigger must accept the {RELEASE_DISPATCH_TYPE:?} event type \
+         that releasing repos send. on:\n{on}"
+    );
+}
+
+/// The cron MUST survive as the backstop. Replacing it with the dispatch would make the feed
+/// depend entirely on every releasing repo remembering to signal — and a component repo that
+/// never adopts the dispatch would then go stale forever rather than for six hours.
+#[test]
+fn the_cron_backstop_survives_the_release_trigger() {
+    let on = on_block(&feed_workflow());
+    assert!(
+        on.contains("schedule:") && on.contains("cron:"),
+        "the periodic cron must remain as the BACKSTOP behind the release trigger (#3046): a \
+         repo that never sends the dispatch must still get a feed refresh. on:\n{on}"
+    );
+}
+
+/// THE TRAP THIS TICKET IS ABOUT, pinned so it cannot be re-introduced.
+///
+/// The signing job is bound to reviewed main code by `if: github.ref == 'refs/heads/main'` (H1,
+/// #540) — that guard must not be relaxed to let a release trigger through. The consequence is a
+/// hard constraint on WHICH trigger events are usable: `github.ref` is the TAG ref for a `release`
+/// event and for a `push:` on `tags:`, so either of those would satisfy the `on:` clause, start a
+/// run, and then have every job silently evaluate the guard to false — a workflow that reports
+/// `completed` having done nothing. That is precisely the "release step that silently does not
+/// run" class this ticket exists to close, so adding one here would replace the bug with itself.
+///
+/// `repository_dispatch` (and `schedule`, and a `workflow_dispatch` selected against main) always
+/// runs on the DEFAULT branch, so it satisfies the guard by construction.
+#[test]
+fn feed_triggers_are_all_default_branch_events_so_the_main_guard_cannot_silently_skip() {
+    let wf = feed_workflow();
+    let on = on_block(&wf);
+
+    // Spelled as the bare expression, not `if: …`: the guard lives inside a folded `if: >-` block
+    // alongside the schedule clause, so anchoring on the `if:` prefix would pin formatting rather
+    // than the invariant.
+    assert!(
+        wf.contains("github.ref == 'refs/heads/main'"),
+        "the signing job must stay bound to reviewed main code (H1, #540) — a release trigger \
+         must not be bought by relaxing this guard"
+    );
+    for tag_ref_event in ["release:", "tags:"] {
+        assert!(
+            !on.contains(tag_ref_event),
+            "feed.yml declares a `{tag_ref_event}` trigger, whose `github.ref` is the TAG ref — \
+             the `github.ref == 'refs/heads/main'` guard would evaluate false and EVERY job would \
+             be skipped while the run still reported `completed` (#3046's own defect class). Use \
+             `repository_dispatch`, which always runs on the default branch. on:\n{on}"
+        );
+    }
+}
+
+/// The `jobs:` entry named `name`, from its 2-space `  name:` key to the next job key.
+fn job_block(workflow: &str, name: &str) -> String {
+    let start = format!("  {name}:");
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in workflow.lines() {
+        if line.starts_with(&start) {
+            inside = true;
+            continue;
+        }
+        // The next 2-space job key ends this block (deeper keys and comments continue it).
+        if inside
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && !line.trim_start().starts_with('#')
+            && line.trim_end().ends_with(':')
+        {
+            break;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "feed.yml must declare a job named {name:?}"
+    );
+    out.join("\n")
+}
+
+/// #3046: the served-vs-released freshness audit must exist. It is the detector for the whole
+/// "a release step silently did not run" class — it compares the two ENDS (what the feed serves vs
+/// what each repo released) and so catches the failure no matter which step in between stopped
+/// firing, including a future replacement of the `repository_dispatch` trigger.
+#[test]
+fn the_served_vs_released_freshness_audit_exists() {
+    let job = job_block(&feed_workflow(), "audit-freshness");
+    assert!(
+        job.contains("audit-freshness \\") || job.contains("feedsign audit-freshness"),
+        "the audit-freshness job must actually RUN the freshness audit:\n{job}"
+    );
+}
+
+/// The audit must stay OFF the signing path, in both directions.
+///
+/// It must not carry the signing environment (it needs no secret and must never be a way to reach
+/// one), and it must not run on the 6-hourly signing heartbeat — a read-only audit that a GitHub
+/// blip can red must never be able to interfere with signing or serving the live feed. This mirrors
+/// the same separation `audit-exemptions` already holds.
+#[test]
+fn the_freshness_audit_stays_off_the_signing_path() {
+    let job = job_block(&feed_workflow(), "audit-freshness");
+    assert!(
+        !job.contains("feed-signing"),
+        "the freshness audit needs no signing secret and must not reference the signing \
+         environment:\n{job}"
+    );
+    assert!(
+        !job.contains("BEACON_SIGNING_KEY"),
+        "the freshness audit must never touch the signing key:\n{job}"
+    );
+    assert!(
+        !job.contains("'0 */6 * * *'"),
+        "the freshness audit must NOT run on the 6-hourly signing heartbeat — a red audit must \
+         never be able to disturb signing/serving the live feed:\n{job}"
+    );
+}
+
+/// Extract a job's `if:` expression, folded to a single line.
+///
+/// The `if:` is written as a `>-` folded block, so the condition spans several indented lines that
+/// must be rejoined before the alternatives can be read off it.
+fn job_if_expression(workflow: &str, job: &str) -> String {
+    let block = job_block(workflow, job);
+    let mut lines = block.lines().skip_while(|l| l.trim_start() != "if: >-");
+    lines.next().expect("the job must declare an `if:` guard");
+    lines
+        .take_while(|l| l.starts_with("      ") && !l.trim_start().starts_with('#'))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// #3046: the daily audit cron must reach the audit WITHOUT anyone opting in.
+///
+/// The manual-dispatch leg is deliberately opt-in (`inputs.audit_freshness`), because the usual
+/// reason to dispatch feed.yml by hand is that the feed IS stale — auditing there would red the run
+/// that was fixing the problem. That concession is safe only while some path still audits on its
+/// own. Conjoin the same input onto the cron leg, or drop the cron leg, and the audit becomes a
+/// thing that runs exclusively when a human already suspects the fault it exists to discover: a
+/// detector that reports nothing is indistinguishable from a feed that is never stale.
+///
+/// `the_served_vs_released_freshness_audit_exists` cannot see this — the job would still be
+/// present and would still run the audit binary. What is lost is the only UNPROMPTED trigger, which
+/// lives in the guard, so the guard is what this reads.
+#[test]
+fn the_daily_audit_cron_reaches_the_audit_without_anyone_opting_in() {
+    let guard = job_if_expression(&feed_workflow(), "audit-freshness");
+
+    // Each `||` alternative is an independent way in. At least one must be the audit cron with no
+    // opt-in attached to it; testing the whole expression for both substrings would pass on the
+    // broken form too, since the input and the cron would both still appear — just conjoined.
+    let unprompted = guard.split("||").find(|alternative| {
+        alternative.contains("17 4 * * *") && !alternative.contains("audit_freshness")
+    });
+
+    assert!(
+        unprompted.is_some(),
+        "the daily audit cron must trigger the freshness audit on its own, with no \
+         `audit_freshness` opt-in conjoined to it — otherwise the audit only ever runs when \
+         someone already suspects staleness, and stays silent in every outage it was built to \
+         catch:\n{guard}"
+    );
+}
