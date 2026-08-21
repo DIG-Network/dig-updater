@@ -674,7 +674,9 @@ mod imp {
             let original = "<Task>\u{2764}</Task>"; // include a non-ASCII code point
             let bytes = utf16le_with_bom(original);
             let units: Vec<u16> = bytes[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             assert_eq!(String::from_utf16(&units).unwrap(), original);
