@@ -4,6 +4,26 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.36.0] - 2026-08-21
+
+### Features
+- **release:** Cut stable from release/X.Y branches (nightly stays main-HEAD) (#33)- **feed:** Cover dig-app and bound the version probe with a deadline- **broker:** Track dig-app in the catalog, HELD until it can prove its version (#41)- **broker:** Content-digest version evidence for dig-app + stop corrupting the Windows task store (#44)- **broker:** Refuse an update this host cannot load, and never install backwards (#46)- **updater:** Bound the fetch + worker IPC so a stalled transport can't wedge updates (#48)- **manifest:** Additive build-variant selection so headless Linux hosts can update (#49)- **feedsign:** Add doctor mode to verify releases match feed-config asset kinds (#2115)- **feedsign:** Audit-exemptions drift check — fail only on all-channel over-broad (#2555)
+
+### Bug Fixes
+- **broker:** Guard per-channel lkg subdirs + fail-closed force-guard on gh error (#24)- **beacon:** Relocate staging to a traversable sibling and exit non-zero on a faulted pass- **ci:** Make cutting a release branch idempotent, so the first cut works (#42)- **feedsign:** Name the asset shapes it truly searched for when a component has none (#50)- **feedsign:** Emit linux/arm64 artifacts in the signed manifest (#2126)- **feed:** Alarm when the signed update feed fails, instead of failing quietly (#54)- **feedsign:** Fail closed on missing-platform components, with explicit exemptions (#56)- **updater:** Schedule status is Unknown (not absent) when unprivileged (#2323)- **updater:** Refuse to register a schedule from a non-privileged-owned dir (#2334)- **secure:** Check the write DACL, not just the owner SID, on the install root (#60)- **feed:** A release must trigger the feed, and a check must catch it when one does not (#68)
+
+### Refactor
+- **broker:** Adopt dig-release-resolver 0.2 loadability, delete in-tree copies (#62)
+
+### Build
+- **deps:** Bump sha2 from 0.10.9 to 0.11.0 (#30)- **deps:** Bump the cargo-minor-patch group with 2 updates (#34)- **deps:** Bump libc from 0.2.186 to 0.2.188 in the cargo-minor-patch group (#36)- **deps:** Bump libc from 0.2.188 to 0.2.189 in the cargo-minor-patch group (#37)- **deps:** Bump base64 from 0.22.1 to 0.23.0 (#38)- **deps:** Bump base64 from 0.23.0 to 0.23.1 in the cargo-minor-patch group (#55)- **deps:** Bump windows from 0.58.0 to 0.62.2 (#27)- **deps:** Bump thiserror from 1.0.69 to 2.0.19 (#35)- **deps:** Bump ureq from 2.12.1 to 3.3.0 (#29)- **deps:** Bump ed25519-dalek from 2.2.0 to 3.0.0 (#31)- **deps:** Bump thiserror from 2.0.19 to 2.0.20 in the cargo-minor-patch group (#63)- **deps:** Bump ureq from 3.3.0 to 3.4.0 in the cargo-minor-patch group (#65)
+
+### CI
+- **dependabot:** Add Cargo Dependabot + auto-merge pipeline (#26)- **dependabot:** Schedule updates at 20:00 UTC, before the nightly release (#32)
+
+### Chores
+- **broker:** Consume dig-release-resolver from crates.io by version (#25)
+
 ## [0.14.0] - 2026-07-16
 
 ### Features
