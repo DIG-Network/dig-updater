@@ -40,6 +40,10 @@ pub const BEACON_COMPONENT_NAME: &str = "dig-updater";
 /// requires [`VersionEvidence::UnsafeToProbe`].
 pub const DIG_APP_COMPONENT_NAME: &str = "dig-app";
 
+/// The manifest component name of the chat client (dig_ecosystem#2339) — the SECOND desktop GUI the
+/// beacon tracks, and, like dig-app, one whose version must never be learned by running it.
+pub const DIG_CHAT_COMPONENT_NAME: &str = "dig-chat";
+
 /// The radix that keeps a packed `build` number monotonic in the version — the SAME encoding the
 /// feed-signer uses (SPEC §10.3: `major·10⁶ + minor·10³ + patch`), so the broker's anti-downgrade
 /// comparison agrees byte-for-byte with the number the signed manifest carries.
@@ -360,6 +364,33 @@ impl Catalog {
                 // file-based self-report there is FORGEABLE: an unprivileged user could claim "3.4.0"
                 // beside a 3.0.0 binary and induce this SYSTEM/root beacon to boot it. A digest read
                 // cannot be steered that way, because the expected value comes from the manifest.
+                evidence: VersionEvidence::ArtifactDigest,
+            },
+            ComponentTarget {
+                name: DIG_CHAT_COMPONENT_NAME.into(),
+                method: InstallMethod::RawBinary,
+                dest: exe(DIG_CHAT_COMPONENT_NAME),
+                // Nothing else in the bin dir is dig-chat under another name, and a claimed filename
+                // is exclusive (SPEC §9.7(4)) — two components resolving one path overwrite each
+                // other on every pass.
+                aliases: vec![],
+                // A per-user desktop application, not a machine service: there is no service for the
+                // applier to stop, and the move-aside swap replaces the file under a running process
+                // that keeps executing its old image until the user next launches it.
+                service: None,
+                // dig-chat is an ELECTRON application, and an Electron main process does not parse
+                // its arguments: `--version` does not print a version and exit, it BOOTS THE APP.
+                // This beacon runs as SYSTEM/root, so probing would launch a GUI under the machine
+                // account — the same hazard dig-app documents above, arriving through a different
+                // door. There is no version of dig-chat for which the probe is safe, because the
+                // behaviour is Electron's rather than dig-chat's, so this is a property of the
+                // component and not a temporary state to revisit.
+                //
+                // The installed build is therefore established by HASHING this destination against
+                // the signed manifest artifact's `sha256`. That works because the raw-binary install
+                // renames the verified, digest-checked copy into `dest`, so a digest match IS "the
+                // current build is installed" — evidenced by the root-signed manifest rather than by
+                // the binary, and so not forgeable from the user-writable install root.
                 evidence: VersionEvidence::ArtifactDigest,
             },
         ])
@@ -1067,6 +1098,52 @@ mod tests {
     }
 
     #[test]
+    fn dig_chat_is_tracked_as_a_single_file_desktop_app_the_beacon_never_runs() {
+        // dig_ecosystem#2339. dig-chat publishes ONE self-contained file per platform
+        // (electron-builder `portable` on Windows, `AppImage` on Linux), which is what lets it be a
+        // raw-binary component the applier can swap in place rather than a native package installed
+        // machine-wide and elevated — it is a per-USER application, so it declares no service.
+        let bin = PathBuf::from("opt").join("dig").join("bin");
+        let cat = Catalog::alpha_defaults_in(&bin, &platform());
+        let dig_chat = cat
+            .target(DIG_CHAT_COMPONENT_NAME)
+            .expect("dig-chat is a tracked component (dig_ecosystem#2339)");
+
+        assert_eq!(dig_chat.method, InstallMethod::RawBinary);
+        assert_eq!(dig_chat.dest, bin.join("dig-chat"));
+        assert_eq!(dig_chat.service_id(), None);
+        assert!(dig_chat.aliases.is_empty());
+        // The single installed filename is dig-chat's alone. Claiming a second one would collide
+        // with another component's dest and have the two overwrite each other every pass.
+        assert_eq!(dig_chat.binaries().count(), 1);
+        for other in cat.targets().filter(|t| t.name != dig_chat.name) {
+            assert!(
+                !other.binaries().any(|b| b == dig_chat.dest),
+                "{} also resolves {}, which dig-chat installs",
+                other.name,
+                dig_chat.dest.display()
+            );
+        }
+    }
+
+    #[test]
+    fn dig_chat_gets_the_exe_suffix_on_windows() {
+        // Windows is dig-chat's `portable` target, so the installed file genuinely ends `.exe`; a
+        // dest without the suffix would be a path nothing ever writes, and the digest evidence would
+        // then read every pass as "not installed" and reinstall forever.
+        let bin = PathBuf::from("apps").join("DIG").join("bin");
+        let windows = Platform {
+            os: "windows".into(),
+            arch: "x64".into(),
+        };
+        let cat = Catalog::alpha_defaults_in(&bin, &windows);
+        assert_eq!(
+            cat.target(DIG_CHAT_COMPONENT_NAME).unwrap().dest,
+            bin.join("dig-chat.exe")
+        );
+    }
+
+    #[test]
     fn every_component_the_beacon_may_execute_is_named_here_explicitly() {
         // The question this answers is "which components may a SYSTEM/root beacon EXECUTE?", so it is
         // asked of the WHOLE catalog rather than of four names: a component added later is unnamed
@@ -1094,8 +1171,8 @@ mod tests {
         }
         assert_eq!(
             seen,
-            MAY_BE_EXECUTED.len() + 1,
-            "the catalog should hold the executable set plus dig-app; if that changed, the new component's evidence declaration needs reviewing here"
+            MAY_BE_EXECUTED.len() + 2,
+            "the catalog should hold the executable set plus the two digest-evidenced desktop apps (dig-app, dig-chat); if that changed, the new component's evidence declaration needs reviewing here"
         );
         assert!(
             !MAY_BE_EXECUTED.contains(&DIG_APP_COMPONENT_NAME),
@@ -1106,6 +1183,11 @@ mod tests {
             cat.target(DIG_APP_COMPONENT_NAME).unwrap().evidence,
             VersionEvidence::ArtifactDigest,
             "dig-app is kept current by MEASURING it against the signed manifest, never by running it"
+        );
+        assert_eq!(
+            cat.target(DIG_CHAT_COMPONENT_NAME).unwrap().evidence,
+            VersionEvidence::ArtifactDigest,
+            "dig-chat is an Electron app: `--version` boots it rather than printing, so a SYSTEM/root probe would launch a GUI under the machine account"
         );
     }
 
