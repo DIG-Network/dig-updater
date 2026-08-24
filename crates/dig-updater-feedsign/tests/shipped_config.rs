@@ -19,32 +19,45 @@ fn shipped_config() -> FeedConfig {
     FeedConfig::from_json(&json).expect("the shipped feed-config.json parses")
 }
 
-/// The asset names dig-app's real `v3.0.0` release publishes, verified against the GitHub API. It
-/// ships FOUR `dig-app-…` binaries and — from the very same release — four `dign-…` binaries, its
-/// separate user CLI.
-const DIG_APP_V3_ASSETS: &[&str] = &[
-    "dig-app-3.0.0-linux-x64",
-    "dig-app-3.0.0-macos-arm64",
-    "dig-app-3.0.0-macos-x64",
-    "dig-app-3.0.0-windows-x64.exe",
-    "dign-3.0.0-linux-x64",
-    "dign-3.0.0-macos-arm64",
-    "dign-3.0.0-macos-x64",
-    "dign-3.0.0-windows-x64.exe",
+/// The asset names dig-app's real `v13.1.2` release publishes, verified against the GitHub API on
+/// 2026-08-24. It ships FIVE `dig-app-…` binaries plus two `-headless` Linux variants and — from the
+/// very same release — five `diga-…` binaries, its separate user CLI.
+///
+/// Re-pinned from `v3.0.0` (dig_ecosystem#2339). That release predates linux/arm64 and could only
+/// resolve while dig-app carried a `linux/arm64` exemption; the exemption was dropped once dig-app
+/// began publishing that platform in both channels, at which point a four-platform fixture no longer
+/// described anything dig-app releases. The sibling CLI was renamed `dign` -> `diga` in the same
+/// period, so the exclusion below now guards the name that is actually there.
+const DIG_APP_ASSETS: &[&str] = &[
+    "dig-app-13.1.2-linux-arm64",
+    "dig-app-13.1.2-linux-arm64-headless",
+    "dig-app-13.1.2-linux-x64",
+    "dig-app-13.1.2-linux-x64-headless",
+    "dig-app-13.1.2-macos-arm64",
+    "dig-app-13.1.2-macos-x64",
+    "dig-app-13.1.2-windows-x64.exe",
+    "diga-13.1.2-linux-arm64",
+    "diga-13.1.2-linux-x64",
+    "diga-13.1.2-macos-arm64",
+    "diga-13.1.2-macos-x64",
+    "diga-13.1.2-windows-x64.exe",
 ];
 
-/// dig-app's real `v3.0.0` release, parsed from the GitHub REST shape the signer really consumes —
+/// dig-app's real `v13.1.2` release, parsed from the GitHub REST shape the signer really consumes —
 /// so the fixture exercises the same deserialization path as production, not a hand-built struct.
-fn dig_app_v3_release() -> GithubRelease {
-    let assets: Vec<String> = DIG_APP_V3_ASSETS
+fn dig_app_release() -> GithubRelease {
+    let assets: Vec<String> = DIG_APP_ASSETS
         .iter()
         .map(|name| {
             format!(
-                r#"{{"name":"{name}","browser_download_url":"https://github.com/DIG-Network/dig-app/releases/download/v3.0.0/{name}"}}"#
+                r#"{{"name":"{name}","browser_download_url":"https://github.com/DIG-Network/dig-app/releases/download/v13.1.2/{name}"}}"#
             )
         })
         .collect();
-    let json = format!(r#"{{"tag_name":"v3.0.0","assets":[{}]}}"#, assets.join(","));
+    let json = format!(
+        r#"{{"tag_name":"v13.1.2","assets":[{}]}}"#,
+        assets.join(",")
+    );
     GithubRelease::from_json(
         "https://api.github.com/repos/DIG-Network/dig-app/releases/latest",
         &json,
@@ -69,7 +82,7 @@ fn the_shipped_config_declares_dig_app() {
 }
 
 #[test]
-fn the_shipped_dig_app_entry_resolves_all_four_real_v3_platforms() {
+fn the_shipped_dig_app_entry_resolves_every_real_platform() {
     let cfg = shipped_config();
     let dig_app = cfg
         .components
@@ -77,7 +90,7 @@ fn the_shipped_dig_app_entry_resolves_all_four_real_v3_platforms() {
         .find(|c| c.name == "dig-app")
         .expect("dig-app is a tracked component");
 
-    let arts = select_artifacts(&dig_app_v3_release(), dig_app, "3.0.0")
+    let arts = select_artifacts(&dig_app_release(), dig_app, "13.1.2")
         .expect("dig-app's real release resolves under its shipped config");
 
     let mut platforms: Vec<_> = arts
@@ -85,27 +98,32 @@ fn the_shipped_dig_app_entry_resolves_all_four_real_v3_platforms() {
         .map(|a| (a.os.as_str(), a.arch.as_str()))
         .collect();
     platforms.sort_unstable();
+    // Every platform appears twice on Linux because the headless variant resolves alongside the
+    // default build; deduplicating would hide a variant that failed to resolve at all.
+    platforms.dedup();
     assert_eq!(
         platforms,
         vec![
+            ("linux", "arm64"),
             ("linux", "x64"),
             ("macos", "arm64"),
             ("macos", "x64"),
             ("windows", "x64")
         ],
-        "all four platforms the beacon ships to must resolve"
+        "all five platforms the beacon ships to must resolve, with no exemption left to hide one"
     );
 }
 
-/// `dign` is NOT dig-app's artifact in this feed, and the exact-name match is what keeps it out.
+/// The sibling CLI (`diga`, formerly `dign`) is NOT dig-app's artifact in this feed, and the
+/// exact-name match is what keeps it out.
 ///
 /// This matters beyond tidiness: the beacon already installs `dign` as a byte-identical ALIAS of
 /// dig-node (`plan.rs`, #548), and dig-node still publishes its own `dign-<ver>-*` assets. Two
 /// components resolving artifacts for one installed filename would have them overwrite each other
 /// on every pass, so dig-app's entry must select only the `dig-app-…` binaries — even though the
-/// `dign-…` ones sit in the very same release.
+/// sibling CLI's binaries sit in the very same release.
 #[test]
-fn the_shipped_dig_app_entry_never_selects_the_sibling_dign_binaries() {
+fn the_shipped_dig_app_entry_never_selects_the_sibling_cli_binaries() {
     let cfg = shipped_config();
     let dig_app = cfg
         .components
@@ -113,7 +131,7 @@ fn the_shipped_dig_app_entry_never_selects_the_sibling_dign_binaries() {
         .find(|c| c.name == "dig-app")
         .expect("dig-app is a tracked component");
 
-    let arts = select_artifacts(&dig_app_v3_release(), dig_app, "3.0.0").expect("resolves");
+    let arts = select_artifacts(&dig_app_release(), dig_app, "13.1.2").expect("resolves");
 
     for art in &arts {
         let file = art.url.rsplit('/').next().unwrap_or_default();
@@ -142,8 +160,11 @@ fn the_shipped_dig_app_entry_resolves_both_linux_variants_when_headless_is_publi
     );
     assert_eq!(dig_app.variants[0].variant, "headless");
 
-    // A future release that also ships the headless build.
+    // Every platform the beacon ships to, since none is exempt for dig-app any more, plus the
+    // headless build on x64 ONLY — so the assertion below distinguishes "the headless variant
+    // resolved" from "every Linux build resolved twice".
     let names = [
+        "dig-app-3.5.0-linux-arm64",
         "dig-app-3.5.0-linux-x64",
         "dig-app-3.5.0-linux-x64-headless",
         "dig-app-3.5.0-macos-arm64",
@@ -162,10 +183,21 @@ fn the_shipped_dig_app_entry_resolves_both_linux_variants_when_headless_is_publi
     let release = GithubRelease::from_json("https://api/x", &json).expect("parses");
 
     let arts = select_artifacts(&release, dig_app, "3.5.0").expect("resolves");
-    let linux: Vec<_> = arts.iter().filter(|a| a.os == "linux").collect();
-    assert_eq!(linux.len(), 2, "both linux/x64 builds resolve");
-    assert_eq!(linux[0].variant, None);
-    assert_eq!(linux[1].variant.as_deref(), Some("headless"));
+    let x64: Vec<_> = arts
+        .iter()
+        .filter(|a| a.os == "linux" && a.arch == "x64")
+        .collect();
+    assert_eq!(x64.len(), 2, "both linux/x64 builds resolve");
+    assert_eq!(x64[0].variant, None, "the default build is emitted first");
+    assert_eq!(x64[1].variant.as_deref(), Some("headless"));
+    // arm64 publishes no headless build in this fixture, so it must resolve exactly once — which is
+    // what stops the count above passing on an accidental cross-arch match.
+    assert_eq!(
+        arts.iter()
+            .filter(|a| a.os == "linux" && a.arch == "arm64")
+            .count(),
+        1
+    );
 }
 
 /// Every component in the shipped config must name a DIG-Network repository and a non-empty asset
