@@ -1026,6 +1026,16 @@ carry dig-app in its payload — shipped roughly 16 hours BEFORE dig-app 3.4.0, 
 window provably carry an argument-ignoring build. That population is not empty; it is unobservable. The
 exposure is closed by NOT EXECUTING, not by waiting for a version floor (dig_ecosystem#1803).
 
+`dig-chat` is tracked on the SAME terms and for a stronger reason (dig_ecosystem#2339). It is an
+Electron application, and an Electron main process does not parse its arguments: `--version` does not
+print and exit, it BOOTS THE APP — under this beacon's SYSTEM/root account. Unlike dig-app there is no
+version at which that changes, because the behaviour belongs to the runtime rather than to dig-chat, so
+*content-digest evidenced* is a permanent property of the component and not a state to revisit. It is a
+raw binary because each of its platforms publishes ONE self-contained file (a Windows `portable`
+executable, a Linux `AppImage`), and it is service-less and alias-less for the same reasons dig-app is:
+it is a per-USER application with no machine service to stop, and an installed filename is exclusive
+per (4).
+
 ### 9.8 Host loadability (normative)
 
 A verified artifact is not necessarily a RUNNABLE artifact. A build may require shared libraries a given
@@ -1229,7 +1239,7 @@ The asset selected within a release depends on the component's **asset kind** �
 select the SAME shape the broker will install (§9.5), or the broker stages a mislabelled file (a raw
 executable renamed `dig-node.msi`) and its OS installer rejects it (`msiexec` exit 1620):
 
-- **raw binary** (digstore, dig-dns, dig-updater, dig-app — the default) — `{prefix}-{version}-{os}-{arch}`,
+- **raw binary** (digstore, dig-dns, dig-updater, dig-app, dig-chat — the default) — `{prefix}-{version}-{os}-{arch}`,
   with `.exe` on Windows (e.g. `digstore-0.13.1-windows-x64.exe`, `dig-node-0.31.1-linux-x64`);
 - **native package** (dig-node) — the platform installer's native asset name: Windows
   `{prefix}-{version}-{os}-{arch}.msi`; macOS `{prefix}-{version}-macos.pkg` (ONE universal package,
@@ -1286,9 +1296,15 @@ so it runs as a PR gate on `feed-config.json` and on a daily schedule (`feedsign
 never red the live feed.
 
 The alpha component set is **dig-node (native package), digstore, dig-updater,
-dig-dns, dig-app (raw binaries)** — dig-app is PUBLISHED in the feed but not yet tracked by the
-broker's catalog (§9.7), and a manifest entry for an untracked component is inert; each component's `asset_kind` comes from the committed `feed-config.json`
-(default kind `raw_binary`). The anti-rollback floor is **per channel** (`channels.stable`,
+dig-dns, dig-app, dig-chat (raw binaries)**. Every one of them is tracked by the broker's catalog
+(§9.7); a manifest entry for an UNTRACKED component would be inert, which is why the feed entry and the
+catalog entry are added together and never separately. Each component's `asset_kind` comes from the
+committed `feed-config.json` (default kind `raw_binary`).
+
+A component MAY declare `exempt_platforms` — the `(os, arch)` pairs it is allowed to publish no
+artifact for. dig-chat exempts `macos/x64`, `macos/arm64` and `linux/arm64`: macOS is blocked on a
+Developer ID certificate (an unsigned build fails Gatekeeper, so shipping one would deliver an
+application that cannot open) and `linux/arm64` has no build runner. The anti-rollback floor is **per channel** (`channels.stable`,
 `channels.nightly` — each on its own build scale, both defaulting to `0` = nothing floored;
 raised deliberately to retire a vulnerable build). The component set, per-component asset kind, the
 per-channel floors, and the freshness windows all live in that one reviewable file — never hard-coded
