@@ -167,10 +167,18 @@ impl ComponentOutcome {
     /// Replace the recorded installed version with the one the health gate RE-OBSERVED on disk
     /// (#582) — verified reality rather than the manifest's promise. Used only on the install path,
     /// where a measurement exists; elsewhere there is nothing better than the plan to report.
+    ///
+    /// An EMPTY `Present` is not a measurement — `digest_evidence_any` uses it to mean "the bytes
+    /// match no known variant" — so it leaves the recorded version alone rather than overwriting a
+    /// real one with a blank. `health.rs`'s gate rejects an empty reading before this is reached, so
+    /// the guard is not live today; it is here so the emptiness contract holds at the one place that
+    /// writes the field, and does not depend on a caller two modules away staying strict.
     #[must_use]
     fn with_detected_version(mut self, detected: &DetectedVersion) -> Self {
         if let DetectedVersion::Present(raw) = detected {
-            self.installed_version = Some(raw.clone());
+            if !raw.trim().is_empty() {
+                self.installed_version = Some(raw.clone());
+            }
         }
         self
     }
@@ -1019,9 +1027,17 @@ fn restart_after(
 /// The two pairs that look like success but are not evidence:
 ///
 /// - **an ALREADY-RUNNING start beside `Running`.** `Stop` does not wait for STOPPED, the replace
-///   succeeds against a running image, and `sc start` then answers 1056 precisely BECAUSE the
-///   pre-stop process is still up. `settled_run_state` returns on the first `Running` it sees,
-///   which may be that same process. Nothing restarted, so the honest verdict is `Unknown`.
+///   succeeds against a running image, and the service is still up when the start is reached.
+///   `settled_run_state` returns on the first `Running` it sees, which may be that same process.
+///   Nothing restarted, so the honest verdict is `Unknown`.
+///
+///   This row is reached on EVERY platform, not only Windows, because
+///   [`crate::service::control`] classifies it from a run-state observation taken BEFORE the start
+///   rather than from the start's exit code. That distinction is load-bearing on **Linux**: it is
+///   where dig-node ships as a service ([`crate::plan`]'s `LinuxDeb`), a `dh_installsystemd`
+///   postinst restarts its own unit, and `systemctl start` then exits 0 — so classifying from the
+///   exit code would send the ORDINARY Linux path down the `Performed` row above and report
+///   `Active` for a machine still serving the old build.
 /// - **a FAILED start beside `Running`.** The start was refused for some other reason, yet
 ///   something under that name is up — so it is something this pass did not launch.
 ///
@@ -1189,9 +1205,12 @@ mod tests {
     }
 
     /// The `sc.exe` text #77 was measured on: a non-zero start on a service that is nonetheless up.
-    /// `service::control` classifies THIS text as [`ControlOutcome::AlreadyInState`], so production
-    /// reaches `judge_restart` with that outcome; the string survives as the error fixture for a
-    /// start that failed for some OTHER reason.
+    ///
+    /// Production no longer depends on this text to reach [`ControlOutcome::AlreadyInState`]:
+    /// `service::control` observes the run state BEFORE the start, which is the only route that
+    /// works on Linux (`systemctl start` exits 0 for an active unit). The Windows text/1056 arm
+    /// survives as defence in depth for the race between that observation and the command, and this
+    /// string survives here as the error fixture for a start that failed for some OTHER reason.
     const START_1056: &str =
         "sc.exe exited with 1056: An instance of the service is already running";
 

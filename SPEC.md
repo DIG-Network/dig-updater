@@ -1159,7 +1159,16 @@ Every per-component outcome therefore carries, separately:
   keeps executing. A conforming implementation MUST report `active` only when the manager PERFORMED
   the restart (it must leave STOPPED to do so, retiring the old process) AND the service was then
   observed running. A start that was refused because the service was ALREADY running, or that failed
-  for any other reason while the service is nonetheless up, MUST be reported `unknown`;
+  for any other reason while the service is nonetheless up, MUST be reported `unknown`.
+
+  **The already-running case MUST be established from an observation of the service's run state
+  taken BEFORE the start, not from the start's exit status.** An exit status cannot carry that
+  signal on every platform: `systemctl start` exits 0 for an already-active unit, byte-identical to
+  a performed start, so an implementation that classifies from the exit code alone reports `active`
+  for every already-running start on Linux — the platform on which a service-backed component is
+  distributed as a `.deb` whose postinst restarts its own unit, making that the ordinary path rather
+  than a race. A conforming implementation MUST therefore treat a service observed running before
+  the start as an already-running start on EVERY platform it supports;
 - **the available version** — the version the feed offers when it is not the one installed.
 
 A surface that notifies a person about an update MUST derive its wording from these fields. Stating

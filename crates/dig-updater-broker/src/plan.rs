@@ -682,16 +682,7 @@ impl Plan {
     }
 }
 
-/// The installed build a probe answer packs to, on the same monotonic scale the signed manifest uses
-/// ([`pack_build`]) — the build a rollback would reinstate. `None` when nothing is installed, or when
-/// what it printed carries no version this beacon can age.
-///
-/// The version is the FIRST whitespace-separated token that packs, not the last. A `--version` line
-/// is conventionally `<program> <version>` (clap's default), but trailing detail is common
-/// (`dig-app 3.4.0 (build abc123)`) — and taking the last token there yields `(build`, which packs to
-/// nothing. Reading "the first token that IS a version" is stable against detail appearing on either
-/// side, so a cosmetic change to a component's version line cannot silently un-age its install.
-/// The raw version string enumeration read, if it read one — [`PlannedComponent::detected_version`].
+/// The raw version string a probe read, if it read one — [`PlannedComponent::detected_version`].
 ///
 /// An EMPTY `Present` is not a reading: [`digest_evidence_any`] uses it to mean "the bytes match no
 /// known variant", which is a statement about digests, not a version. Reporting it as an installed
@@ -704,6 +695,15 @@ fn detected_version(detected: &DetectedVersion) -> Option<String> {
     }
 }
 
+/// The installed build a probe answer packs to, on the same monotonic scale the signed manifest uses
+/// ([`pack_build`]) — the build a rollback would reinstate. `None` when nothing is installed, or when
+/// what it printed carries no version this beacon can age.
+///
+/// The version is the FIRST whitespace-separated token that packs, not the last. A `--version` line
+/// is conventionally `<program> <version>` (clap's default), but trailing detail is common
+/// (`dig-app 3.4.0 (build abc123)`) — and taking the last token there yields `(build`, which packs to
+/// nothing. Reading "the first token that IS a version" is stable against detail appearing on either
+/// side, so a cosmetic change to a component's version line cannot silently un-age its install.
 #[must_use]
 fn installed_build(detected: &DetectedVersion) -> Option<u64> {
     match detected {
