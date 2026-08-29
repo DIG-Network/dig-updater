@@ -618,6 +618,7 @@ mod tests {
             aliases: vec![],
             version: "0.15.0".into(),
             build: 15_000,
+            detected_version: None,
             variants: vec![crate::plan::PlannedVariant {
                 variant: None,
                 expected_digest: digest.into(),

@@ -36,7 +36,7 @@ use std::process::ExitCode;
 use dig_updater_broker::config::{Channel, UpdaterConfig};
 use dig_updater_broker::display::without_control_chars;
 use dig_updater_broker::paths::default_state_dir;
-use dig_updater_broker::status::StatusSnapshot;
+use dig_updater_broker::status::{Activation, ComponentStatus, StatusSnapshot};
 use dig_updater_broker::{elevation, scheduler, Broker, BrokerError, PassReport};
 use dig_updater_broker::{follow_channel_change, ExtFollow, InstalledDigInstaller};
 use dig_updater_worker::{FeedSource, WorkerReport};
@@ -726,8 +726,37 @@ fn render_status(status: &StatusSnapshot, json: bool) -> String {
             c.result,
             without_control_chars(&c.detail)
         ));
+        out.push_str(&component_version_line(c));
     }
     out
+}
+
+/// The human suffix stating what is INSTALLED and what is AVAILABLE for one component
+/// (dig_ecosystem#3180), or an empty string when neither is known.
+///
+/// The wording never lets "installed" stand for "running": a build that is on disk while an older
+/// process still serves it reads `installed, restart pending`, and a build whose activation could not
+/// be established says so rather than borrowing the confident phrasing of one that was measured.
+fn component_version_line(c: &ComponentStatus) -> String {
+    let mut parts = Vec::new();
+    if let Some(installed) = &c.installed {
+        let state = match installed.activation {
+            Activation::Active => "installed and active",
+            Activation::PendingRestart => "installed, restart pending",
+            Activation::Unknown => "installed, running build unknown",
+        };
+        parts.push(format!(
+            "{state} {}",
+            without_control_chars(&installed.version)
+        ));
+    }
+    if let Some(available) = &c.available {
+        parts.push(format!("available {}", without_control_chars(available)));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("\n      ({})", parts.join("; "))
 }
 
 /// Render `channel get`/`channel set`'s outcome as JSON or a human line. Pure.
@@ -1106,10 +1135,70 @@ mod tests {
                 action: "update".to_string(),
                 result: "installed".to_string(),
                 detail: "v0.1.0 -> v0.2.0".to_string(),
+                // dig_ecosystem#3180: the build is on disk but an older process still serves it —
+                // the state the human line must NOT render as a plain "installed".
+                installed: Some(dig_updater_broker::status::InstalledBuild {
+                    version: "v0.2.0".to_string(),
+                    activation: Activation::PendingRestart,
+                }),
+                available: None,
             });
         let human = render_status(&status, false);
         assert!(human.contains("run check at 100 -> applied"));
         assert!(human.contains("digstore [update] installed"));
+        // dig_ecosystem#3180: the two facts are stated separately and the activation is not
+        // overstated. `installed and active` must NOT appear for a build that is merely on disk —
+        // asserting only the presence of "restart pending" would still pass if BOTH phrases were
+        // emitted, which is the ambiguity the wording exists to remove.
+        assert!(
+            human.contains("installed, restart pending v0.2.0"),
+            "a build on disk behind a running older process says so: {human}"
+        );
+        assert!(
+            !human.contains("installed and active"),
+            "nothing measured this build as running, so nothing may claim it: {human}"
+        );
+    }
+
+    /// dig_ecosystem#3180: the machine-readable surface a user-session notifier reads carries the
+    /// installed/available split structurally, not buried in `detail` prose.
+    #[test]
+    fn render_status_json_exposes_installed_activation_and_available_separately() {
+        let mut status = never_checked_status();
+        status
+            .components
+            .push(dig_updater_broker::status::ComponentStatus {
+                component: "dig-node".to_string(),
+                action: "update".to_string(),
+                result: "deferred".to_string(),
+                detail: "target locked after retries".to_string(),
+                installed: Some(dig_updater_broker::status::InstalledBuild {
+                    version: "0.154.0".to_string(),
+                    activation: Activation::Active,
+                }),
+                available: Some("0.155.0".to_string()),
+            });
+        let json: serde_json::Value = serde_json::from_str(&render_status(&status, true)).unwrap();
+        let c = &json["components"][0];
+        assert_eq!(c["installed"]["version"], "0.154.0");
+        assert_eq!(c["installed"]["activation"], "active");
+        assert_eq!(
+            c["available"], "0.155.0",
+            "the version a notification would offer is its own field, not parsed out of prose"
+        );
+    }
+
+    /// A `status.json` written by a pre-#3180 beacon must still deserialize — the fields are
+    /// ADDITIVE (SPEC §5.1), and an older record reads as "this beacon reported nothing" rather
+    /// than as a parse failure that would make status unanswerable.
+    #[test]
+    fn a_pre_3180_component_status_still_deserializes_with_no_version_fields() {
+        let c: dig_updater_broker::status::ComponentStatus = serde_json::from_str(
+            r#"{"component":"digstore","action":"update","result":"installed","detail":"ok"}"#,
+        )
+        .expect("a pre-#3180 component status still parses");
+        assert!(c.installed.is_none());
+        assert!(c.available.is_none());
     }
 
     #[test]
@@ -1187,12 +1276,18 @@ mod tests {
                     action: "update".into(),
                     result: ComponentResult::Installed,
                     detail: "v0.1.0 -> v0.2.0".into(),
+                    installed_version: Some("v0.2.0".into()),
+                    activation: Activation::Active,
+                    available_version: None,
                 },
                 ComponentOutcome {
                     component: "dig-updater".into(),
                     action: "skip".into(),
                     result: ComponentResult::Skipped,
                     detail: "already current".into(),
+                    installed_version: Some("v0.36.0".into()),
+                    activation: Activation::Unknown,
+                    available_version: None,
                 },
             ],
             state_advanced: true,

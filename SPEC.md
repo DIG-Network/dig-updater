@@ -803,6 +803,15 @@ bare name resolved through `PATH`. Availability invariants:
   propagates, so a stopped node is never left down. A restart failure is surfaced as a warning but
   never turns an otherwise-correct on-disk state into a hard failure (the next scheduled wake + the
   service manager's own boot recovery bring it back).
+- **A restart's success is judged by the service's OBSERVED run state, not by the exit code of the
+  start command.** After attempting the start the applier MUST ask the service manager whether the
+  service is running, allowing it a bounded settle period, and MUST report a restart failure only when
+  the service is observed NOT running. Symmetrically to the stop rule above, `sc.exe start` exits
+  **1056** (`ERROR_SERVICE_ALREADY_RUNNING`) on a service that is up, which after a restart is the
+  expected race and MUST be classified as success; `1060` (no such service) MUST NOT be. A start that
+  REPORTS success on a service observed not running MUST be reported as a failure. Where the run state
+  cannot be established, the applier MUST report that it is unconfirmed and MUST NOT assert either
+  outcome.
 
 ### 9.6 The version probe is BOUNDED — and what a component owes it
 
@@ -1125,6 +1134,46 @@ headless host whose default build is unloadable but whose headless build loads t
 headless build; it is NOT refused.
 
 ---
+
+### 9.10 What is INSTALLED versus what is RUNNING
+
+The applier replaces a running binary by renaming the old image aside (§9.5), so **the new bytes are at
+the destination while the old process continues to run** until something restarts it. These are two
+different facts and a conforming implementation MUST NOT let either stand for the other.
+
+Every per-component outcome therefore carries, separately:
+
+- **the installed version** — what is at the destination, when this pass established one. A pass that
+  left the destination on a build it knows only as an opaque build number MUST report no version
+  rather than inferring one;
+- **its activation** — one of `active` (the installed build was OBSERVED to be the one running),
+  `pending_restart` (the build is on disk, an older one is still running), or `unknown` (which build
+  is running could not be established). `unknown` is the default and MUST NOT be reported as either
+  other value. Note that the §9.6 version probe inspects the FILE at the destination, so it establishes
+  what is on disk and is not by itself evidence of what is executing;
+
+  **`active` requires an observation that distinguishes the new build from the old process.** A
+  service manager reporting a service RUNNING is not such an observation on its own: it names a
+  service, not a build, and the process it names may be the one the replace was meant to displace —
+  the applier's stop does not wait for STOPPED (§9.5), so a replace can succeed while the old image
+  keeps executing. A conforming implementation MUST report `active` only when the manager PERFORMED
+  the restart (it must leave STOPPED to do so, retiring the old process) AND the service was then
+  observed running. A start that was refused because the service was ALREADY running, or that failed
+  for any other reason while the service is nonetheless up, MUST be reported `unknown`.
+
+  **The already-running case MUST be established from an observation of the service's run state
+  taken BEFORE the start, not from the start's exit status.** An exit status cannot carry that
+  signal on every platform: `systemctl start` exits 0 for an already-active unit, byte-identical to
+  a performed start, so an implementation that classifies from the exit code alone reports `active`
+  for every already-running start on Linux — the platform on which a service-backed component is
+  distributed as a `.deb` whose postinst restarts its own unit, making that the ordinary path rather
+  than a race. A conforming implementation MUST therefore treat a service observed running before
+  the start as an already-running start on EVERY platform it supports;
+- **the available version** — the version the feed offers when it is not the one installed.
+
+A surface that notifies a person about an update MUST derive its wording from these fields. Stating
+that a version "was installed" when its activation is `pending_restart` asserts something false about
+the machine.
 
 ## 10. The feed + signing (CI)
 
@@ -1593,7 +1642,17 @@ Administrator/root.
                                            // "installed"/"skipped"/"deferred"/"rolled_back"/"held"/
                                            // "refused" (§9.8 — the host cannot LOAD the artifact,
                                            // so nothing was installed; `action` is then "refuse")
-      "detail":    "dig-node now reports dig-node 0.26.0"
+      "detail":    "dig-node now reports dig-node 0.26.0",
+      "installed": {                      // ADDITIVE (§9.10): what is at the destination and whether
+                                           // it is RUNNING. null when this pass established no
+                                           // installed version (a dry check, a refused or held
+                                           // component). Defaults to null when absent.
+        "version":    "0.26.0",
+        "activation": "active"            // "active" | "pending_restart" | "unknown"
+      },
+      "available": null                   // ADDITIVE (§9.10): the version the feed OFFERS when it is
+                                           // not the one installed — what a "new version available"
+                                           // notification names. Defaults to null when absent
     }
   ],
   "next_wake":  1731076400,               // a best-effort ESTIMATE (now + 24h) if the daily

@@ -119,18 +119,47 @@ pub fn service_argv(service_id: &str, action: ServiceAction) -> Result<Vec<Strin
 /// stop that reaches an already-stopped state lets the pass proceed, and the guaranteed restart then
 /// brings the node up (#666 F2).
 ///
+/// **Symmetrically, an ALREADY-RUNNING `Start` is not a start failure** ([`is_already_running`], #77).
+/// `sc.exe start` exits **1056** `ERROR_SERVICE_ALREADY_RUNNING` when the service is up — which for a
+/// service the beacon has just restarted is the expected race, not a fault. Reporting it as one told
+/// an operator "could not restart dig-node" about a node that was running the new binary perfectly,
+/// and a false failure is worse than no report, because whoever reads it remediates a problem that
+/// does not exist. The intent of `Start` is "be running"; a service that IS running has met it.
+///
+/// It is nonetheless a DIFFERENT success from a performed one, so it is returned as
+/// [`ControlOutcome::AlreadyInState`] rather than collapsed into `Ok(())`: only a PERFORMED start
+/// proves the manager drove the service out of STOPPED, and only that proves the process now running
+/// was launched from the bytes this pass installed. See [`crate::pass`]'s restart verdict.
+///
+/// **The already-running case is decided BEFORE the start, not from its exit code**
+/// ([`start_outcome_from_prior`]): the run state is observed first, and a `Running` service short-
+/// circuits to `AlreadyInState` without asking the manager to start it. An exit code cannot carry
+/// this signal on every platform — `systemctl start` exits **0** for an already-active unit, which
+/// is byte-identical to a performed start — so a fix resting on the exit code would classify only
+/// Windows, and Linux is the platform DIG actually ships as a service ([`crate::plan`]'s
+/// `LinuxDeb` dig-node). [`is_already_running`] remains as defence in depth for the Windows 1056
+/// race, on the narrow window between the observation and the command.
+///
 /// # Errors
 ///
 /// A detail string if the argv cannot be built (unresolvable tool) or the command genuinely fails /
-/// exits non-zero for a reason OTHER than the service already being stopped.
-pub fn control(service_id: &str, action: ServiceAction) -> Result<(), String> {
+/// exits non-zero for a reason OTHER than the service already being in the requested state.
+pub fn control(service_id: &str, action: ServiceAction) -> Result<ControlOutcome, String> {
+    if action == ServiceAction::Start {
+        if let Some(outcome) = start_outcome_from_prior(&run_state(service_id)) {
+            return Ok(outcome);
+        }
+    }
     let argv = service_argv(service_id, action)?;
     let output = run_output(&argv)?;
     if output.status.success() {
-        return Ok(());
+        return Ok(ControlOutcome::Performed);
     }
     if action == ServiceAction::Stop && is_already_stopped(&output) {
-        return Ok(());
+        return Ok(ControlOutcome::AlreadyInState);
+    }
+    if action == ServiceAction::Start && is_already_running(&output) {
+        return Ok(ControlOutcome::AlreadyInState);
     }
     let mut detail = format!("{} exited with {}", argv[0], output.status);
     let text = combined_output(&output);
@@ -140,10 +169,49 @@ pub fn control(service_id: &str, action: ServiceAction) -> Result<(), String> {
     Err(detail)
 }
 
+/// The outcome a `Start` has ALREADY met, judged from the run state observed BEFORE the service
+/// manager is asked — `Some(AlreadyInState)` when the service is running, `None` when the start must
+/// actually be attempted (#77).
+///
+/// This exists because **an exit code cannot express "already running" on every platform**, and the
+/// platform where it cannot is the one DIG ships as a service. `systemctl start` exits **0** for an
+/// already-active unit, indistinguishable from a performed start, so [`is_already_running`]'s Linux
+/// text arm — consulted only on a NON-zero exit — never sees the case it was written for. Judging
+/// from an observation taken before the command removes the dependence on an exit code that carries
+/// no such signal, and makes the classification deliberate on all three platforms rather than
+/// accidental on two (macOS `launchctl bootstrap` merely happens to exit non-zero).
+///
+/// A prior state of [`ServiceRunState::Unknown`] returns `None`: not knowing is not evidence the
+/// service is up, and the start is attempted rather than skipped on a guess.
+#[must_use]
+pub fn start_outcome_from_prior(prior: &ServiceRunState) -> Option<ControlOutcome> {
+    match prior {
+        ServiceRunState::Running => Some(ControlOutcome::AlreadyInState),
+        ServiceRunState::NotRunning | ServiceRunState::Unknown { .. } => None,
+    }
+}
+
+/// How a successful [`control`] call reached its goal — the service manager DID the transition, or
+/// the service was already where the caller wanted it.
+///
+/// Both are successes for the caller's INTENT ("be stopped" / "be running"), which is why both are
+/// `Ok`. They are not interchangeable as EVIDENCE: a performed start is an observation that the
+/// manager took the service out of STOPPED, whereas an already-running start observes only that
+/// *something* under that name was up — possibly the very process the replace was supposed to
+/// displace. Keeping them apart is what stops a restart verdict from asserting a build identity
+/// nothing measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOutcome {
+    /// The service manager carried out the requested transition.
+    Performed,
+    /// The service was ALREADY stopped (`Stop`) or ALREADY running (`Start`); nothing transitioned.
+    AlreadyInState,
+}
+
 /// A service-control function: stop or start a service by id. Injected into the applier so the
 /// stop→replace→restart ORDERING + failure handling are unit-tested without touching a real service
 /// manager (production wires [`control`]).
-pub type ServiceControl<'a> = dyn Fn(&str, ServiceAction) -> Result<(), String> + 'a;
+pub type ServiceControl<'a> = dyn Fn(&str, ServiceAction) -> Result<ControlOutcome, String> + 'a;
 
 /// Run the service-control argv, returning its captured [`std::process::Output`] (so the caller can
 /// classify an already-stopped exit, [`is_already_stopped`]). The program at index 0 is the
@@ -212,6 +280,242 @@ fn is_already_stopped(output: &std::process::Output) -> bool {
     }
 }
 
+/// Is a non-zero `Start` exit actually the benign "the service is already running" state rather than
+/// a genuine refusal (#77)?
+///
+/// This is DEFENCE IN DEPTH, not the primary classification: [`control`] observes the run state
+/// before it starts anything, so an already-running service never reaches this function. What
+/// remains for it is the race — a service that came up in the window between that observation and
+/// the command — which is why it must not be relied on alone. It **cannot** classify the Linux case
+/// at all: `systemctl start` exits 0 for an active unit, so a non-zero exit is the one thing systemd
+/// does not produce there.
+///
+/// Matched per OS on the exit code AND the emitted text:
+/// - **Windows `sc start`** — exit 1056 `ERROR_SERVICE_ALREADY_RUNNING` ("an instance of the service
+///   is already running"). **1060 `ERROR_SERVICE_DOES_NOT_EXIST` is deliberately NOT matched**: a
+///   service that does not exist is not running, and masking it would hide a real misconfiguration.
+/// - **macOS `launchctl bootstrap`** — exit 37 `EALREADY` / "service already loaded" / "already
+///   bootstrapped".
+/// - **Linux `systemctl start`** — exits 0 for an active unit, so this function is UNREACHABLE for
+///   the already-running case; the text arm exists only so a future systemd wording change is not a
+///   false failure. The Linux case is classified by the pre-start observation instead.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn is_already_running(output: &std::process::Output) -> bool {
+    let text = combined_output(output).to_ascii_lowercase();
+    let code = output.status.code();
+    #[cfg(windows)]
+    {
+        if code == Some(1056) {
+            return true;
+        }
+        text.contains("1056") || text.contains("already running")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if code == Some(37) {
+            return true;
+        }
+        text.contains("already loaded") || text.contains("already bootstrapped")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = code;
+        text.contains("already active") || text.contains("already running")
+    }
+}
+
+/// Whether a service is currently running — the OUTCOME the beacon actually cares about after a
+/// restart, as distinct from the exit code of the one `start` command it ran (#77).
+///
+/// Three-valued on purpose, for the same reason [`crate::status::ScheduleRegistration`] is: a probe
+/// that cannot read the service manager genuinely does not know, and collapsing that into
+/// [`Self::NotRunning`] would make "I could not look" indistinguishable from "I looked and it is
+/// down" — the exact substitution of a fabricated answer for an unknown that this ticket exists to
+/// remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceRunState {
+    /// The service manager reports the service running.
+    Running,
+    /// The service manager reports the service stopped, failed, or absent.
+    NotRunning,
+    /// The service manager could not be asked, or gave an answer this code cannot classify.
+    Unknown {
+        /// Why no answer could be established — carried so the silence is legible in the report.
+        why: String,
+    },
+}
+
+/// A service run-state probe, injected into the applier so the restart OUTCOME judgment is unit-
+/// testable without a real service manager (production wires [`run_state`]).
+pub type ServiceProbe<'a> = dyn Fn(&str) -> ServiceRunState + 'a;
+
+/// Build the absolute-tool argv that QUERIES `service_id`'s run state.
+///
+/// # Errors
+///
+/// A detail string if the platform's service manager cannot be resolved at a trusted absolute path.
+pub fn query_argv(service_id: &str) -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        let program = sc_program()?;
+        Ok(vec![
+            program.display().to_string(),
+            "query".into(),
+            service_id.to_string(),
+        ])
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let program = systemctl_program()?;
+        Ok(vec![
+            program.display().to_string(),
+            "is-active".into(),
+            linux_unit_name(service_id),
+        ])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let program = launchctl_program()?;
+        Ok(vec![
+            program.display().to_string(),
+            "print".into(),
+            format!("system/{service_id}"),
+        ])
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = service_id;
+        Err("no supported service manager on this OS".to_string())
+    }
+}
+
+/// Ask the service manager whether `service_id` is running — the production [`ServiceProbe`].
+///
+/// A query that cannot be built or run yields [`ServiceRunState::Unknown`] carrying the reason, never
+/// a fabricated [`ServiceRunState::NotRunning`].
+#[must_use]
+pub fn run_state(service_id: &str) -> ServiceRunState {
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    {
+        let argv = match query_argv(service_id) {
+            Ok(argv) => argv,
+            Err(why) => return ServiceRunState::Unknown { why },
+        };
+        let output = match run_output(&argv) {
+            Ok(output) => output,
+            Err(why) => return ServiceRunState::Unknown { why },
+        };
+        classify_run_state(&output)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = service_id;
+        ServiceRunState::Unknown {
+            why: "no supported service manager on this OS".to_string(),
+        }
+    }
+}
+
+/// Classify a run-state query's output per OS. Split from [`run_state`] so the mapping is testable
+/// against synthetic output on every platform.
+///
+/// - **Windows `sc query`** — the `STATE` line: `RUNNING`/`START_PENDING` → running (a start that has
+///   been accepted and is coming up has met the intent), `STOPPED`/`STOP_PENDING`/`PAUSED` → not
+///   running. Exit 1060 (no such service) → not running.
+/// - **Linux `systemctl is-active`** — stdout `active`/`activating` → running; `inactive`, `failed`,
+///   `deactivating`, `unknown` → not running.
+/// - **macOS `launchctl print`** — `state = running` → running; a non-zero exit → not running.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn classify_run_state(output: &std::process::Output) -> ServiceRunState {
+    let text = combined_output(output).to_ascii_lowercase();
+    #[cfg(windows)]
+    {
+        if output.status.code() == Some(1060) || text.contains("1060") {
+            return ServiceRunState::NotRunning;
+        }
+        if text.contains("start_pending") || text.contains("running") {
+            return ServiceRunState::Running;
+        }
+        if text.contains("stopped") || text.contains("stop_pending") || text.contains("paused") {
+            return ServiceRunState::NotRunning;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(state) = linux_is_active_state(&text) {
+        return state;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if text.contains("state = running") {
+            return ServiceRunState::Running;
+        }
+        if !output.status.success() {
+            return ServiceRunState::NotRunning;
+        }
+    }
+    ServiceRunState::Unknown {
+        why: format!(
+            "unrecognised service-manager answer: {}",
+            combined_output(output).trim().replace('\n', "; ")
+        ),
+    }
+}
+
+/// Classify the lower-cased stdout of `systemctl is-active` — `Some` for a word systemd defines,
+/// `None` for anything else (which the caller reports as [`ServiceRunState::Unknown`]).
+///
+/// `is-active` prints exactly one word per unit, and the word `inactive` CONTAINS `active`, so the
+/// first WHOLE word is matched; a substring match would read a stopped unit as running.
+///
+/// Compiled on every platform rather than behind `#[cfg(target_os = "linux")]` **so the Linux
+/// classification is provable from any host**. The defect this function's caller exists to fix is
+/// Linux-only, and a Linux-only test of it can only ever run on a Linux runner — leaving the fix
+/// unverified on the machine that wrote it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_is_active_state(lowercased: &str) -> Option<ServiceRunState> {
+    match lowercased.split_whitespace().next()? {
+        "active" | "activating" | "reloading" => Some(ServiceRunState::Running),
+        "inactive" | "failed" | "deactivating" | "unknown" => Some(ServiceRunState::NotRunning),
+        _ => None,
+    }
+}
+
+/// Ask whether `service_id` is running, allowing it a bounded moment to SETTLE first — the
+/// production [`ServiceProbe`] (#77).
+///
+/// A service queried in the instant after `start` returns can legitimately still be coming up, and a
+/// single query that catches that instant would report a healthy restart as a failure — replacing one
+/// false alarm with another. So the probe retries while the answer is [`ServiceRunState::NotRunning`]
+/// or [`ServiceRunState::Unknown`], up to [`SETTLE_ATTEMPTS`] times spaced [`SETTLE_INTERVAL`] apart,
+/// and returns the FIRST [`ServiceRunState::Running`] it sees.
+///
+/// It does NOT retry forever, and it does not fabricate: if the service is still down when the budget
+/// is spent, the last observed answer is returned as observed. The budget is deliberately short —
+/// an update pass must not hang on a service that is genuinely broken.
+#[must_use]
+pub fn settled_run_state(service_id: &str) -> ServiceRunState {
+    let mut last = ServiceRunState::Unknown {
+        why: "the service was never queried".to_string(),
+    };
+    for attempt in 0..SETTLE_ATTEMPTS {
+        last = run_state(service_id);
+        if last == ServiceRunState::Running {
+            return last;
+        }
+        if attempt + 1 < SETTLE_ATTEMPTS {
+            std::thread::sleep(SETTLE_INTERVAL);
+        }
+    }
+    last
+}
+
+/// How many times [`settled_run_state`] asks before accepting a non-running answer.
+const SETTLE_ATTEMPTS: u32 = 10;
+
+/// How long [`settled_run_state`] waits between asks — 10 x 1s bounds the wait at ~9s, comfortably
+/// inside a pass and comfortably longer than a service manager's own start acknowledgement.
+const SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The absolute, trusted `sc.exe` (`%SystemRoot%\System32\sc.exe`) — never a bare name.
 #[cfg(windows)]
 fn sc_program() -> Result<PathBuf, String> {
@@ -236,6 +540,74 @@ fn launchctl_program() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #77 on the LINUX path — the platform dig-node actually ships as a service
+    /// ([`crate::plan`]'s `LinuxDeb`). A `.deb` postinst built by `dh_installsystemd` restarts its
+    /// unit, so by the time the pass starts the service it is ORDINARILY already active. That case
+    /// must classify as [`ControlOutcome::AlreadyInState`] — the input to `judge_restart`'s honest
+    /// `Unknown` row — and it CANNOT be classified from the start's exit code, because
+    /// `systemctl start` exits 0 for an active unit exactly as it does for a performed start.
+    ///
+    /// The fixture is systemd's own `is-active` output rather than a synthetic verdict, so the test
+    /// exercises the real Linux reading path from the manager's bytes to the outcome. It runs on any
+    /// host: a Linux-only test of a Linux-only defect can never be red on the machine that fixes it.
+    #[test]
+    fn an_already_active_linux_unit_classifies_a_start_as_already_in_state() {
+        let running = linux_is_active_state("active\n").expect("systemd's own word for up");
+        assert_eq!(running, ServiceRunState::Running);
+        assert_eq!(
+            start_outcome_from_prior(&running),
+            Some(ControlOutcome::AlreadyInState),
+            "an already-active unit met the intent of Start without anything being restarted"
+        );
+
+        // The control that keeps this one-sided in the right direction: a unit that is DOWN must not
+        // be short-circuited, or the pass would skip the restart it exists to perform.
+        let stopped = linux_is_active_state("inactive\n").expect("systemd's own word for down");
+        assert_eq!(stopped, ServiceRunState::NotRunning);
+        assert_eq!(
+            start_outcome_from_prior(&stopped),
+            None,
+            "a stopped unit must still be started"
+        );
+
+        // And an unreadable answer is not evidence the service is up: attempt the start.
+        assert_eq!(
+            start_outcome_from_prior(&ServiceRunState::Unknown {
+                why: "systemctl could not be run".to_string()
+            }),
+            None,
+            "not knowing is never a reason to skip the restart"
+        );
+    }
+
+    /// `systemctl is-active` prints ONE word, and `inactive` contains `active` — pinned here on
+    /// every host, not only a Linux runner, because the whole-word match is what keeps a stopped
+    /// unit from reading as a running one in [`start_outcome_from_prior`].
+    #[test]
+    fn linux_is_active_state_matches_the_whole_word_and_leaves_the_unrecognised_unclassified() {
+        assert_eq!(
+            linux_is_active_state("activating\n"),
+            Some(ServiceRunState::Running)
+        );
+        assert_eq!(
+            linux_is_active_state("failed\n"),
+            Some(ServiceRunState::NotRunning)
+        );
+        assert_eq!(
+            linux_is_active_state("deactivating\n"),
+            Some(ServiceRunState::NotRunning)
+        );
+        assert_eq!(
+            linux_is_active_state(""),
+            None,
+            "no answer is not an answer — the caller reports Unknown"
+        );
+        assert_eq!(
+            linux_is_active_state("something nobody has seen before\n"),
+            None
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -342,6 +714,116 @@ mod tests {
             control(bogus, ServiceAction::Stop).is_ok(),
             "stopping an already-absent/stopped service is a benign success, not a failure"
         );
+    }
+
+    /// A synthetic [`std::process::Output`] with `code` and `stderr`, for the classifier tests.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    fn synthetic(code: i32, text: &str) -> std::process::Output {
+        #[cfg(unix)]
+        fn status(code: i32) -> std::process::ExitStatus {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw((code & 0xff) << 8)
+        }
+        #[cfg(windows)]
+        fn status(code: i32) -> std::process::ExitStatus {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+        std::process::Output {
+            status: status(code),
+            stdout: Vec::new(),
+            stderr: text.as_bytes().to_vec(),
+        }
+    }
+
+    /// #77: `sc.exe` **1056** after a restart means the service is UP — the expected race, not a
+    /// fault. The pair of assertions is the point: 1056 must classify as already-running AND
+    /// **1060** (`ERROR_SERVICE_DOES_NOT_EXIST`) must NOT, because a nonexistent service is not a
+    /// running one and masking it would hide a real misconfiguration behind a reassuring silence.
+    /// A one-sided test (only the 1056 arm) is satisfied by a classifier that returns `true`
+    /// unconditionally, which is precisely the over-broad fix this ticket must not ship.
+    #[cfg(windows)]
+    #[test]
+    fn is_already_running_recognises_1056_but_not_a_missing_service_or_a_generic_failure() {
+        assert!(
+            super::is_already_running(&synthetic(
+                1056,
+                "An instance of the service is already running."
+            )),
+            "1056 after a start is the service being up, which is what Start intended"
+        );
+        assert!(
+            !super::is_already_running(&synthetic(
+                1060,
+                "The specified service does not exist as an installed service."
+            )),
+            "a service that does not exist is not a running one — never mask 1060"
+        );
+        assert!(
+            !super::is_already_running(&synthetic(5, "Access is denied.")),
+            "a generic start failure stays a failure"
+        );
+    }
+
+    /// #77: `sc query` maps to the three-valued run state, and `inactive`/`stopped` must never read
+    /// as running. The `Unknown` arm is asserted explicitly so an unreadable answer stays unreadable
+    /// rather than collapsing into a confident `NotRunning`.
+    #[cfg(windows)]
+    #[test]
+    fn classify_run_state_maps_the_windows_state_line_and_keeps_unknown_unknown() {
+        assert_eq!(
+            super::classify_run_state(&synthetic(0, "STATE : 4  RUNNING")),
+            ServiceRunState::Running
+        );
+        assert_eq!(
+            super::classify_run_state(&synthetic(0, "STATE : 2  START_PENDING")),
+            ServiceRunState::Running,
+            "a start that has been accepted and is coming up has met the intent of Start"
+        );
+        assert_eq!(
+            super::classify_run_state(&synthetic(0, "STATE : 1  STOPPED")),
+            ServiceRunState::NotRunning
+        );
+        assert_eq!(
+            super::classify_run_state(&synthetic(
+                1060,
+                "The specified service does not exist as an installed service."
+            )),
+            ServiceRunState::NotRunning
+        );
+        assert!(
+            matches!(
+                super::classify_run_state(&synthetic(0, "something nobody has seen before")),
+                ServiceRunState::Unknown { .. }
+            ),
+            "an answer this code cannot classify is Unknown, never a fabricated NotRunning"
+        );
+    }
+
+    /// #77 on Linux: `systemctl is-active` prints one word, and the word `inactive` CONTAINS
+    /// `active` — so a substring match would report a stopped unit as running. Matching the first
+    /// whole word is what makes the two distinguishable, and this test fails against the substring
+    /// implementation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classify_run_state_reads_is_active_whole_word_so_inactive_is_not_active() {
+        assert_eq!(
+            super::classify_run_state(&synthetic(0, "active\n")),
+            ServiceRunState::Running
+        );
+        assert_eq!(
+            super::classify_run_state(&synthetic(3, "inactive\n")),
+            ServiceRunState::NotRunning,
+            "`inactive` contains `active`; a substring match would call a stopped unit running"
+        );
+        assert_eq!(
+            super::classify_run_state(&synthetic(3, "failed\n")),
+            ServiceRunState::NotRunning
+        );
+        assert!(matches!(
+            super::classify_run_state(&synthetic(0, "")),
+            ServiceRunState::Unknown { .. }
+        ));
     }
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]

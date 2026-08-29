@@ -97,6 +97,7 @@ fn applying_dig_dns_also_refreshes_its_digd_alias_666a() {
         action: dig_release_resolver::UpdateAction::Update,
         summary: String::new(),
         installed_build: Some(13_002),
+        detected_version: None,
         // dig-dns ships a CLI that answers `--version`, so its installed build is established by a
         // probe — the evidence class that permits the alias set this test is about.
         evidence: dig_updater_broker::VersionEvidence::SafeToProbe,
@@ -198,6 +199,7 @@ fn a_service_backed_replace_lands_new_bytes_on_disk_before_health_666b() {
         action: dig_release_resolver::UpdateAction::Update,
         summary: String::new(),
         installed_build: Some(32_000),
+        detected_version: None,
         evidence: target.evidence,
     };
 
