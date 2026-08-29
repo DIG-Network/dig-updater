@@ -589,3 +589,4 @@ one and it still fails on the next:
   reinstalled every pass; (2) the post-install health gate must re-hash against the SELECTED variant's
   digest, not the default's. Both are threaded through `PlannedComponent.variants` (default-first) + the
   selected digest returned from `select_loadable_variant`.
+
