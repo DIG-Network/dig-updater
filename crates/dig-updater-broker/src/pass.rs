@@ -1367,6 +1367,66 @@ mod tests {
         );
     }
 
+    /// A planned component fixture for the outcome-construction tests below. `version` is the
+    /// FEED's offer; `detected_version` is what enumeration read at the destination — the two
+    /// arguments the record must not confuse.
+    fn planned_skip(version: &str, detected: Option<&str>) -> PlannedComponent {
+        PlannedComponent {
+            name: "digstore".into(),
+            method: InstallMethod::RawBinary,
+            dest: std::path::PathBuf::from("digstore"),
+            aliases: vec![],
+            version: version.into(),
+            build: 15_000,
+            variants: vec![crate::plan::PlannedVariant {
+                variant: None,
+                expected_digest: "0".repeat(64),
+                staged_path: std::path::PathBuf::new(),
+            }],
+            action: UpdateAction::Skip,
+            summary: "already current".into(),
+            installed_build: None,
+            detected_version: detected.map(str::to_string),
+            evidence: crate::plan::VersionEvidence::SafeToProbe,
+        }
+    }
+
+    /// dig_ecosystem#3180: a SKIPPED component installs nothing, so the manifest's version is the
+    /// feed's OFFER and not a measurement of the machine. The record must state what enumeration
+    /// actually read at the destination.
+    ///
+    /// The fixture separates the two on purpose: disk says `0.14.0` while the feed offers `0.15.0`.
+    /// A `Skip` can be decided on a RECORDED build (the installed-build store) rather than on the
+    /// disk reading, so the pair can genuinely diverge — and reporting the feed's version there
+    /// overstates what is installed, which is the same class of claim as an unearned `active`.
+    /// An implementation that reports `pc.version` passes every equal-version fixture and fails
+    /// only this one.
+    #[test]
+    fn a_skipped_component_reports_the_version_measured_on_disk_not_the_feeds_offer() {
+        let out = ComponentOutcome::from(
+            &planned_skip("0.15.0", Some("digstore 0.14.0")),
+            ComponentResult::Skipped,
+            "already current".into(),
+        );
+        assert_eq!(
+            out.installed_version.as_deref(),
+            Some("digstore 0.14.0"),
+            "the record states the measured build, never the feed's offer"
+        );
+    }
+
+    /// The other half: with NO reading at the destination there is nothing measured to report, and
+    /// substituting the feed's version would be the fabrication this record exists to avoid.
+    #[test]
+    fn a_skipped_component_with_no_reading_reports_no_installed_version() {
+        let out = ComponentOutcome::from(
+            &planned_skip("0.15.0", None),
+            ComponentResult::Skipped,
+            "already current".into(),
+        );
+        assert_eq!(out.installed_version, None);
+    }
+
     #[test]
     fn restart_after_is_a_no_op_for_a_non_service_component() {
         let ctl =
