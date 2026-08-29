@@ -52,8 +52,8 @@ use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
 use crate::selfupdate::apply_self_update;
 use crate::service::{ServiceAction, ServiceControl, ServiceProbe, ServiceRunState};
-use crate::status::Activation;
 use crate::state::{LoadedState, TrustStateStore};
+use crate::status::Activation;
 use dig_release_resolver::loadability::{Loadability, LoadabilityCheck};
 
 /// What one component's apply produced.
@@ -1027,9 +1027,7 @@ fn judge_restart(
         ),
         (Err(detail), ServiceRunState::NotRunning) => (
             Activation::PendingRestart,
-            Some(format!(
-                " (warning: could not restart {service}: {detail})"
-            )),
+            Some(format!(" (warning: could not restart {service}: {detail})")),
         ),
         (Ok(()), ServiceRunState::Unknown { why }) => (
             Activation::Unknown,
@@ -1152,7 +1150,8 @@ mod tests {
     }
 
     /// The `sc.exe` text #77 was measured on: a non-zero start on a service that is nonetheless up.
-    const START_1056: &str = "sc.exe exited with 1056: An instance of the service is already running";
+    const START_1056: &str =
+        "sc.exe exited with 1056: An instance of the service is already running";
 
     /// #77, the regression: `sc.exe` 1056 after a restart is the service being UP. This fixture and
     /// `restart_after_still_reports_a_genuine_restart_failure` below differ in EXACTLY ONE thing —
@@ -1227,7 +1226,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            out.detail.contains("reported a successful start but is not running"),
+            out.detail
+                .contains("reported a successful start but is not running"),
             "a start that claims success on a down service is reported: {}",
             out.detail
         );

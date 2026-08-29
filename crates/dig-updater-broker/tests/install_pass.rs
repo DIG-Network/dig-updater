@@ -1097,16 +1097,30 @@ fn running(_: &str) -> ServiceRunState {
 /// Drive one apply pass with a service-backed "digstore" component (its OS service id set to
 /// `service_id`) and a RECORDING service controller, so the stop→replace→restart ORDERING + the
 /// failure handling are observable without touching a real service manager (#666 Bug B).
+/// The four doubles a service-backed scenario injects: the enumeration + health probes, and the
+/// service control + run-state probe the restart judgment reads (#77). Grouped so the harness reads
+/// as "this scenario, with these doubles" rather than as an eight-argument call whose arguments are
+/// told apart by position.
+struct ServiceDoubles<'a> {
+    detect: &'a dyn Fn(&Path) -> DetectedVersion,
+    health: &'a dyn Fn(&Path) -> DetectedVersion,
+    service_ctl: &'a ServiceControl<'a>,
+    service_probe: &'a ServiceProbe<'a>,
+}
+
 fn apply_with_service(
     report: &WorkerReport,
     home: &Path,
     dest: &Path,
     service_id: &str,
-    detect: &dyn Fn(&Path) -> DetectedVersion,
-    health: &dyn Fn(&Path) -> DetectedVersion,
-    service_ctl: &ServiceControl,
-    service_probe: &ServiceProbe,
+    doubles: ServiceDoubles<'_>,
 ) -> PassReport {
+    let ServiceDoubles {
+        detect,
+        health,
+        service_ctl,
+        service_probe,
+    } = doubles;
     let store = TrustStateStore::for_channel(home, Channel::Stable);
     let loaded = store.load().expect("load state");
     let lkg = LkgCache::at(home.join("lkg"));
@@ -1177,10 +1191,12 @@ fn a_service_backed_component_is_stopped_before_replace_and_restarted_after_666b
         home.path(),
         &dest,
         "net.dignetwork.dig-node",
-        &detect,
-        &health,
-        &ctl,
-        &running,
+        ServiceDoubles {
+            detect: &detect,
+            health: &health,
+            service_ctl: &ctl,
+            service_probe: &running,
+        },
     );
 
     assert_eq!(result.components[0].result, ComponentResult::Installed);
@@ -1223,10 +1239,12 @@ fn a_service_is_restarted_even_when_the_replace_rolls_back_666b() {
         home.path(),
         &dest,
         "net.dignetwork.dig-node",
-        &detect,
-        &health,
-        &ctl,
-        &running,
+        ServiceDoubles {
+            detect: &detect,
+            health: &health,
+            service_ctl: &ctl,
+            service_probe: &running,
+        },
     );
 
     assert_eq!(result.components[0].result, ComponentResult::RolledBack);
@@ -1264,10 +1282,12 @@ fn a_service_that_cannot_be_stopped_defers_and_is_left_running_666b() {
         home.path(),
         &dest,
         "net.dignetwork.dig-node",
-        &detect,
-        &health,
-        &ctl,
-        &running,
+        ServiceDoubles {
+            detect: &detect,
+            health: &health,
+            service_ctl: &ctl,
+            service_probe: &running,
+        },
     );
 
     // The stop failed, so the binary is still locked: defer the replace, and NEVER issue a Start

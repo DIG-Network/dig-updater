@@ -558,8 +558,8 @@ mod tests {
 
     #[test]
     fn from_pass_applied_lists_every_component_outcome() {
-        use crate::{ComponentOutcome, ComponentResult};
         use super::Activation;
+        use crate::{ComponentOutcome, ComponentResult};
         let config = UpdaterConfig::default();
         let ctx = StatusContext::for_test(&config);
         let report = PassReport {
@@ -593,8 +593,8 @@ mod tests {
         // requirement is its visibility. The unprivileged mirror must name the component in
         // `refused_components`, report its per-component result as the `refused` token, and keep the
         // missing sonames in the detail — all three are what an operator (or the Updates UI) reads.
-        use crate::{ComponentOutcome, ComponentResult};
         use super::Activation;
+        use crate::{ComponentOutcome, ComponentResult};
         let config = UpdaterConfig::default();
         let ctx = StatusContext::for_test(&config);
         let report = PassReport {

@@ -1178,8 +1178,7 @@ mod tests {
                 }),
                 available: Some("0.155.0".to_string()),
             });
-        let json: serde_json::Value =
-            serde_json::from_str(&render_status(&status, true)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&render_status(&status, true)).unwrap();
         let c = &json["components"][0];
         assert_eq!(c["installed"]["version"], "0.154.0");
         assert_eq!(c["installed"]["activation"], "active");
