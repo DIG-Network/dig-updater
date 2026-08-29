@@ -122,7 +122,37 @@ impl ComponentOutcome {
             action: pc.action.as_str().to_string(),
             result,
             detail,
+            installed_version: match result {
+                // The version on disk is the manifest's for a build we just installed or that was
+                // already current. Every other result left the destination on a build this pass
+                // knows only as an opaque build NUMBER, so there is no version string to state and
+                // inventing one would be the fabrication this record exists to avoid.
+                ComponentResult::Installed | ComponentResult::Skipped => Some(pc.version.clone()),
+                _ => None,
+            },
+            // Set by `restart_after` for a service-backed component from the service's OBSERVED run
+            // state (#77) — the only place this beacon actually watches a RUNNING process. Every
+            // other path leaves it Unknown, which is the truth: the health gate probes the FILE at
+            // the destination, so it establishes what is on disk and says nothing whatever about
+            // what is executing.
+            activation: Activation::Unknown,
+            available_version: match result {
+                // Installed and Skipped both end on the offered build, so nothing is waiting.
+                ComponentResult::Installed | ComponentResult::Skipped => None,
+                _ => Some(pc.version.clone()),
+            },
         }
+    }
+
+    /// Replace the recorded installed version with the one the health gate RE-OBSERVED on disk
+    /// (#582) — verified reality rather than the manifest's promise. Used only on the install path,
+    /// where a measurement exists; elsewhere there is nothing better than the plan to report.
+    #[must_use]
+    fn with_detected_version(mut self, detected: &DetectedVersion) -> Self {
+        if let DetectedVersion::Present(raw) = detected {
+            self.installed_version = Some(raw.clone());
+        }
+        self
     }
 }
 
@@ -730,7 +760,8 @@ impl Installer<'_> {
                     pc,
                     ComponentResult::Installed,
                     verified_install_detail(&pc.name, &detected),
-                )),
+                )
+                .with_detected_version(&detected)),
                 Err(detail) => {
                     self.rollback_set(snapshots, floor)?;
                     Ok(ComponentOutcome::from(
@@ -906,23 +937,83 @@ fn alias_cache_key(component: &str, alias: &Path) -> String {
 /// reinstate-write failure) still restarts the service, then the error propagates. A restart failure
 /// is folded into the outcome detail as a warning but never turns an otherwise-correct on-disk state
 /// into a hard failure (the daily wake + the service manager's own boot recovery bring it back).
+///
+/// **The verdict is the service's OBSERVED run state, not the start command's exit code (#77).** The
+/// start is attempted, then the service is probed, and [`judge_restart`] decides from the pair. A
+/// start that exits non-zero on a service that is nonetheless RUNNING reported "could not restart
+/// dig-node" about a healthy node on the new binary — a false failure an operator then remediates,
+/// and one about to become a user-facing notification (dig_ecosystem#3180), which would inherit its
+/// authority.
 fn restart_after(
     service: Option<&str>,
     service_ctl: &ServiceControl,
+    service_probe: &ServiceProbe,
     result: Result<ComponentOutcome, BrokerError>,
 ) -> Result<ComponentOutcome, BrokerError> {
-    let restart_warning = match service {
-        Some(service) => service_ctl(service, ServiceAction::Start)
-            .err()
-            .map(|detail| format!(" (warning: could not restart {service}: {detail})")),
-        None => None,
-    };
-    // Propagate the install/rollback error ONLY after the restart above has already run.
+    // Attempt + observe BEFORE propagating the inner error, so the #666 F1 guarantee holds.
+    let restart = service.map(|service| {
+        let attempt = service_ctl(service, ServiceAction::Start);
+        (service, attempt, service_probe(service))
+    });
     let mut outcome = result?;
-    if let Some(warning) = restart_warning {
-        outcome.detail.push_str(&warning);
+    if let Some((service, attempt, observed)) = restart {
+        let (activation, note) = judge_restart(service, attempt, observed);
+        outcome.activation = activation;
+        if let Some(note) = note {
+            outcome.detail.push_str(&note);
+        }
     }
     Ok(outcome)
+}
+
+/// Decide, from the start command's result AND the service's observed run state, whether the new
+/// build is now ACTIVE — and what (if anything) to say about it (#77).
+///
+/// The observation dominates the exit code, because the observation is the property that matters:
+///
+/// | start attempt | observed | verdict | reported |
+/// |---|---|---|---|
+/// | ok or error | `Running` | [`Activation::Active`] | nothing — the intent was met |
+/// | ok | `NotRunning` | [`Activation::PendingRestart`] | a warning: it claimed success and is down |
+/// | error | `NotRunning` | [`Activation::PendingRestart`] | the genuine restart failure |
+/// | either | `Unknown` | [`Activation::Unknown`] | a note naming why nothing could be confirmed |
+///
+/// The `Unknown` row is not a formality. Collapsing "I could not ask the service manager" into
+/// either confident answer is how a fabricated verdict becomes indistinguishable from a measured
+/// one; the operator is told what is unproven instead.
+fn judge_restart(
+    service: &str,
+    attempt: Result<(), String>,
+    observed: ServiceRunState,
+) -> (Activation, Option<String>) {
+    match (attempt, observed) {
+        (_, ServiceRunState::Running) => (Activation::Active, None),
+        (Ok(()), ServiceRunState::NotRunning) => (
+            Activation::PendingRestart,
+            Some(format!(
+                " (warning: {service} reported a successful start but is not running)"
+            )),
+        ),
+        (Err(detail), ServiceRunState::NotRunning) => (
+            Activation::PendingRestart,
+            Some(format!(
+                " (warning: could not restart {service}: {detail})"
+            )),
+        ),
+        (Ok(()), ServiceRunState::Unknown { why }) => (
+            Activation::Unknown,
+            Some(format!(
+                " (note: {service} was started; its run state could not be confirmed: {why})"
+            )),
+        ),
+        (Err(detail), ServiceRunState::Unknown { why }) => (
+            Activation::Unknown,
+            Some(format!(
+                " (warning: could not restart {service}: {detail}; \
+                 and its run state could not be confirmed: {why})"
+            )),
+        ),
+    }
 }
 
 /// The production enumeration/health probe: spawn `<path> --version`, BOUNDED.

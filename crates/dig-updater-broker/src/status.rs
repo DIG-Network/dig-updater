@@ -60,6 +60,40 @@ impl From<crate::scheduler::SchedulePresence> for ScheduleRegistration {
 
 const STATUS_FILE: &str = "status.json";
 
+/// Whether a build that is on disk is the build that is actually RUNNING (dig_ecosystem#3180).
+///
+/// The distinction is not pedantry, it is the whole point of the record. [`crate::install`] replaces
+/// a **running** binary by renaming the old image aside to a `.dig-updater-old` sibling, so the new
+/// bytes sit at the destination while the old process keeps running until something restarts it.
+/// A surface that says *"dig-node 0.155.0 was installed"* while `dign --version` still answers
+/// `0.154.0` is stating a falsehood about the machine — and dig_ecosystem#3180 turns this record into
+/// a user-facing notification, which would inherit that falsehood.
+///
+/// So the two facts are kept apart, and the third value is kept honest: [`Self::Unknown`] means the
+/// beacon could not establish which build is running, and it is the DEFAULT precisely so that a
+/// record written by an older beacon — or a code path that forgets to set it — degrades to "I do not
+/// know" rather than to a reassuring "active" that nothing measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activation {
+    /// The newly installed build was confirmed to be the one now running.
+    Active,
+    /// The new build is on disk, but an older one is still running — a restart will pick it up.
+    PendingRestart,
+    /// Which build is running could not be established. NOT a synonym for either other value.
+    #[default]
+    Unknown,
+}
+
+/// What a component HAS installed, as opposed to what the feed offers (dig_ecosystem#3180).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledBuild {
+    /// The version on disk at this component's destination.
+    pub version: String,
+    /// Whether that version is the one actually running ([`Activation`]).
+    pub activation: Activation,
+}
+
 /// One component's most-recently-observed decision: either a dry check's staged-artifact preview
 /// (`action: "would_fetch"`) or a full pass's install/skip/defer/rollback outcome. A dry check
 /// never enumerates installed versions (only a full pass does, via
@@ -74,6 +108,23 @@ pub struct ComponentStatus {
     pub result: String,
     /// A human-readable detail (the version transition, or the failure reason).
     pub detail: String,
+    /// What is installed at this component's destination and whether it is RUNNING
+    /// (dig_ecosystem#3180) — `None` when this pass established no installed version (a dry check
+    /// never enumerates one, and a refused/held component was deliberately not probed).
+    ///
+    /// ADDITIVE (SPEC §5.1 / §13.2): defaults to `None` so a `status.json` written by a pre-#3180
+    /// beacon still deserializes, reading as "this beacon did not report one" rather than failing.
+    #[serde(default)]
+    pub installed: Option<InstalledBuild>,
+    /// The version the feed OFFERS for this component when it is not the one installed and active —
+    /// what a user-session surface names in a "new version available" notification. `None` means the
+    /// component is already on the offered build, or that this pass could not tell.
+    ///
+    /// Deliberately separate from [`Self::installed`] rather than folded into one "version" field:
+    /// a single field cannot express "0.154.0 is running, 0.155.0 is waiting", which is the exact
+    /// state an update notification exists to describe.
+    #[serde(default)]
+    pub available: Option<String>,
 }
 
 /// Everything the broker knows when it is about to persist a [`StatusSnapshot`]: the current
