@@ -278,6 +278,7 @@ fn apply_with_suppress(
         // the wrong evidence source, which this panicking reader makes observable.
         digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(()),
+        service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance,
     };
     installer.apply(root, report, loaded)
@@ -339,6 +340,7 @@ fn apply_digest_evidenced(
         health: &never_execute,
         digest,
         service_ctl: &|_, _| Ok(()),
+        service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance: false,
     };
     installer.apply(root, report, loaded)
@@ -943,6 +945,7 @@ fn apply_self_and_other(
         // wrong evidence source was consulted, which this panicking reader makes observable.
         digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(()),
+        service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance: false,
     };
     installer
@@ -1081,7 +1084,15 @@ fn assert_state_dir_hardened(dir: &Path) {
 
 use std::sync::Mutex;
 
-use dig_updater_broker::{ServiceAction, ServiceControl};
+use dig_updater_broker::{ServiceAction, ServiceControl, ServiceProbe, ServiceRunState};
+
+/// The default injected run-state probe for scenarios that assert install MECHANICS rather than the
+/// restart JUDGMENT (#77): the service comes back up, which is the ordinary case. The tests that
+/// exercise the judgment itself script their own answers in `pass.rs`.
+#[allow(dead_code)]
+fn running(_: &str) -> ServiceRunState {
+    ServiceRunState::Running
+}
 
 /// Drive one apply pass with a service-backed "digstore" component (its OS service id set to
 /// `service_id`) and a RECORDING service controller, so the stop→replace→restart ORDERING + the
@@ -1094,6 +1105,7 @@ fn apply_with_service(
     detect: &dyn Fn(&Path) -> DetectedVersion,
     health: &dyn Fn(&Path) -> DetectedVersion,
     service_ctl: &ServiceControl,
+    service_probe: &ServiceProbe,
 ) -> PassReport {
     let store = TrustStateStore::for_channel(home, Channel::Stable);
     let loaded = store.load().expect("load state");
@@ -1132,6 +1144,7 @@ fn apply_with_service(
         // probes — a digest read here would mean the wrong evidence source was consulted.
         digest: &digest_must_not_be_read,
         service_ctl,
+        service_probe,
         suppress_state_advance: false,
     };
     installer
@@ -1167,6 +1180,7 @@ fn a_service_backed_component_is_stopped_before_replace_and_restarted_after_666b
         &detect,
         &health,
         &ctl,
+        &running,
     );
 
     assert_eq!(result.components[0].result, ComponentResult::Installed);
@@ -1212,6 +1226,7 @@ fn a_service_is_restarted_even_when_the_replace_rolls_back_666b() {
         &detect,
         &health,
         &ctl,
+        &running,
     );
 
     assert_eq!(result.components[0].result, ComponentResult::RolledBack);
@@ -1252,6 +1267,7 @@ fn a_service_that_cannot_be_stopped_defers_and_is_left_running_666b() {
         &detect,
         &health,
         &ctl,
+        &running,
     );
 
     // The stop failed, so the binary is still locked: defer the replace, and NEVER issue a Start
@@ -1283,6 +1299,7 @@ fn apply_aliased(
     detect: &dyn Fn(&Path) -> DetectedVersion,
     health: &dyn Fn(&Path) -> DetectedVersion,
     service_ctl: &ServiceControl,
+    service_probe: &ServiceProbe,
 ) -> Result<PassReport, BrokerError> {
     let store = TrustStateStore::for_channel(home, Channel::Stable);
     let loaded = store.load().expect("load state");
@@ -1321,6 +1338,7 @@ fn apply_aliased(
         // probes — a digest read here would mean the wrong evidence source was consulted.
         digest: &digest_must_not_be_read,
         service_ctl,
+        service_probe,
         suppress_state_advance: false,
     };
     installer.apply(&test_root().verifying_key(), report, loaded)
@@ -1356,6 +1374,7 @@ fn a_failed_health_rolls_back_the_whole_set_no_split_primary_alias_666f2() {
         &detect,
         &health,
         &ctl,
+        &running,
     )
     .expect("apply completes");
 
@@ -1414,6 +1433,7 @@ fn a_stale_alias_is_re_refreshed_on_a_later_pass_even_when_the_primary_is_curren
         &detect,
         &health,
         &ctl,
+        &running,
     )
     .expect("apply completes");
 
@@ -1568,6 +1588,7 @@ fn an_unsafe_to_probe_dig_app_is_held_unexecuted_while_its_stale_sibling_really_
         // wrong evidence source was consulted, which this panicking reader makes observable.
         digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(()),
+        service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance: false,
     };
     let result = installer
@@ -1653,6 +1674,7 @@ fn apply_with_loadability(
     f: &RefusalFixture,
     loadability: &dyn Fn(&Path) -> Loadability,
     service_ctl: &ServiceControl,
+    service_probe: &ServiceProbe,
     dig_app_digest: &dyn Fn(&Path) -> Option<String>,
 ) -> PassReport {
     let home = f.home.path();
@@ -1720,6 +1742,7 @@ fn apply_with_loadability(
         health: &health,
         digest: dig_app_digest,
         service_ctl,
+        service_probe,
         suppress_state_advance: false,
     };
     installer
@@ -1800,6 +1823,7 @@ fn an_unloadable_artifact_is_refused_before_the_live_binary_is_touched() {
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
         &ctl,
+        &running,
         &digest_of_something_else,
     );
 
@@ -1887,6 +1911,7 @@ fn a_refusal_names_the_missing_libraries_in_its_detail() {
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
         &|_, _| Ok(()),
+        &running,
         &digest_of_something_else,
     );
     let detail = &result
@@ -1917,6 +1942,7 @@ fn a_refusal_does_not_withhold_the_state_advance() {
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
         &|_, _| Ok(()),
+        &running,
         &digest_of_something_else,
     );
     assert!(
@@ -1942,6 +1968,7 @@ fn a_refused_pass_is_applied_and_not_a_fault_but_is_visible() {
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
         &|_, _| Ok(()),
+        &running,
         &digest_of_something_else,
     );
     assert!(
@@ -1975,6 +2002,7 @@ fn a_loadable_or_indeterminate_artifact_installs_exactly_as_before() {
             &f,
             &|_: &Path| answer.clone(),
             &|_, _| Ok(()),
+            &running,
             // The honest PRODUCTION digest reader: the health gate re-hashes what landed, so this can
             // only pass because the promised bytes really are at the destination.
             &dig_updater_broker::installed_digest_hex,
@@ -2181,6 +2209,7 @@ fn apply_two_variant_pass(
         // go green because the promised variant's bytes really are at the destination.
         digest: &dig_updater_broker::installed_digest_hex,
         service_ctl: &|_, _| Ok(()),
+        service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance: false,
     };
     let report = installer
@@ -2341,6 +2370,7 @@ fn a_successful_install_records_the_manifest_build() {
         &f,
         &|_: &Path| Loadability::Loadable,
         &|_, _| Ok(()),
+        &running,
         &dig_updater_broker::installed_digest_hex,
     );
     assert!(result
@@ -2365,6 +2395,7 @@ fn a_refused_component_records_nothing() {
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
         &|_, _| Ok(()),
+        &running,
         &digest_of_something_else,
     );
     let recorded = InstalledBuildStore::for_channel(f.home.path(), Channel::Stable).load();

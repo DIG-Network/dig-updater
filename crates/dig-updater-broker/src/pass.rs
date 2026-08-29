@@ -51,7 +51,8 @@ use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONE
 use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
 use crate::selfupdate::apply_self_update;
-use crate::service::{ServiceAction, ServiceControl};
+use crate::service::{ServiceAction, ServiceControl, ServiceProbe, ServiceRunState};
+use crate::status::Activation;
 use crate::state::{LoadedState, TrustStateStore};
 use dig_release_resolver::loadability::{Loadability, LoadabilityCheck};
 
@@ -113,6 +114,15 @@ pub struct ComponentOutcome {
     /// Every other result carries the plan summary or a failure reason, neither of which claims to
     /// describe a post-install state.
     pub detail: String,
+    /// The version now at this component's destination, when this pass established one
+    /// (dig_ecosystem#3180). `None` where the pass left the destination on a build it knows only as
+    /// an opaque build number.
+    pub installed_version: Option<String>,
+    /// Whether [`Self::installed_version`] is the build actually RUNNING ([`Activation`], #77).
+    pub activation: Activation,
+    /// The version the feed offers when it is not the one installed — what a "new version available"
+    /// notification names (dig_ecosystem#3180).
+    pub available_version: Option<String>,
 }
 
 impl ComponentOutcome {
@@ -345,6 +355,10 @@ pub struct Installer<'a> {
     /// Production wires [`crate::service::control`]; tests inject a recording fake so the
     /// stop→replace→restart ordering + failure handling are exercised without a real service.
     pub service_ctl: &'a ServiceControl<'a>,
+    /// Ask whether a service is RUNNING, so a restart is judged by its outcome rather than by the
+    /// exit code of the one `start` command (#77). Production wires
+    /// [`crate::service::settled_run_state`]; tests inject a scripted answer.
+    pub service_probe: &'a ServiceProbe<'a>,
     /// Suppress advancing (and thus persisting) the tracked channel's trust state after an otherwise
     /// fully-successful pass (#621 item 1). Set only when the feed ladder was overridden out-of-band
     /// (`--feed-base`/`$DIG_UPDATER_FEED_BASE`): the fetched manifest's marks may be on a DIFFERENT
@@ -437,6 +451,12 @@ impl Installer<'_> {
             action: ACTION_HOLD.to_string(),
             result: ComponentResult::Held,
             detail: h.reason.clone(),
+            // A HOLD asserts nothing about the component except that the beacon left it alone: it
+            // was never probed, so no version on disk was established, and the feed's build was
+            // never planned against it either.
+            installed_version: None,
+            activation: Activation::Unknown,
+            available_version: None,
         }));
 
         // 4. Advance the trust state ONLY once every OTHER component fully succeeded (SPEC §9
@@ -651,6 +671,12 @@ impl Installer<'_> {
                         action: ACTION_REFUSE.to_string(),
                         result: ComponentResult::Refused,
                         detail,
+                        // The live binary was never touched, so what is installed is whatever was
+                        // already there — a build this pass never established a version for. The
+                        // feed's build IS available, and is exactly what the host cannot load.
+                        installed_version: None,
+                        activation: Activation::Unknown,
+                        available_version: Some(pc.version.clone()),
                     });
                 }
             };
@@ -694,7 +720,12 @@ impl Installer<'_> {
         // even when the rollback itself errors out (#666 F1).
         let outcome = install_step(&private, &self.retry);
         let install_result = self.finish_apply(pc, floor, snapshots, outcome, &expected_digest);
-        let mut outcome = restart_after(service.as_deref(), self.service_ctl, install_result)?;
+        let mut outcome = restart_after(
+            service.as_deref(),
+            self.service_ctl,
+            self.service_probe,
+            install_result,
+        )?;
         if let Some(why) = indeterminate {
             outcome
                 .detail
@@ -1089,7 +1120,13 @@ mod tests {
             component: "dig-node".into(),
             detail: "cached bytes unreadable".into(),
         });
-        let out = restart_after(Some("net.dignetwork.dig-node"), &ctl, rollback_error);
+        let probe = |_: &str| ServiceRunState::Running;
+        let out = restart_after(
+            Some("net.dignetwork.dig-node"),
+            &ctl,
+            &probe,
+            rollback_error,
+        );
         assert!(
             out.is_err(),
             "the rollback error still propagates to the caller"
@@ -1101,16 +1138,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restart_after_folds_a_restart_failure_into_the_detail_without_failing_the_pass() {
-        let ctl = |_: &str, _: ServiceAction| Err("boot failed".to_string());
-        let ok = Ok(ComponentOutcome {
+    /// A just-installed component outcome, for the restart-judgment fixtures below.
+    fn installed_outcome() -> Result<ComponentOutcome, BrokerError> {
+        Ok(ComponentOutcome {
             component: "dig-node".into(),
             action: "update".into(),
             result: ComponentResult::Installed,
             detail: "dig-node now reports 0.33.0".into(),
-        });
-        let out = restart_after(Some("net.dignetwork.dig-node"), &ctl, ok).unwrap();
+            installed_version: Some("0.33.0".into()),
+            activation: Activation::Unknown,
+            available_version: None,
+        })
+    }
+
+    /// The `sc.exe` text #77 was measured on: a non-zero start on a service that is nonetheless up.
+    const START_1056: &str = "sc.exe exited with 1056: An instance of the service is already running";
+
+    /// #77, the regression: `sc.exe` 1056 after a restart is the service being UP. This fixture and
+    /// `restart_after_still_reports_a_genuine_restart_failure` below differ in EXACTLY ONE thing —
+    /// the observed run state — while both feed `restart_after` the identical non-zero start. That
+    /// is what makes the pair load-bearing: an implementation that reports the exit code would fail
+    /// this test, and one that suppresses the warning unconditionally would fail its sibling. Either
+    /// test alone is satisfied by a wrong implementation.
+    #[test]
+    fn restart_after_reports_success_when_the_service_is_running_despite_a_nonzero_start() {
+        let ctl = |_: &str, _: ServiceAction| Err(START_1056.to_string());
+        let probe = |_: &str| ServiceRunState::Running;
+        let out = restart_after(
+            Some("net.dignetwork.dig-node"),
+            &ctl,
+            &probe,
+            installed_outcome(),
+        )
+        .unwrap();
+        assert!(
+            !out.detail.contains("warning"),
+            "the service is running the new build; there is nothing to warn about: {}",
+            out.detail
+        );
+        assert_eq!(
+            out.activation,
+            Activation::Active,
+            "a confirmed-running service means the installed build is the ACTIVE one"
+        );
+    }
+
+    /// The sibling of the test above: same non-zero start, service genuinely DOWN. The real failure
+    /// must still be reported, or #77's fix would have traded a false alarm for a silent one.
+    #[test]
+    fn restart_after_still_reports_a_genuine_restart_failure() {
+        let ctl = |_: &str, _: ServiceAction| Err(START_1056.to_string());
+        let probe = |_: &str| ServiceRunState::NotRunning;
+        let out = restart_after(
+            Some("net.dignetwork.dig-node"),
+            &ctl,
+            &probe,
+            installed_outcome(),
+        )
+        .unwrap();
         assert_eq!(
             out.result,
             ComponentResult::Installed,
@@ -1118,7 +1203,60 @@ mod tests {
         );
         assert!(
             out.detail.contains("warning: could not restart"),
-            "the warning is surfaced: {}",
+            "a service that is actually down is still reported: {}",
+            out.detail
+        );
+        assert_eq!(
+            out.activation,
+            Activation::PendingRestart,
+            "the new bytes are on disk but nothing is running them"
+        );
+    }
+
+    /// A start that REPORTS success on a service that is down is the inverse false report, and it is
+    /// the one no exit-code-only implementation can ever catch.
+    #[test]
+    fn restart_after_warns_when_a_successful_start_left_the_service_down() {
+        let ctl = |_: &str, _: ServiceAction| Ok(());
+        let probe = |_: &str| ServiceRunState::NotRunning;
+        let out = restart_after(
+            Some("net.dignetwork.dig-node"),
+            &ctl,
+            &probe,
+            installed_outcome(),
+        )
+        .unwrap();
+        assert!(
+            out.detail.contains("reported a successful start but is not running"),
+            "a start that claims success on a down service is reported: {}",
+            out.detail
+        );
+        assert_eq!(out.activation, Activation::PendingRestart);
+    }
+
+    /// An unreadable run state must NOT become a confident answer in either direction — the
+    /// substitution of a fabricated verdict for an unknown is the defect class #77 belongs to.
+    #[test]
+    fn restart_after_does_not_claim_active_when_the_run_state_cannot_be_read() {
+        let ctl = |_: &str, _: ServiceAction| Ok(());
+        let probe = |_: &str| ServiceRunState::Unknown {
+            why: "sc.exe could not be resolved".into(),
+        };
+        let out = restart_after(
+            Some("net.dignetwork.dig-node"),
+            &ctl,
+            &probe,
+            installed_outcome(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.activation,
+            Activation::Unknown,
+            "no observation means no claim about what is running"
+        );
+        assert!(
+            out.detail.contains("could not be confirmed"),
+            "what is unproven is stated: {}",
             out.detail
         );
     }
@@ -1132,8 +1270,12 @@ mod tests {
             action: "update".into(),
             result: ComponentResult::Installed,
             detail: "ok".into(),
+            installed_version: Some("0.2.0".into()),
+            activation: Activation::Unknown,
+            available_version: None,
         });
-        assert!(restart_after(None, &ctl, ok).is_ok());
+        let probe = |_: &str| panic!("must not be probed for a service-less component");
+        assert!(restart_after(None, &ctl, &probe, ok).is_ok());
     }
 
     #[test]

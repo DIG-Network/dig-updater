@@ -115,7 +115,10 @@ pub use plan::{
 pub use rollback::{LkgCache, RestoreKind};
 pub use sandbox::Sandbox;
 pub use secure::Repair;
-pub use service::{control as control_service, ServiceAction, ServiceControl};
+pub use service::{
+    control as control_service, settled_run_state, ServiceAction, ServiceControl, ServiceProbe,
+    ServiceRunState,
+};
 pub use spawn::spawn_worker;
 pub use state::{LoadedState, TrustStateStore};
 
@@ -523,6 +526,8 @@ impl Broker {
                 channel,
             ),
             service_ctl: &service::control,
+            // #77: judge the restart by the service's OBSERVED run state, not by one exit code.
+            service_probe: &service::settled_run_state,
             // #621 item 1: when the feed ladder was overridden (`--feed-base`/`$DIG_UPDATER_FEED_BASE`)
             // the fetched marks may be off the tracked channel's scale, so this pass installs but must
             // NOT advance — and thus must not POLLUTE — the tracked channel's persisted trust state.

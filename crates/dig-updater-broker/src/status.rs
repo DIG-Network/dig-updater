@@ -263,6 +263,11 @@ impl StatusSnapshot {
                         action: "would_fetch".to_string(),
                         result: "staged".to_string(),
                         detail: format!("{} [{}-{}]", a.version, a.os, a.arch),
+                        // A dry check never enumerates what is installed (see this type's doc), so
+                        // it has no installed version to state. What it verified IS what the feed
+                        // offers, which is exactly the "available" half.
+                        installed: None,
+                        available: Some(a.version.clone()),
                     })
                     .collect(),
             ),
@@ -290,6 +295,14 @@ impl StatusSnapshot {
                 action: c.action.clone(),
                 result: c.result.as_str().to_string(),
                 detail: c.detail.clone(),
+                // dig_ecosystem#3180: mirror the two facts a notification needs SEPARATELY — what is
+                // on disk (and whether it is running) and what the feed offers — rather than making a
+                // reader parse them back out of `detail`.
+                installed: c.installed_version.clone().map(|version| InstalledBuild {
+                    version,
+                    activation: c.activation,
+                }),
+                available: c.available_version.clone(),
             })
             .collect();
         Self::base(
@@ -546,6 +559,7 @@ mod tests {
     #[test]
     fn from_pass_applied_lists_every_component_outcome() {
         use crate::{ComponentOutcome, ComponentResult};
+        use super::Activation;
         let config = UpdaterConfig::default();
         let ctx = StatusContext::for_test(&config);
         let report = PassReport {
@@ -557,6 +571,9 @@ mod tests {
                 action: "update".into(),
                 result: ComponentResult::Installed,
                 detail: "v0.1.0 -> v0.2.0".into(),
+                installed_version: Some("v0.2.0".into()),
+                activation: Activation::Active,
+                available_version: None,
             }],
             state_advanced: true,
             refused: Vec::new(),
@@ -577,6 +594,7 @@ mod tests {
         // `refused_components`, report its per-component result as the `refused` token, and keep the
         // missing sonames in the detail — all three are what an operator (or the Updates UI) reads.
         use crate::{ComponentOutcome, ComponentResult};
+        use super::Activation;
         let config = UpdaterConfig::default();
         let ctx = StatusContext::for_test(&config);
         let report = PassReport {
@@ -590,12 +608,18 @@ mod tests {
                     result: ComponentResult::Refused,
                     detail: "needs shared libraries this host does not provide (libgtk-3.so.0)"
                         .into(),
+                    installed_version: None,
+                    activation: Activation::Unknown,
+                    available_version: Some("13.1.2".into()),
                 },
                 ComponentOutcome {
                     component: "digstore".into(),
                     action: "update".into(),
                     result: ComponentResult::Installed,
                     detail: "digstore now reports 0.19.3".into(),
+                    installed_version: Some("0.19.3".into()),
+                    activation: Activation::Active,
+                    available_version: None,
                 },
             ],
             state_advanced: true,

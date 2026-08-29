@@ -401,6 +401,42 @@ fn classify_run_state(output: &std::process::Output) -> ServiceRunState {
     }
 }
 
+/// Ask whether `service_id` is running, allowing it a bounded moment to SETTLE first — the
+/// production [`ServiceProbe`] (#77).
+///
+/// A service queried in the instant after `start` returns can legitimately still be coming up, and a
+/// single query that catches that instant would report a healthy restart as a failure — replacing one
+/// false alarm with another. So the probe retries while the answer is [`ServiceRunState::NotRunning`]
+/// or [`ServiceRunState::Unknown`], up to [`SETTLE_ATTEMPTS`] times spaced [`SETTLE_INTERVAL`] apart,
+/// and returns the FIRST [`ServiceRunState::Running`] it sees.
+///
+/// It does NOT retry forever, and it does not fabricate: if the service is still down when the budget
+/// is spent, the last observed answer is returned as observed. The budget is deliberately short —
+/// an update pass must not hang on a service that is genuinely broken.
+#[must_use]
+pub fn settled_run_state(service_id: &str) -> ServiceRunState {
+    let mut last = ServiceRunState::Unknown {
+        why: "the service was never queried".to_string(),
+    };
+    for attempt in 0..SETTLE_ATTEMPTS {
+        last = run_state(service_id);
+        if last == ServiceRunState::Running {
+            return last;
+        }
+        if attempt + 1 < SETTLE_ATTEMPTS {
+            std::thread::sleep(SETTLE_INTERVAL);
+        }
+    }
+    last
+}
+
+/// How many times [`settled_run_state`] asks before accepting a non-running answer.
+const SETTLE_ATTEMPTS: u32 = 10;
+
+/// How long [`settled_run_state`] waits between asks — 10 x 1s bounds the wait at ~9s, comfortably
+/// inside a pass and comfortably longer than a service manager's own start acknowledgement.
+const SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The absolute, trusted `sc.exe` (`%SystemRoot%\System32\sc.exe`) — never a bare name.
 #[cfg(windows)]
 fn sc_program() -> Result<PathBuf, String> {
