@@ -1151,6 +1151,15 @@ Every per-component outcome therefore carries, separately:
   is running could not be established). `unknown` is the default and MUST NOT be reported as either
   other value. Note that the §9.6 version probe inspects the FILE at the destination, so it establishes
   what is on disk and is not by itself evidence of what is executing;
+
+  **`active` requires an observation that distinguishes the new build from the old process.** A
+  service manager reporting a service RUNNING is not such an observation on its own: it names a
+  service, not a build, and the process it names may be the one the replace was meant to displace —
+  the applier's stop does not wait for STOPPED (§9.5), so a replace can succeed while the old image
+  keeps executing. A conforming implementation MUST report `active` only when the manager PERFORMED
+  the restart (it must leave STOPPED to do so, retiring the old process) AND the service was then
+  observed running. A start that was refused because the service was ALREADY running, or that failed
+  for any other reason while the service is nonetheless up, MUST be reported `unknown`;
 - **the available version** — the version the feed offers when it is not the one installed.
 
 A surface that notifies a person about an update MUST derive its wording from these fields. Stating

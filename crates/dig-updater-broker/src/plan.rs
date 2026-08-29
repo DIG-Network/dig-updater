@@ -458,6 +458,15 @@ pub struct PlannedComponent {
     /// The installed version detected before this pass (`None` if absent), packed for the
     /// rollback-floor comparison — the build a rollback would reinstate.
     pub installed_build: Option<u64>,
+    /// The RAW version string enumeration read off this component's destination before the pass
+    /// (`None` when nothing was detected). Carried so a `Skip` can report what is measurably on
+    /// disk instead of the feed's offered version (dig_ecosystem#3180): those are usually equal —
+    /// that is why the component is being skipped — but they diverge whenever the recorded build is
+    /// AHEAD of disk, and reporting the feed's version there OVERSTATES what is installed. The
+    /// install path gets the same correction from a post-install re-read
+    /// ([`crate::pass::ComponentOutcome::with_detected_version`]); a skip installs nothing, so this
+    /// pre-pass reading is the only measurement it has.
+    pub detected_version: Option<String>,
     /// What establishes this component's installed version, carried from its
     /// [`ComponentTarget::evidence`] so the applier's health gate uses the SAME evidence class the
     /// planner did. Without it the gate would fall back to a version PROBE — re-introducing, after
@@ -655,6 +664,7 @@ impl Plan {
                 action,
                 summary,
                 installed_build,
+                detected_version: detected_version(&detected),
                 evidence: target.evidence,
             });
         }
@@ -681,6 +691,19 @@ impl Plan {
 /// (`dig-app 3.4.0 (build abc123)`) — and taking the last token there yields `(build`, which packs to
 /// nothing. Reading "the first token that IS a version" is stable against detail appearing on either
 /// side, so a cosmetic change to a component's version line cannot silently un-age its install.
+/// The raw version string enumeration read, if it read one — [`PlannedComponent::detected_version`].
+///
+/// An EMPTY `Present` is not a reading: [`digest_evidence_any`] uses it to mean "the bytes match no
+/// known variant", which is a statement about digests, not a version. Reporting it as an installed
+/// version would put an empty string where a measurement belongs.
+#[must_use]
+fn detected_version(detected: &DetectedVersion) -> Option<String> {
+    match detected {
+        DetectedVersion::Present(raw) if !raw.trim().is_empty() => Some(raw.clone()),
+        _ => None,
+    }
+}
+
 #[must_use]
 fn installed_build(detected: &DetectedVersion) -> Option<u64> {
     match detected {

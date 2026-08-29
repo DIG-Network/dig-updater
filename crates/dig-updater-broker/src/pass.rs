@@ -51,7 +51,9 @@ use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONE
 use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
 use crate::selfupdate::apply_self_update;
-use crate::service::{ServiceAction, ServiceControl, ServiceProbe, ServiceRunState};
+use crate::service::{
+    ControlOutcome, ServiceAction, ServiceControl, ServiceProbe, ServiceRunState,
+};
 use crate::state::{LoadedState, TrustStateStore};
 use crate::status::Activation;
 use dig_release_resolver::loadability::{Loadability, LoadabilityCheck};
@@ -133,11 +135,19 @@ impl ComponentOutcome {
             result,
             detail,
             installed_version: match result {
-                // The version on disk is the manifest's for a build we just installed or that was
-                // already current. Every other result left the destination on a build this pass
-                // knows only as an opaque build NUMBER, so there is no version string to state and
-                // inventing one would be the fabrication this record exists to avoid.
-                ComponentResult::Installed | ComponentResult::Skipped => Some(pc.version.clone()),
+                // A just-installed component is on the manifest's version by construction, and the
+                // install path then REPLACES this with what the health gate re-read off disk
+                // (`with_detected_version`, #582).
+                ComponentResult::Installed => Some(pc.version.clone()),
+                // A SKIP installed nothing, so the manifest's version is the feed's offer, not a
+                // measurement. Report what enumeration actually read at the destination instead:
+                // the two normally agree — that is WHY the component is skipped — but they diverge
+                // when the recorded build is ahead of disk, and there the feed's version would
+                // OVERSTATE what is installed. With no reading, say nothing.
+                ComponentResult::Skipped => pc.detected_version.clone(),
+                // Every other result left the destination on a build this pass knows only as an
+                // opaque build NUMBER, so there is no version string to state and inventing one
+                // would be the fabrication this record exists to avoid.
                 _ => None,
             },
             // Set by `restart_after` for a service-backed component from the service's OBSERVED run
@@ -969,12 +979,12 @@ fn alias_cache_key(component: &str, alias: &Path) -> String {
 /// is folded into the outcome detail as a warning but never turns an otherwise-correct on-disk state
 /// into a hard failure (the daily wake + the service manager's own boot recovery bring it back).
 ///
-/// **The verdict is the service's OBSERVED run state, not the start command's exit code (#77).** The
-/// start is attempted, then the service is probed, and [`judge_restart`] decides from the pair. A
-/// start that exits non-zero on a service that is nonetheless RUNNING reported "could not restart
-/// dig-node" about a healthy node on the new binary — a false failure an operator then remediates,
-/// and one about to become a user-facing notification (dig_ecosystem#3180), which would inherit its
-/// authority.
+/// **The verdict comes from the start's OUTCOME together with the service's observed run state
+/// (#77).** The start is attempted, then the service is probed, and [`judge_restart`] decides from
+/// the pair. Neither half suffices: a start that exits non-zero on a service that is nonetheless
+/// RUNNING reported "could not restart dig-node" about a healthy node — a false failure an operator
+/// then remediates — while a bare `Running` observation cannot tell the new image from the process
+/// the replace was meant to displace, so it cannot on its own justify [`Activation::Active`].
 fn restart_after(
     service: Option<&str>,
     service_ctl: &ServiceControl,
@@ -1000,26 +1010,55 @@ fn restart_after(
 /// Decide, from the start command's result AND the service's observed run state, whether the new
 /// build is now ACTIVE — and what (if anything) to say about it (#77).
 ///
-/// The observation dominates the exit code, because the observation is the property that matters:
+/// [`Activation::Active`] asserts that *the build this pass installed* is the one executing, so it
+/// is reachable from exactly ONE pair: a **performed** start next to a `Running` service. That pair
+/// is the only distinguishing observation available here. A performed start means the manager drove
+/// the service out of STOPPED, so the process that came back was launched from the bytes now at
+/// `dest`; nothing else in this function can tell the new image from the old process.
+///
+/// The two pairs that look like success but are not evidence:
+///
+/// - **an ALREADY-RUNNING start beside `Running`.** `Stop` does not wait for STOPPED, the replace
+///   succeeds against a running image, and `sc start` then answers 1056 precisely BECAUSE the
+///   pre-stop process is still up. `settled_run_state` returns on the first `Running` it sees,
+///   which may be that same process. Nothing restarted, so the honest verdict is `Unknown`.
+/// - **a FAILED start beside `Running`.** The start was refused for some other reason, yet
+///   something under that name is up — so it is something this pass did not launch.
 ///
 /// | start attempt | observed | verdict | reported |
 /// |---|---|---|---|
-/// | ok or error | `Running` | [`Activation::Active`] | nothing — the intent was met |
-/// | ok | `NotRunning` | [`Activation::PendingRestart`] | a warning: it claimed success and is down |
+/// | performed | `Running` | [`Activation::Active`] | nothing — the new build is up |
+/// | already running | `Running` | [`Activation::Unknown`] | a note: nothing was restarted |
+/// | error | `Running` | [`Activation::Unknown`] | a warning naming the refusal |
+/// | ok (either) | `NotRunning` | [`Activation::PendingRestart`] | a warning: it claimed success and is down |
 /// | error | `NotRunning` | [`Activation::PendingRestart`] | the genuine restart failure |
 /// | either | `Unknown` | [`Activation::Unknown`] | a note naming why nothing could be confirmed |
 ///
-/// The `Unknown` row is not a formality. Collapsing "I could not ask the service manager" into
-/// either confident answer is how a fabricated verdict becomes indistinguishable from a measured
+/// The `Unknown` rows are not a formality. Collapsing "I could not establish which build is running"
+/// into a confident answer is how a fabricated verdict becomes indistinguishable from a measured
 /// one; the operator is told what is unproven instead.
 fn judge_restart(
     service: &str,
-    attempt: Result<(), String>,
+    attempt: Result<ControlOutcome, String>,
     observed: ServiceRunState,
 ) -> (Activation, Option<String>) {
     match (attempt, observed) {
-        (_, ServiceRunState::Running) => (Activation::Active, None),
-        (Ok(()), ServiceRunState::NotRunning) => (
+        (Ok(ControlOutcome::Performed), ServiceRunState::Running) => (Activation::Active, None),
+        (Ok(ControlOutcome::AlreadyInState), ServiceRunState::Running) => (
+            Activation::Unknown,
+            Some(format!(
+                " (note: {service} was already running, so nothing was restarted; \
+                 which build is running could not be established)"
+            )),
+        ),
+        (Err(detail), ServiceRunState::Running) => (
+            Activation::Unknown,
+            Some(format!(
+                " (warning: could not restart {service}: {detail}; it is running, \
+                 but which build is running could not be established)"
+            )),
+        ),
+        (Ok(_), ServiceRunState::NotRunning) => (
             Activation::PendingRestart,
             Some(format!(
                 " (warning: {service} reported a successful start but is not running)"
@@ -1029,7 +1068,7 @@ fn judge_restart(
             Activation::PendingRestart,
             Some(format!(" (warning: could not restart {service}: {detail})")),
         ),
-        (Ok(()), ServiceRunState::Unknown { why }) => (
+        (Ok(_), ServiceRunState::Unknown { why }) => (
             Activation::Unknown,
             Some(format!(
                 " (note: {service} was started; its run state could not be confirmed: {why})"
@@ -1112,7 +1151,7 @@ mod tests {
         let calls = RefCell::new(Vec::new());
         let ctl = |_: &str, action: ServiceAction| {
             calls.borrow_mut().push(action);
-            Ok(())
+            Ok(ControlOutcome::Performed)
         };
         let rollback_error = Err(BrokerError::RollbackFailed {
             component: "dig-node".into(),
@@ -1150,18 +1189,24 @@ mod tests {
     }
 
     /// The `sc.exe` text #77 was measured on: a non-zero start on a service that is nonetheless up.
+    /// `service::control` classifies THIS text as [`ControlOutcome::AlreadyInState`], so production
+    /// reaches `judge_restart` with that outcome; the string survives as the error fixture for a
+    /// start that failed for some OTHER reason.
     const START_1056: &str =
         "sc.exe exited with 1056: An instance of the service is already running";
 
-    /// #77, the regression: `sc.exe` 1056 after a restart is the service being UP. This fixture and
-    /// `restart_after_still_reports_a_genuine_restart_failure` below differ in EXACTLY ONE thing —
-    /// the observed run state — while both feed `restart_after` the identical non-zero start. That
-    /// is what makes the pair load-bearing: an implementation that reports the exit code would fail
-    /// this test, and one that suppresses the warning unconditionally would fail its sibling. Either
-    /// test alone is satisfied by a wrong implementation.
+    /// The ONLY pair that may report [`Activation::Active`]: the manager PERFORMED the start, and
+    /// the service is then observed running. Performing it required leaving STOPPED, which retires
+    /// the process that was holding the old image — so what is up was launched from the new bytes.
+    ///
+    /// This test and `restart_after_does_not_claim_active_when_nothing_was_actually_restarted` below
+    /// differ in EXACTLY ONE thing — whether the start was performed or merely already-satisfied —
+    /// against an identical `Running` observation. An implementation that judges on the run state
+    /// alone passes this one and fails its sibling; one that never reports `Active` fails this one.
+    /// Neither test alone is load-bearing.
     #[test]
-    fn restart_after_reports_success_when_the_service_is_running_despite_a_nonzero_start() {
-        let ctl = |_: &str, _: ServiceAction| Err(START_1056.to_string());
+    fn restart_after_reports_active_when_the_start_was_performed_and_the_service_is_running() {
+        let ctl = |_: &str, _: ServiceAction| Ok(ControlOutcome::Performed);
         let probe = |_: &str| ServiceRunState::Running;
         let out = restart_after(
             Some("net.dignetwork.dig-node"),
@@ -1171,14 +1216,75 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !out.detail.contains("warning"),
-            "the service is running the new build; there is nothing to warn about: {}",
+            out.detail.is_empty() || !out.detail.contains("note"),
+            "a performed restart needs no caveat: {}",
             out.detail
         );
         assert_eq!(
             out.activation,
             Activation::Active,
-            "a confirmed-running service means the installed build is the ACTIVE one"
+            "the manager drove the service out of STOPPED and it came back — that is the new build"
+        );
+    }
+
+    /// #77's fix is preserved and its overreach removed. `sc.exe` 1056 means the service was
+    /// ALREADY running, so nothing restarted: the false "could not restart dig-node" alarm must
+    /// still be gone (that was #77), and yet the record must NOT claim `Active` (dig_ecosystem#3180).
+    ///
+    /// The state is reachable: the applier's `Stop` does not wait for STOPPED, the replace succeeds
+    /// against a still-running image, `sc start` is then refused with 1056 by the pre-stop process,
+    /// and `settled_run_state` returns on the first `Running` — which is that same process. The old
+    /// build is what is executing, and `Unknown` is the only honest thing to say about it.
+    #[test]
+    fn restart_after_does_not_claim_active_when_nothing_was_actually_restarted() {
+        let ctl = |_: &str, _: ServiceAction| Ok(ControlOutcome::AlreadyInState);
+        let probe = |_: &str| ServiceRunState::Running;
+        let out = restart_after(
+            Some("net.dignetwork.dig-node"),
+            &ctl,
+            &probe,
+            installed_outcome(),
+        )
+        .unwrap();
+        assert!(
+            !out.detail.contains("could not restart"),
+            "#77: an already-running service is not a restart failure: {}",
+            out.detail
+        );
+        assert_eq!(
+            out.activation,
+            Activation::Unknown,
+            "nothing was restarted, so which build is running was never established"
+        );
+        assert!(
+            out.detail.contains("already running"),
+            "the reason the verdict is unknown is stated: {}",
+            out.detail
+        );
+    }
+
+    /// The third `Running` pair: a start that genuinely FAILED beside a service that is up. Whatever
+    /// is up is something this pass did not launch, so it is no evidence of the new build either.
+    #[test]
+    fn restart_after_does_not_claim_active_when_a_failed_start_left_something_running() {
+        let ctl = |_: &str, _: ServiceAction| Err("access is denied".to_string());
+        let probe = |_: &str| ServiceRunState::Running;
+        let out = restart_after(
+            Some("net.dignetwork.dig-node"),
+            &ctl,
+            &probe,
+            installed_outcome(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.activation,
+            Activation::Unknown,
+            "a refused start proves nothing about which build is executing"
+        );
+        assert!(
+            out.detail.contains("access is denied"),
+            "the refusal is named: {}",
+            out.detail
         );
     }
 
@@ -1216,7 +1322,7 @@ mod tests {
     /// the one no exit-code-only implementation can ever catch.
     #[test]
     fn restart_after_warns_when_a_successful_start_left_the_service_down() {
-        let ctl = |_: &str, _: ServiceAction| Ok(());
+        let ctl = |_: &str, _: ServiceAction| Ok(ControlOutcome::Performed);
         let probe = |_: &str| ServiceRunState::NotRunning;
         let out = restart_after(
             Some("net.dignetwork.dig-node"),
@@ -1238,7 +1344,7 @@ mod tests {
     /// substitution of a fabricated verdict for an unknown is the defect class #77 belongs to.
     #[test]
     fn restart_after_does_not_claim_active_when_the_run_state_cannot_be_read() {
-        let ctl = |_: &str, _: ServiceAction| Ok(());
+        let ctl = |_: &str, _: ServiceAction| Ok(ControlOutcome::Performed);
         let probe = |_: &str| ServiceRunState::Unknown {
             why: "sc.exe could not be resolved".into(),
         };

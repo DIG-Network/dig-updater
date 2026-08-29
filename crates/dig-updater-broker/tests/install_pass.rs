@@ -277,7 +277,7 @@ fn apply_with_suppress(
         // probe — so reading a digest here would mean the planner or the health gate had consulted
         // the wrong evidence source, which this panicking reader makes observable.
         digest: &digest_must_not_be_read,
-        service_ctl: &|_, _| Ok(()),
+        service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance,
     };
@@ -339,7 +339,7 @@ fn apply_digest_evidenced(
         detect: &never_execute,
         health: &never_execute,
         digest,
-        service_ctl: &|_, _| Ok(()),
+        service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance: false,
     };
@@ -944,7 +944,7 @@ fn apply_self_and_other(
         // A SafeToProbe component's version comes from its probe; hashing it here would mean the
         // wrong evidence source was consulted, which this panicking reader makes observable.
         digest: &digest_must_not_be_read,
-        service_ctl: &|_, _| Ok(()),
+        service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance: false,
     };
@@ -1084,7 +1084,9 @@ fn assert_state_dir_hardened(dir: &Path) {
 
 use std::sync::Mutex;
 
-use dig_updater_broker::{ServiceAction, ServiceControl, ServiceProbe, ServiceRunState};
+use dig_updater_broker::{
+    ControlOutcome, ServiceAction, ServiceControl, ServiceProbe, ServiceRunState,
+};
 
 /// The default injected run-state probe for scenarios that assert install MECHANICS rather than the
 /// restart JUDGMENT (#77): the service comes back up, which is the ordinary case. The tests that
@@ -1182,7 +1184,7 @@ fn a_service_backed_component_is_stopped_before_replace_and_restarted_after_666b
     let calls: Mutex<Vec<ServiceAction>> = Mutex::new(Vec::new());
     let ctl = |_: &str, action: ServiceAction| {
         calls.lock().unwrap().push(action);
-        Ok(())
+        Ok(ControlOutcome::Performed)
     };
     let detect = |_: &Path| DetectedVersion::Present("dig-node 0.32.0".to_string());
     let health = |_: &Path| DetectedVersion::Present("dig-node 0.33.0".to_string());
@@ -1229,7 +1231,7 @@ fn a_service_is_restarted_even_when_the_replace_rolls_back_666b() {
     let calls: Mutex<Vec<ServiceAction>> = Mutex::new(Vec::new());
     let ctl = |_: &str, action: ServiceAction| {
         calls.lock().unwrap().push(action);
-        Ok(())
+        Ok(ControlOutcome::Performed)
     };
     // The post-install probe reports the OLD version → the health gate fails → rollback.
     let detect = |_: &Path| DetectedVersion::Present("dig-node 0.32.0".to_string());
@@ -1272,7 +1274,7 @@ fn a_service_that_cannot_be_stopped_defers_and_is_left_running_666b() {
         calls.lock().unwrap().push(action);
         match action {
             ServiceAction::Stop => Err("service refused to stop".to_string()),
-            ServiceAction::Start => Ok(()),
+            ServiceAction::Start => Ok(ControlOutcome::Performed),
         }
     };
     let detect = |_: &Path| DetectedVersion::Present("dig-node 0.32.0".to_string());
@@ -1384,7 +1386,7 @@ fn a_failed_health_rolls_back_the_whole_set_no_split_primary_alias_666f2() {
     // OLD version → the gate fails → the WHOLE set must roll back (no primary-new/alias-old split).
     let detect = |_: &Path| DetectedVersion::Present("digstore 0.14.0".to_string());
     let health = |_: &Path| DetectedVersion::Present("digstore 0.14.0".to_string());
-    let ctl = |_: &str, _: ServiceAction| Ok(());
+    let ctl = |_: &str, _: ServiceAction| Ok(ControlOutcome::Performed);
     let result = apply_aliased(
         &report,
         home.path(),
@@ -1443,7 +1445,7 @@ fn a_stale_alias_is_re_refreshed_on_a_later_pass_even_when_the_primary_is_curren
         }
     };
     let health = |_: &Path| DetectedVersion::Present("digstore 0.15.0".to_string());
-    let ctl = |_: &str, _: ServiceAction| Ok(());
+    let ctl = |_: &str, _: ServiceAction| Ok(ControlOutcome::Performed);
     let result = apply_aliased(
         &report,
         home.path(),
@@ -1607,7 +1609,7 @@ fn an_unsafe_to_probe_dig_app_is_held_unexecuted_while_its_stale_sibling_really_
         // A SafeToProbe component's version comes from its probe; hashing it here would mean the
         // wrong evidence source was consulted, which this panicking reader makes observable.
         digest: &digest_must_not_be_read,
-        service_ctl: &|_, _| Ok(()),
+        service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance: false,
     };
@@ -1836,7 +1838,7 @@ fn an_unloadable_artifact_is_refused_before_the_live_binary_is_touched() {
     let calls = Mutex::new(Vec::new());
     let ctl = |_: &str, action: ServiceAction| {
         calls.lock().unwrap().push(action);
-        Ok(())
+        Ok(ControlOutcome::Performed)
     };
 
     let result = apply_with_loadability(
@@ -1930,7 +1932,7 @@ fn a_refusal_names_the_missing_libraries_in_its_detail() {
     let result = apply_with_loadability(
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
-        &|_, _| Ok(()),
+        &|_, _| Ok(ControlOutcome::Performed),
         &running,
         &digest_of_something_else,
     );
@@ -1961,7 +1963,7 @@ fn a_refusal_does_not_withhold_the_state_advance() {
     let result = apply_with_loadability(
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
-        &|_, _| Ok(()),
+        &|_, _| Ok(ControlOutcome::Performed),
         &running,
         &digest_of_something_else,
     );
@@ -1987,7 +1989,7 @@ fn a_refused_pass_is_applied_and_not_a_fault_but_is_visible() {
     let result = apply_with_loadability(
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
-        &|_, _| Ok(()),
+        &|_, _| Ok(ControlOutcome::Performed),
         &running,
         &digest_of_something_else,
     );
@@ -2021,7 +2023,7 @@ fn a_loadable_or_indeterminate_artifact_installs_exactly_as_before() {
         let result = apply_with_loadability(
             &f,
             &|_: &Path| answer.clone(),
-            &|_, _| Ok(()),
+            &|_, _| Ok(ControlOutcome::Performed),
             &running,
             // The honest PRODUCTION digest reader: the health gate re-hashes what landed, so this can
             // only pass because the promised bytes really are at the destination.
@@ -2228,7 +2230,7 @@ fn apply_two_variant_pass(
         // re-hashes what actually landed against the selected variant's digest — so the pass can only
         // go green because the promised variant's bytes really are at the destination.
         digest: &dig_updater_broker::installed_digest_hex,
-        service_ctl: &|_, _| Ok(()),
+        service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
         suppress_state_advance: false,
     };
@@ -2389,7 +2391,7 @@ fn a_successful_install_records_the_manifest_build() {
     let result = apply_with_loadability(
         &f,
         &|_: &Path| Loadability::Loadable,
-        &|_, _| Ok(()),
+        &|_, _| Ok(ControlOutcome::Performed),
         &running,
         &dig_updater_broker::installed_digest_hex,
     );
@@ -2414,7 +2416,7 @@ fn a_refused_component_records_nothing() {
     apply_with_loadability(
         &f,
         &host_missing_libs_for(&f.dig_app_dest),
-        &|_, _| Ok(()),
+        &|_, _| Ok(ControlOutcome::Performed),
         &running,
         &digest_of_something_else,
     );

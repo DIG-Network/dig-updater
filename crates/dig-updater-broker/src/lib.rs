@@ -116,8 +116,8 @@ pub use rollback::{LkgCache, RestoreKind};
 pub use sandbox::Sandbox;
 pub use secure::Repair;
 pub use service::{
-    control as control_service, settled_run_state, ServiceAction, ServiceControl, ServiceProbe,
-    ServiceRunState,
+    control as control_service, settled_run_state, ControlOutcome, ServiceAction, ServiceControl,
+    ServiceProbe, ServiceRunState,
 };
 pub use spawn::spawn_worker;
 pub use state::{LoadedState, TrustStateStore};

@@ -126,21 +126,26 @@ pub fn service_argv(service_id: &str, action: ServiceAction) -> Result<Vec<Strin
 /// and a false failure is worse than no report, because whoever reads it remediates a problem that
 /// does not exist. The intent of `Start` is "be running"; a service that IS running has met it.
 ///
+/// It is nonetheless a DIFFERENT success from a performed one, so it is returned as
+/// [`ControlOutcome::AlreadyInState`] rather than collapsed into `Ok(())`: only a PERFORMED start
+/// proves the manager drove the service out of STOPPED, and only that proves the process now running
+/// was launched from the bytes this pass installed. See [`crate::pass`]'s restart verdict.
+///
 /// # Errors
 ///
 /// A detail string if the argv cannot be built (unresolvable tool) or the command genuinely fails /
-/// exits non-zero for a reason OTHER than the service already being stopped.
-pub fn control(service_id: &str, action: ServiceAction) -> Result<(), String> {
+/// exits non-zero for a reason OTHER than the service already being in the requested state.
+pub fn control(service_id: &str, action: ServiceAction) -> Result<ControlOutcome, String> {
     let argv = service_argv(service_id, action)?;
     let output = run_output(&argv)?;
     if output.status.success() {
-        return Ok(());
+        return Ok(ControlOutcome::Performed);
     }
     if action == ServiceAction::Stop && is_already_stopped(&output) {
-        return Ok(());
+        return Ok(ControlOutcome::AlreadyInState);
     }
     if action == ServiceAction::Start && is_already_running(&output) {
-        return Ok(());
+        return Ok(ControlOutcome::AlreadyInState);
     }
     let mut detail = format!("{} exited with {}", argv[0], output.status);
     let text = combined_output(&output);
@@ -150,10 +155,27 @@ pub fn control(service_id: &str, action: ServiceAction) -> Result<(), String> {
     Err(detail)
 }
 
+/// How a successful [`control`] call reached its goal — the service manager DID the transition, or
+/// the service was already where the caller wanted it.
+///
+/// Both are successes for the caller's INTENT ("be stopped" / "be running"), which is why both are
+/// `Ok`. They are not interchangeable as EVIDENCE: a performed start is an observation that the
+/// manager took the service out of STOPPED, whereas an already-running start observes only that
+/// *something* under that name was up — possibly the very process the replace was supposed to
+/// displace. Keeping them apart is what stops a restart verdict from asserting a build identity
+/// nothing measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOutcome {
+    /// The service manager carried out the requested transition.
+    Performed,
+    /// The service was ALREADY stopped (`Stop`) or ALREADY running (`Start`); nothing transitioned.
+    AlreadyInState,
+}
+
 /// A service-control function: stop or start a service by id. Injected into the applier so the
 /// stop→replace→restart ORDERING + failure handling are unit-tested without touching a real service
 /// manager (production wires [`control`]).
-pub type ServiceControl<'a> = dyn Fn(&str, ServiceAction) -> Result<(), String> + 'a;
+pub type ServiceControl<'a> = dyn Fn(&str, ServiceAction) -> Result<ControlOutcome, String> + 'a;
 
 /// Run the service-control argv, returning its captured [`std::process::Output`] (so the caller can
 /// classify an already-stopped exit, [`is_already_stopped`]). The program at index 0 is the

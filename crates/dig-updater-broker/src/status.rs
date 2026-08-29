@@ -77,6 +77,14 @@ const STATUS_FILE: &str = "status.json";
 #[serde(rename_all = "snake_case")]
 pub enum Activation {
     /// The newly installed build was confirmed to be the one now running.
+    ///
+    /// "Confirmed" is deliberately narrow, because no probe here reads a build identity out of a
+    /// live process. The only confirmation available is a service manager that PERFORMED the
+    /// restart — it must take the service out of STOPPED to do so, which retires the old process —
+    /// paired with the service then being observed running. An already-running service, or one
+    /// running after a refused start, proves only that *something* under that name is up, and that
+    /// something may be the very process the replace was meant to displace: those record
+    /// [`Self::Unknown`].
     Active,
     /// The new build is on disk, but an older one is still running — a restart will pick it up.
     PendingRestart,
