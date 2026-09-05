@@ -595,6 +595,78 @@ mod tests {
         );
     }
 
+    /// dig_ecosystem#3113: a status surface must never assert a restart succeeded when it did not —
+    /// the exact false report a real machine produced (`[update] installed` beside a buried
+    /// `sc.exe 1056` warning, with the printed version read from disk rather than the service). The
+    /// pass-level judgment (`judge_restart`, pinned separately in `pass.rs`) already gets this right;
+    /// what this test pins is that the verdict SURVIVES the persistence boundary this function is —
+    /// `ComponentOutcome::activation` copied into `InstalledBuild::activation` — rather than being
+    /// silently dropped to the `Unknown` default or flattened to a single hardcoded value.
+    ///
+    /// Two components carrying DIFFERENT non-default activations in ONE report is the fixture that
+    /// distinguishes "wired through" from "hardcoded": an implementation that always writes one
+    /// constant (`Active`, or the `Unknown` derive-default) passes a single-component test but fails
+    /// this one, because `dig-node`'s and `digstore`'s activations must come out distinct.
+    #[test]
+    fn from_pass_mirrors_each_components_activation_distinctly_3113() {
+        use super::Activation;
+        use crate::{ComponentOutcome, ComponentResult};
+        let config = UpdaterConfig::default();
+        let ctx = StatusContext::for_test(&config);
+        let report = PassReport {
+            applied: true,
+            reason: None,
+            detail: None,
+            components: vec![
+                ComponentOutcome {
+                    component: "dig-node".into(),
+                    action: "update".into(),
+                    detail: "dig-node now reports 0.126.0".into(),
+                    result: ComponentResult::Installed,
+                    installed_version: Some("0.126.0".into()),
+                    // A performed restart, confirmed running: the ONLY pair allowed to claim Active.
+                    activation: Activation::Active,
+                    available_version: None,
+                },
+                ComponentOutcome {
+                    component: "digstore".into(),
+                    action: "update".into(),
+                    detail: "digstore now reports 0.19.3".into(),
+                    result: ComponentResult::Installed,
+                    installed_version: Some("0.19.3".into()),
+                    // The new bytes are on disk; the running process was never confirmed to be them.
+                    activation: Activation::PendingRestart,
+                    available_version: None,
+                },
+            ],
+            state_advanced: true,
+            refused: Vec::new(),
+        };
+        let snapshot = StatusSnapshot::from_pass(&report, &ctx);
+
+        let dig_node = snapshot.components[0]
+            .installed
+            .as_ref()
+            .expect("dig-node reported an installed version");
+        assert_eq!(
+            dig_node.activation,
+            Activation::Active,
+            "a confirmed restart must read back as Active, not lost in the status mirror"
+        );
+
+        let digstore = snapshot.components[1]
+            .installed
+            .as_ref()
+            .expect("digstore reported an installed version");
+        assert_eq!(
+            digstore.activation,
+            Activation::PendingRestart,
+            "3113: a component whose restart could not be confirmed must read back as \
+             PendingRestart — never silently upgraded to Active, which is the exact false \
+             'installed and active' claim the ticket was filed against"
+        );
+    }
+
     #[test]
     fn status_json_mirrors_a_refusal_as_refused_with_the_component_named() {
         // dig_ecosystem#1870: the refusal is not a fault, so the ONLY thing that carries the
