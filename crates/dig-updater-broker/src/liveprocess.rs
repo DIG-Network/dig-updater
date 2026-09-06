@@ -51,6 +51,12 @@ pub fn is_running(binary: &Path) -> bool {
 /// CSV row; a hit's first quoted CSV field is the image name itself. Matching on the QUOTED name
 /// therefore distinguishes a hit from the miss message without a CSV parser, and can never be
 /// satisfied by the miss text (which never quotes the searched-for name).
+///
+/// The comparison is CASE-INSENSITIVE: `tasklist` reports a binary's on-disk image name verbatim,
+/// which for a system tool is commonly UPPERCASE (`PING.EXE`) regardless of the case a caller
+/// queried with, while NTFS treats both as the same file. `/FI "IMAGENAME eq …"` itself already
+/// matches case-insensitively — only the post-hoc "did we get a hit" string search was exact-case,
+/// which silently turned a real, running match into a reported miss.
 #[cfg(windows)]
 fn windows_is_running(name: &str) -> bool {
     let filter = format!("IMAGENAME eq {name}");
@@ -61,7 +67,8 @@ fn windows_is_running(name: &str) -> bool {
     else {
         return false;
     };
-    out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&format!("\"{name}\""))
+    let stdout = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    out.status.success() && stdout.contains(&format!("\"{}\"", name.to_lowercase()))
 }
 
 /// Unix: `pgrep -x` against the process's own `comm` name — an exact match with no shell-injection
@@ -82,18 +89,50 @@ fn unix_is_running(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The distinguishing fixture: THIS TEST BINARY is itself a running process, under its own
-    /// executable's file name, for the entire duration of this test. A stub that always returns
-    /// `false` (above) fails this for the right reason — it never asked the OS anything — which is
+    /// Spawn a short-lived child under a SHORT, fixed name — the shape every real component this
+    /// module serves actually has (`dig-app`, `dig-chat`, both under ten characters) — rather than
+    /// asking `is_running` about THIS test binary's own name.
+    ///
+    /// That substitution is load-bearing, not incidental (#92 CI red on ubuntu+macos): a `cargo
+    /// test` binary's name is `<crate>-<16-hex-char-hash>`, 35+ characters, and Linux/macOS both
+    /// truncate a process's reported name well under that (Linux `TASK_COMM_LEN` allows 15 usable
+    /// characters; Darwin's is comparably short) — so `pgrep -x <the-untruncated-name>` can never
+    /// exact-match the kernel's own truncated value, no matter how correct the detector is. That
+    /// false negative is a property of the FIXTURE's name length, not of `unix_is_running`: every
+    /// name this crate ever calls it with is short enough to never truncate, so the fix belongs in
+    /// the test's choice of vehicle, not in the detector.
+    #[cfg(windows)]
+    fn spawn_short_named_probe() -> (std::process::Child, &'static str) {
+        let child = Command::new("ping")
+            .args(["-n", "6", "127.0.0.1"])
+            .spawn()
+            .expect("ping.exe ships with every supported Windows edition");
+        (child, "ping.exe")
+    }
+
+    /// See [`spawn_short_named_probe`] (Windows) for why this spawns rather than asking about the
+    /// test binary itself. `sleep` is POSIX/coreutils and present on every unix CI image.
+    #[cfg(not(windows))]
+    fn spawn_short_named_probe() -> (std::process::Child, &'static str) {
+        let child = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("sleep ships on every unix CI runner image");
+        (child, "sleep")
+    }
+
+    /// The distinguishing fixture: a REAL child process, under a short, fixed, representative
+    /// name, running for the entire duration of the check. A stub that always returns `false`
+    /// (above) fails this for the right reason — it never asked the OS anything — which is
     /// exactly what proves the assertion is load-bearing rather than vacuously satisfied by an
     /// implementation that reports nothing ever runs.
     #[test]
-    fn detects_the_currently_running_test_process_by_its_own_binary_name() {
-        let me = std::env::current_exe().expect("the test binary has a path");
-        assert!(
-            is_running(&me),
-            "the test binary is definitionally running right now, under {me:?}"
-        );
+    fn detects_a_genuinely_running_process_by_its_short_component_style_name() {
+        let (mut child, name) = spawn_short_named_probe();
+        let detected = is_running(Path::new(name));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(detected, "{name} was spawned and should still be running");
     }
 
     /// The control: a name nothing on the host is running. Paired with the positive case above so

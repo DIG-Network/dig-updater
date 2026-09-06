@@ -590,3 +590,22 @@ one and it still fails on the next:
   digest, not the default's. Both are threaded through `PlannedComponent.variants` (default-first) + the
   selected digest returned from `select_loadable_variant`.
 
+
+
+## Process-liveness detection is two OS-specific traps, not one (#92)
+
+- **A `cargo test` binary's own name is the WRONG fixture for `pgrep -x`.** Linux/macOS both
+  truncate a process's reported name well under a cargo test binary's `<crate>-<16-hex-hash>` length
+  (35+ chars) — Linux `TASK_COMM_LEN` allows 15 usable characters, Darwin's is comparably short — so
+  `pgrep -x <the-untruncated-name>` can never exact-match the kernel's own truncated value, no matter
+  how correct the detector is. It is a property of the FIXTURE's name length, not of the detector:
+  every name this crate actually calls it with (`dig-app`, `dig-chat`, both under ten characters)
+  is short enough to never truncate. The fix is a short-named real child process (`sleep`/`ping`),
+  not a change to the detector.
+- **`tasklist`'s hit-check must be case-INSENSITIVE.** `/FI "IMAGENAME eq …"` itself matches
+  case-insensitively, but a naive post-hoc `stdout.contains("\"{name}\"")` is exact-case — and
+  `tasklist` reports a binary's on-disk image name verbatim, which for a system tool is commonly
+  UPPERCASE (`PING.EXE`) regardless of the case queried with, while NTFS treats both as the same
+  file. A synthetic/mocked test cannot surface this; only spawning a REAL system binary and reading
+  REAL `tasklist` output caught it — the case mismatch was invisible using `current_exe()` because
+  cargo always names its own build output lowercase.
