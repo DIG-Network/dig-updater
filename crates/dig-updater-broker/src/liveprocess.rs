@@ -72,6 +72,7 @@ fn windows_is_running(name: &str) -> bool {
 fn unix_is_running(name: &str) -> bool {
     Command::new("pgrep")
         .args(["-x", name])
+        .hide_console()
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)

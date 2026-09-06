@@ -536,7 +536,14 @@ fn a_stale_running_dig_app_is_reported_pending_restart_after_the_update_installs
 
     let artifact = b"the-dig-app-15.1.0-binary-bytes";
     let server = Server::bind();
-    let m = manifest_for(DIGEST_COMPONENT, &server.base, "15.1.0", 15_001_000, 0, artifact);
+    let m = manifest_for(
+        DIGEST_COMPONENT,
+        &server.base,
+        "15.1.0",
+        15_001_000,
+        0,
+        artifact,
+    );
     let _guard = server.serve(routes(&m, artifact));
     let report = stage(&server.base, &home.path().join("staging"));
 
@@ -575,7 +582,14 @@ fn a_dig_app_with_no_running_instance_stays_silent_about_restart_92() {
 
     let artifact = b"the-dig-app-15.1.0-binary-bytes";
     let server = Server::bind();
-    let m = manifest_for(DIGEST_COMPONENT, &server.base, "15.1.0", 15_001_000, 0, artifact);
+    let m = manifest_for(
+        DIGEST_COMPONENT,
+        &server.base,
+        "15.1.0",
+        15_001_000,
+        0,
+        artifact,
+    );
     let _guard = server.serve(routes(&m, artifact));
     let report = stage(&server.base, &home.path().join("staging"));
 
