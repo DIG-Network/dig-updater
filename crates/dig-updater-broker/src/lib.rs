@@ -63,6 +63,7 @@ mod hashing;
 pub mod health;
 pub mod install;
 pub mod installed;
+pub mod liveprocess;
 pub mod lock;
 pub mod optout;
 mod pass;
@@ -528,6 +529,9 @@ impl Broker {
             service_ctl: &service::control,
             // #77: judge the restart by the service's OBSERVED run state, not by one exit code.
             service_probe: &service::settled_run_state,
+            // #92: the same liveness question for a component with no service handle at all — a
+            // per-user desktop app whose replace happens under a running process.
+            process_probe: &liveprocess::is_running,
             // #621 item 1: when the feed ladder was overridden (`--feed-base`/`$DIG_UPDATER_FEED_BASE`)
             // the fetched marks may be off the tracked channel's scale, so this pass installs but must
             // NOT advance — and thus must not POLLUTE — the tracked channel's persisted trust state.

@@ -47,6 +47,7 @@ use crate::install::{
     InstallOutcome, RetryPolicy,
 };
 use crate::installed::InstalledBuildStore;
+use crate::liveprocess::ProcessProbe;
 use crate::plan::{Catalog, InstallMethod, Plan, PlannedComponent, BEACON_COMPONENT_NAME};
 use crate::rollback::{LkgCache, LkgEntry, RestoreKind};
 use crate::secure::harden_state_dir;
@@ -377,6 +378,14 @@ pub struct Installer<'a> {
     /// exit code of the one `start` command (#77). Production wires
     /// [`crate::service::settled_run_state`]; tests inject a scripted answer.
     pub service_probe: &'a ServiceProbe<'a>,
+    /// [`service_probe`](Self::service_probe)'s counterpart for a component with NO service handle
+    /// (#92) — a per-user desktop app the applier must never execute to check
+    /// ([`crate::plan::VersionEvidence::ArtifactDigest`]), whose replace happens under a running
+    /// process that keeps executing its old image until the user's next launch. Asks the OS process
+    /// list whether that stale process is still up, so a successful install can say so truthfully
+    /// instead of leaving the silence #92 reported. Production wires
+    /// [`crate::liveprocess::is_running`]; tests inject a scripted answer.
+    pub process_probe: &'a ProcessProbe<'a>,
     /// Suppress advancing (and thus persisting) the tracked channel's trust state after an otherwise
     /// fully-successful pass (#621 item 1). Set only when the feed ladder was overridden out-of-band
     /// (`--feed-base`/`$DIG_UPDATER_FEED_BASE`): the fetched manifest's marks may be on a DIFFERENT
@@ -744,6 +753,7 @@ impl Installer<'_> {
             self.service_probe,
             install_result,
         )?;
+        note_stale_process(&mut outcome, pc, service.is_none(), self.process_probe);
         if let Some(why) = indeterminate {
             outcome
                 .detail
@@ -1098,6 +1108,47 @@ fn judge_restart(
             )),
         ),
     }
+}
+
+/// [`judge_restart`]'s counterpart for a component with NO service handle (#92) — a per-user
+/// desktop app ([`crate::plan::VersionEvidence::ArtifactDigest`]) the applier must never execute to
+/// check, whose replace happens under a running process that keeps executing its old image until
+/// the user's next launch (SPEC §9.7(1)).
+///
+/// A service-backed install ALREADY reached its own verdict via [`restart_after`] — this only
+/// speaks up on a THIRD kind of component: no service to restart (`no_service`) and a component the
+/// health gate established by hashing rather than running (`!pc.evidence.requires_execution()`). A
+/// component the planner never installed (`ComponentResult::Installed`, checked first) and one the
+/// planner refused to execute BEFORE install (a [`crate::plan::VersionEvidence::UnsafeToProbe`]
+/// [`crate::plan::HeldComponent`]) can never reach `Installed` at all, so this can only ever fire
+/// for exactly the class the module doc describes — never guessed from a component's name.
+///
+/// Silent when nothing is detected running (`Activation::Unknown` stands, matching every other
+/// non-service component) — #92's bar is truthful reporting, not manufacturing a warning the probe
+/// did not earn. A stale hit becomes [`Activation::PendingRestart`], the exact meaning the enum
+/// already carries ("the new build is on disk, but an older one is still running"), with a note
+/// naming how an operator restarts a GUI app themselves: closing and reopening it, never a kill this
+/// unattended pass performs (the ticket's explicit line: restarting dig-node's SERVICE is
+/// low-ceremony and reversible; killing a live user's GUI session to reach parity is not).
+fn note_stale_process(
+    outcome: &mut ComponentOutcome,
+    pc: &PlannedComponent,
+    no_service: bool,
+    process_probe: &ProcessProbe,
+) {
+    if outcome.result != ComponentResult::Installed
+        || !no_service
+        || pc.evidence.requires_execution()
+        || !process_probe(&pc.dest)
+    {
+        return;
+    }
+    outcome.activation = Activation::PendingRestart;
+    outcome.detail.push_str(&format!(
+        " (note: a running {} instance is still the previous build; restart it \
+         yourself to apply {} — close it from its tray icon or task list, then reopen it)",
+        pc.name, pc.version
+    ));
 }
 
 /// The production enumeration/health probe: spawn `<path> --version`, BOUNDED.
