@@ -26,6 +26,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use dig_updater_broker::config::Channel;
+use dig_updater_broker::status::Activation;
 use dig_updater_broker::{
     BrokerError, Catalog, ComponentResult, ComponentTarget, DetectedVersion, InstallMethod,
     InstalledBuildStore, Installer, LkgCache, Loadability, PassReport, RetryPolicy,
@@ -279,7 +280,61 @@ fn apply_with_suppress(
         digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
+        process_probe: &|_| false,
         suppress_state_advance,
+    };
+    installer.apply(root, report, loaded)
+}
+
+/// As [`apply`], but lets a caller script the process-liveness answer (#92) — the boundary
+/// fixture: this drives a SafeToProbe component (digstore), so a probe that answers `true` for
+/// every path must still never turn into a pending-restart note (that gate is evidence-type only).
+#[allow(clippy::too_many_arguments)]
+fn apply_with_probing_process(
+    root: &VerifyingKey,
+    report: &WorkerReport,
+    home: &Path,
+    dest: &Path,
+    detect: &dyn Fn(&Path) -> DetectedVersion,
+    health: &dyn Fn(&Path) -> DetectedVersion,
+    process_probe: &dyn Fn(&Path) -> bool,
+) -> Result<PassReport, BrokerError> {
+    let store = TrustStateStore::for_channel(home, Channel::Stable);
+    let loaded = store.load().expect("load state");
+    let lkg = LkgCache::at(home.join("lkg"));
+    let staging_dir = home.join("staging");
+    let apply_dir = home.join("apply");
+    std::fs::create_dir_all(&apply_dir).expect("apply dir");
+    let catalog = Catalog::new(vec![ComponentTarget {
+        name: "digstore".into(),
+        method: InstallMethod::RawBinary,
+        dest: dest.to_path_buf(),
+        aliases: vec![],
+        service: None,
+        evidence: VersionEvidence::SafeToProbe,
+    }]);
+    let platform = Platform::current();
+    let installer = Installer {
+        store: &store,
+        loadability: &always_loadable,
+        installed_builds: &records_beside(&store),
+        catalog: &catalog,
+        platform: &platform,
+        lkg: &lkg,
+        staging_dir: &staging_dir,
+        apply_dir: &apply_dir,
+        retry: RetryPolicy {
+            attempts: 2,
+            backoff: Duration::ZERO,
+        },
+        now: NOW,
+        detect,
+        health,
+        digest: &digest_must_not_be_read,
+        service_ctl: &|_, _| Ok(ControlOutcome::Performed),
+        service_probe: &|_| ServiceRunState::Running,
+        process_probe,
+        suppress_state_advance: false,
     };
     installer.apply(root, report, loaded)
 }
@@ -297,6 +352,21 @@ fn apply_digest_evidenced(
     home: &Path,
     dest: &Path,
     digest: &dyn Fn(&Path) -> Option<String>,
+) -> Result<PassReport, BrokerError> {
+    apply_digest_evidenced_with_process(root, report, home, dest, digest, &|_| false)
+}
+
+/// As [`apply_digest_evidenced`], but lets a caller script the process-liveness answer (#92) — a
+/// digest-evidenced component is EXACTLY dig-app's class (no service, never executed), so this is
+/// where the pending-restart-on-a-stale-running-instance behaviour is exercised.
+#[allow(clippy::too_many_arguments)]
+fn apply_digest_evidenced_with_process(
+    root: &VerifyingKey,
+    report: &WorkerReport,
+    home: &Path,
+    dest: &Path,
+    digest: &dyn Fn(&Path) -> Option<String>,
+    process_probe: &dyn Fn(&Path) -> bool,
 ) -> Result<PassReport, BrokerError> {
     let store = TrustStateStore::for_channel(home, Channel::Stable);
     let loaded = store.load().expect("load state");
@@ -341,6 +411,7 @@ fn apply_digest_evidenced(
         digest,
         service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
+        process_probe,
         suppress_state_advance: false,
     };
     installer.apply(root, report, loaded)
@@ -450,6 +521,127 @@ fn a_digest_evidenced_component_rolls_back_when_the_post_install_digest_does_not
     assert!(
         !out.state_advanced,
         "a pass with a rolled-back component must not advance the trust state"
+    );
+}
+
+#[test]
+fn a_stale_running_dig_app_is_reported_pending_restart_after_the_update_installs_92() {
+    // #92: dig-app's whole class (ArtifactDigest, no service) installs silently today — the
+    // property under test is that a STALE, still-running instance of the OLD build now gets a
+    // truthful note instead. The distinguishing fixture is the process probe answering TRUE for
+    // this exact destination; the paired test below answers FALSE and must stay silent, which is
+    // what rules out an implementation that always appends the note regardless of the probe.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("dig-app");
+
+    let artifact = b"the-dig-app-15.1.0-binary-bytes";
+    let server = Server::bind();
+    let m = manifest_for(DIGEST_COMPONENT, &server.base, "15.1.0", 15_001_000, 0, artifact);
+    let _guard = server.serve(routes(&m, artifact));
+    let report = stage(&server.base, &home.path().join("staging"));
+
+    let out = apply_digest_evidenced_with_process(
+        &test_root().verifying_key(),
+        &report,
+        home.path(),
+        &dest,
+        &dig_updater_broker::installed_digest_hex,
+        &|probed| probed == dest,
+    )
+    .expect("the pass applies");
+
+    let line = &out.components[0];
+    assert_eq!(line.result, ComponentResult::Installed);
+    assert_eq!(
+        line.activation,
+        Activation::PendingRestart,
+        "a stale running instance means the new bytes are on disk but not yet active: {}",
+        line.detail
+    );
+    assert!(
+        line.detail.contains("restart") && line.detail.contains("dig-app"),
+        "the detail must say a restart is needed, by name, not just log a fact silently: {}",
+        line.detail
+    );
+}
+
+#[test]
+fn a_dig_app_with_no_running_instance_stays_silent_about_restart_92() {
+    // The control for the test above: the SAME fixture, but the process probe finds nothing
+    // running anywhere. #92's bar is truthful reporting, not a warning bolted on unconditionally —
+    // silence here is correct because there is no stale process for an operator to restart.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("dig-app");
+
+    let artifact = b"the-dig-app-15.1.0-binary-bytes";
+    let server = Server::bind();
+    let m = manifest_for(DIGEST_COMPONENT, &server.base, "15.1.0", 15_001_000, 0, artifact);
+    let _guard = server.serve(routes(&m, artifact));
+    let report = stage(&server.base, &home.path().join("staging"));
+
+    let out = apply_digest_evidenced_with_process(
+        &test_root().verifying_key(),
+        &report,
+        home.path(),
+        &dest,
+        &dig_updater_broker::installed_digest_hex,
+        &|_| false,
+    )
+    .expect("the pass applies");
+
+    let line = &out.components[0];
+    assert_eq!(line.result, ComponentResult::Installed);
+    assert_eq!(
+        line.activation,
+        Activation::Unknown,
+        "nothing is running, so there is nothing to warn about: {}",
+        line.detail
+    );
+    assert!(
+        !line.detail.to_lowercase().contains("restart"),
+        "silence is the correct behaviour when the probe found nothing running: {}",
+        line.detail
+    );
+}
+
+#[test]
+fn a_safe_to_probe_component_never_consults_the_process_probe_92() {
+    // The boundary the gate exists to hold: digstore is SafeToProbe (a CLI, never a stale-GUI-
+    // process concern), so even a process probe that answers TRUE for every path must never turn
+    // into a pending-restart note here. This is the fixture that distinguishes "the evidence-type
+    // gate genuinely excludes SafeToProbe" from "the note happens to never fire because no test
+    // ever made the probe answer true" — the nearest wrong implementation is one that reacts to
+    // ANY component's process probe hit, not only an ArtifactDigest one.
+    let home = tempfile::tempdir().unwrap();
+    let dest = home.path().join("bin").join("digstore");
+
+    let artifact = b"the-new-digstore-0.2.0-binary";
+    let srv = Server::bind();
+    let m = manifest(&srv.base, "0.2.0", 2_000, 0, artifact);
+    let _guard = srv.serve(routes(&m, artifact));
+    let report = stage(&srv.base, &home.path().join("staging"));
+
+    let detect = |_: &Path| DetectedVersion::Absent;
+    let health = |_: &Path| DetectedVersion::Present("0.2.0".into());
+    let out = apply_with_probing_process(
+        &test_root().verifying_key(),
+        &report,
+        home.path(),
+        &dest,
+        &detect,
+        &health,
+        &|_| true,
+    )
+    .expect("the pass applies");
+
+    let line = &out.components[0];
+    assert_eq!(line.result, ComponentResult::Installed);
+    assert_eq!(
+        line.activation,
+        Activation::Unknown,
+        "a SafeToProbe component has no process-liveness concept, regardless of what the process \
+         probe answers: {}",
+        line.detail
     );
 }
 
@@ -946,6 +1138,7 @@ fn apply_self_and_other(
         digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
+        process_probe: &|_| false,
         suppress_state_advance: false,
     };
     installer
@@ -1161,6 +1354,7 @@ fn apply_with_service(
         digest: &digest_must_not_be_read,
         service_ctl,
         service_probe,
+        process_probe: &|_| false,
         suppress_state_advance: false,
     };
     installer
@@ -1361,6 +1555,7 @@ fn apply_aliased(
         digest: &digest_must_not_be_read,
         service_ctl,
         service_probe,
+        process_probe: &|_| false,
         suppress_state_advance: false,
     };
     installer.apply(&test_root().verifying_key(), report, loaded)
@@ -1611,6 +1806,7 @@ fn an_unsafe_to_probe_dig_app_is_held_unexecuted_while_its_stale_sibling_really_
         digest: &digest_must_not_be_read,
         service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
+        process_probe: &|_| false,
         suppress_state_advance: false,
     };
     let result = installer
@@ -1765,6 +1961,7 @@ fn apply_with_loadability(
         digest: dig_app_digest,
         service_ctl,
         service_probe,
+        process_probe: &|_| false,
         suppress_state_advance: false,
     };
     installer
@@ -2232,6 +2429,7 @@ fn apply_two_variant_pass(
         digest: &dig_updater_broker::installed_digest_hex,
         service_ctl: &|_, _| Ok(ControlOutcome::Performed),
         service_probe: &|_| ServiceRunState::Running,
+        process_probe: &|_| false,
         suppress_state_advance: false,
     };
     let report = installer
