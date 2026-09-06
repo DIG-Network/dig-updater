@@ -1171,9 +1171,24 @@ Every per-component outcome therefore carries, separately:
   the start as an already-running start on EVERY platform it supports;
 - **the available version** — the version the feed offers when it is not the one installed.
 
+**A component with no service handle at all** (`ComponentTarget::service` is `None`, e.g. a per-user
+desktop app declared `ArtifactDigest`, §9.7) has no manager to ask, so a successful replace MUST NOT
+be reported `active` merely because the file landed — there is no observation here that distinguishes
+the new build from whatever is still executing, exactly the gap §9.5 leaves open for such a
+component. A conforming implementation MAY establish `pending_restart` for it by asking the host's
+process list whether a process is currently running under the component's own binary name: a match
+is this component's ONLY available liveness signal, and — like a service's run state — it names a
+RUNNING PROGRAM, not a build, so it MUST NOT be upgraded to `active`. A miss, or a process-list query
+that could not run at all, MUST leave the activation `unknown` rather than asserting anything about
+what is or is not running: the query is BEST-EFFORT and MUST fail closed, never manufacturing a
+restart warning it did not earn. Whatever the outcome, a component the beacon is forbidden to execute
+(§9.7) MUST NOT be executed to answer this question either — a process-list query answers from the
+OS's own bookkeeping and never runs the binary.
+
 A surface that notifies a person about an update MUST derive its wording from these fields. Stating
 that a version "was installed" when its activation is `pending_restart` asserts something false about
-the machine.
+the machine. For a component with no service to restart on the operator's behalf, the surface MUST
+additionally say HOW to restart it — silence where a restart is needed is itself non-conformant.
 
 ## 10. The feed + signing (CI)
 
