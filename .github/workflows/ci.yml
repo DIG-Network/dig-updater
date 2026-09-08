@@ -43,6 +43,21 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # The vendored branded icon is byte-pinned; see scripts/check-icon.sh for why
+  # drift is made loud rather than impossible. Cheap and dependency-free, so it
+  # runs as its own job and reports independently of the compile gates.
+  icon:
+    name: icon asset (sha256 pin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Invoked through `bash` rather than relying on the file mode: a checkout
+      # that loses the executable bit would otherwise fail this gate for a
+      # reason that has nothing to do with the icon.
+      - run: bash scripts/check-icon.sh
+
   release-scripts:
     # The release helpers under `scripts/` mutate a git tree from a release workflow, where a wrong
     # exit code costs a failed release cut rather than a failed test (#1806). They are shell, so they
