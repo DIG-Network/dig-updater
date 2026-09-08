@@ -28,6 +28,7 @@
 //! [`SignedManifest::from_json`]: dig_updater_trust::SignedManifest::from_json
 //! [`verify_update_chain`]: dig_updater_trust::verify_update_chain
 
+mod continuation_guard;
 mod error;
 mod feed;
 mod net;

@@ -36,6 +36,7 @@
 //!
 //! [`verify_update_chain`] composes the whole check in the order a caller must apply it.
 
+mod continuation_guard;
 pub mod manifest;
 pub mod pinned_key;
 pub mod trust_state;

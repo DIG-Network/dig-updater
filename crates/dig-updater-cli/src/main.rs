@@ -41,6 +41,8 @@ use dig_updater_broker::{elevation, scheduler, Broker, BrokerError, PassReport};
 use dig_updater_broker::{follow_channel_change, ExtFollow, InstalledDigInstaller};
 use dig_updater_worker::{FeedSource, WorkerReport};
 
+mod continuation_guard;
+
 const USAGE: &str = "\
 dig-updater — DIG auto-update beacon
 

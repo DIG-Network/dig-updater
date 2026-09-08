@@ -373,7 +373,7 @@ fn both_channels_build_from_the_one_reusable_build_workflow() {
     ] {
         assert!(
             !nightly.contains(compiler),
-            "nightly-release.yml invokes `{compiler}` — a channel must not compile or package              anything itself; that is exactly how its asset set drifts from the shared build              (dig_ecosystem#618). Add the step to build-binaries.yml instead."
+            "nightly-release.yml invokes `{compiler}` — a channel must not compile or package anything itself; that is exactly how its asset set drifts from the shared build (dig_ecosystem#618). Add the step to build-binaries.yml instead."
         );
     }
 }

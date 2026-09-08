@@ -41,6 +41,7 @@
 mod assemble;
 mod channel;
 mod config;
+mod continuation_guard;
 mod doctor;
 mod error;
 mod freshness;
