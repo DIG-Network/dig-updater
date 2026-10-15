@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-broker"
-version = "0.40.9"
+version = "0.40.10"
 dependencies = [
  "base64 0.23.1",
  "dig-release-resolver",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-cli"
-version = "0.40.9"
+version = "0.40.10"
 dependencies = [
  "dig-updater-broker",
  "dig-updater-trust",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-feedsign"
-version = "0.40.9"
+version = "0.40.10"
 dependencies = [
  "base64 0.23.1",
  "dig-updater-trust",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-trust"
-version = "0.40.9"
+version = "0.40.10"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "dig-updater-worker"
-version = "0.40.9"
+version = "0.40.10"
 dependencies = [
  "base64 0.23.1",
  "dig-updater-trust",
@@ -742,9 +742,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures",
